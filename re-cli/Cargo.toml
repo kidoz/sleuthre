@@ -1,0 +1,12 @@
+[package]
+name = "re-cli"
+version.workspace = true
+edition.workspace = true
+description = "Headless CLI tool for batch binary analysis"
+
+[dependencies]
+re-core = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }

@@ -1,0 +1,39 @@
+[workspace]
+members = [
+    "re-core",
+    "re-gui",
+    "re-mcp",
+    "re-cli",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Aleksandr Pavlov <ckidoz@gmail.com>"]
+license = "MIT"
+repository = "https://github.com/kidoz/sleuthre"
+description = "An open-source reverse engineering desktop application."
+
+[workspace.dependencies]
+egui = "0.33"
+eframe = "0.33"
+re-core = { path = "re-core" }
+anyhow = "1.0"
+thiserror = "2.0"
+log = "0.4"
+env_logger = "0.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+goblin = "0.9"
+capstone = "0.13"
+rusqlite = { version = "0.33", features = ["bundled"] }
+petgraph = "0.7"
+tracing = "0.1"
+bitflags = { version = "2.8", features = ["serde"] }
+rfd = "0.15"
+uuid = { version = "1.10", features = ["v4", "serde"] }
+clap = { version = "4.5", features = ["derive"] }
+gimli = "0.31"
+object = { version = "0.36", default-features = false, features = ["read"] }
+pdb = "0.8"

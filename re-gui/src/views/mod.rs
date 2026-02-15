@@ -1,0 +1,9 @@
+mod callgraph;
+mod decompiler;
+mod disassembly;
+mod exports;
+mod graph;
+mod hex;
+mod imports;
+mod strings;
+mod structures;

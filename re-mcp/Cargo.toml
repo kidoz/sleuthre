@@ -1,0 +1,14 @@
+[package]
+name = "re-mcp"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+re-core = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+uuid = { workspace = true }
+capstone = { workspace = true }
