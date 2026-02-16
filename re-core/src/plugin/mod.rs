@@ -9,6 +9,8 @@ use std::collections::HashMap;
 
 use crate::Result;
 use crate::analysis::functions::FunctionManager;
+use crate::analysis::strings::StringsManager;
+use crate::analysis::xrefs::XrefManager;
 use crate::loader::LoadedBinary;
 use crate::memory::MemoryMap;
 
@@ -109,6 +111,8 @@ pub trait AnalysisPass: Send + Sync {
         &self,
         memory: &MemoryMap,
         functions: &mut FunctionManager,
+        xrefs: &XrefManager,
+        strings: &StringsManager,
     ) -> Result<Vec<AnalysisFinding>>;
 }
 
@@ -202,15 +206,22 @@ impl PluginManager {
         self.analysis_passes.push(pass);
     }
 
+    /// Remove all registered analysis passes.
+    pub fn clear_analysis_passes(&mut self) {
+        self.analysis_passes.clear();
+    }
+
     /// Run every registered analysis pass, collecting all findings.
     pub fn run_all_analysis_passes(
         &self,
         memory: &MemoryMap,
         functions: &mut FunctionManager,
+        xrefs: &XrefManager,
+        strings: &StringsManager,
     ) -> Result<Vec<AnalysisFinding>> {
         let mut all_findings = Vec::new();
         for pass in &self.analysis_passes {
-            let findings = pass.run_analysis(memory, functions)?;
+            let findings = pass.run_analysis(memory, functions, xrefs, strings)?;
             all_findings.extend(findings);
         }
         Ok(all_findings)
@@ -314,6 +325,8 @@ mod tests {
             &self,
             _memory: &MemoryMap,
             functions: &mut FunctionManager,
+            _xrefs: &XrefManager,
+            _strings: &StringsManager,
         ) -> Result<Vec<AnalysisFinding>> {
             let findings: Vec<AnalysisFinding> = functions
                 .functions
@@ -450,8 +463,11 @@ mod tests {
 
         let memory = make_memory_map();
         let mut functions = make_function_manager();
+        let xrefs = crate::analysis::xrefs::XrefManager::new();
+        let strings = crate::analysis::strings::StringsManager::default();
+
         let findings = mgr
-            .run_all_analysis_passes(&memory, &mut functions)
+            .run_all_analysis_passes(&memory, &mut functions, &xrefs, &strings)
             .unwrap();
 
         assert_eq!(findings.len(), 1);
@@ -465,8 +481,11 @@ mod tests {
         let mgr = PluginManager::new();
         let memory = make_memory_map();
         let mut functions = make_function_manager();
+        let xrefs = crate::analysis::xrefs::XrefManager::new();
+        let strings = crate::analysis::strings::StringsManager::default();
+
         let findings = mgr
-            .run_all_analysis_passes(&memory, &mut functions)
+            .run_all_analysis_passes(&memory, &mut functions, &xrefs, &strings)
             .unwrap();
         assert!(findings.is_empty());
     }

@@ -24,14 +24,14 @@ pub enum PrimitiveType {
 }
 
 impl PrimitiveType {
-    pub fn size(&self) -> usize {
+    pub fn size(&self, arch: crate::arch::Architecture) -> usize {
         match self {
             Self::Void => 0,
             Self::Bool | Self::U8 | Self::I8 | Self::Char => 1,
             Self::U16 | Self::I16 | Self::WChar => 2,
             Self::U32 | Self::I32 | Self::F32 => 4,
             Self::U64 | Self::I64 | Self::F64 => 8,
-            Self::Pointer | Self::USize | Self::ISize => 8, // Default to 64-bit
+            Self::Pointer | Self::USize | Self::ISize => arch.pointer_size(),
         }
     }
 
@@ -90,6 +90,16 @@ pub enum TypeRef {
 }
 
 impl TypeRef {
+    pub fn size(&self, arch: crate::arch::Architecture) -> usize {
+        match self {
+            Self::Primitive(p) => p.size(arch),
+            Self::Pointer(_) | Self::FunctionPointer { .. } => arch.pointer_size(),
+            Self::Array { element, count } => element.size(arch) * count,
+            Self::Named(_) => 0, // Requires manager to resolve
+            Self::Const(inner) | Self::Volatile(inner) => inner.size(arch),
+        }
+    }
+
     pub fn display_name(&self) -> String {
         match self {
             Self::Primitive(p) => p.display_name().to_string(),
@@ -151,13 +161,10 @@ impl CompoundType {
         }
     }
 
-    pub fn size(&self) -> usize {
+    pub fn size(&self, arch: crate::arch::Architecture) -> usize {
         match self {
             Self::Struct { size, .. } | Self::Union { size, .. } | Self::Enum { size, .. } => *size,
-            Self::Typedef { target, .. } => match target {
-                TypeRef::Primitive(p) => p.size(),
-                _ => 0,
-            },
+            Self::Typedef { target, .. } => target.size(arch),
         }
     }
 
@@ -229,9 +236,17 @@ pub struct TypeManager {
     pub global_variables: BTreeMap<u64, VariableInfo>,
     pub local_variables: BTreeMap<u64, Vec<VariableInfo>>,
     pub source_lines: BTreeMap<u64, SourceLineInfo>,
+    pub arch: crate::arch::Architecture,
 }
 
 impl TypeManager {
+    pub fn size_of(&self, type_ref: &TypeRef) -> usize {
+        match type_ref {
+            TypeRef::Named(name) => self.get_type(name).map(|t| t.size(self.arch)).unwrap_or(0),
+            _ => type_ref.size(self.arch),
+        }
+    }
+
     pub fn add_type(&mut self, ty: CompoundType) {
         self.types.insert(ty.name().to_string(), ty);
     }
@@ -242,6 +257,21 @@ impl TypeManager {
 
     pub fn remove_type(&mut self, name: &str) -> Option<CompoundType> {
         self.types.remove(name)
+    }
+
+    pub fn add_struct_field(&mut self, struct_name: &str, field: StructField) {
+        let field_size = self.size_of(&field.type_ref);
+        if let Some(
+            CompoundType::Struct { fields, size, .. } | CompoundType::Union { fields, size, .. },
+        ) = self.types.get_mut(struct_name)
+        {
+            let field_end = field.offset + field_size;
+            if field_end > *size {
+                *size = field_end;
+            }
+            fields.push(field);
+            fields.sort_by_key(|f| f.offset);
+        }
     }
 
     pub fn annotate(&mut self, annotation: TypeAnnotation) {
@@ -260,20 +290,26 @@ impl TypeManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arch::Architecture;
 
     #[test]
     fn primitive_sizes() {
-        assert_eq!(PrimitiveType::U8.size(), 1);
-        assert_eq!(PrimitiveType::U16.size(), 2);
-        assert_eq!(PrimitiveType::U32.size(), 4);
-        assert_eq!(PrimitiveType::U64.size(), 8);
-        assert_eq!(PrimitiveType::F32.size(), 4);
-        assert_eq!(PrimitiveType::F64.size(), 8);
-        assert_eq!(PrimitiveType::Void.size(), 0);
-        assert_eq!(PrimitiveType::Char.size(), 1);
-        assert_eq!(PrimitiveType::WChar.size(), 2);
-        assert_eq!(PrimitiveType::USize.size(), 8);
-        assert_eq!(PrimitiveType::ISize.size(), 8);
+        let arch = Architecture::X86_64;
+        assert_eq!(PrimitiveType::U8.size(arch), 1);
+        assert_eq!(PrimitiveType::U16.size(arch), 2);
+        assert_eq!(PrimitiveType::U32.size(arch), 4);
+        assert_eq!(PrimitiveType::U64.size(arch), 8);
+        assert_eq!(PrimitiveType::F32.size(arch), 4);
+        assert_eq!(PrimitiveType::F64.size(arch), 8);
+        assert_eq!(PrimitiveType::Void.size(arch), 0);
+        assert_eq!(PrimitiveType::Char.size(arch), 1);
+        assert_eq!(PrimitiveType::WChar.size(arch), 2);
+        assert_eq!(PrimitiveType::USize.size(arch), 8);
+        assert_eq!(PrimitiveType::ISize.size(arch), 8);
+
+        let arch32 = Architecture::X86;
+        assert_eq!(PrimitiveType::USize.size(arch32), 4);
+        assert_eq!(PrimitiveType::ISize.size(arch32), 4);
     }
 
     #[test]
@@ -301,7 +337,7 @@ mod tests {
         };
         mgr.add_type(s);
         let t = mgr.get_type("Point").unwrap();
-        assert_eq!(t.size(), 8);
+        assert_eq!(t.size(Architecture::X86_64), 8);
         assert_eq!(t.kind_name(), "struct");
     }
 
@@ -374,7 +410,7 @@ mod tests {
         mgr.add_type(e);
         let t = mgr.get_type("Color").unwrap();
         assert_eq!(t.kind_name(), "enum");
-        assert_eq!(t.size(), 4);
+        assert_eq!(t.size(Architecture::X86_64), 4);
     }
 
     #[test]

@@ -1,7 +1,38 @@
 use eframe::egui;
+use egui_dock::TabViewer;
 
-use crate::app::{SleuthreApp, Tab};
+use crate::app::{
+    CommandBarResult, CommandBarResultKind, FunctionSortColumn, FunctionTypeFilter, NavBandLayer,
+    SleuthreApp, Tab,
+};
 use crate::theme::{SyntaxColors, ThemeMode, apply_theme};
+
+struct SleuthreTabViewer<'a> {
+    app: &'a mut SleuthreApp,
+}
+
+impl TabViewer for SleuthreTabViewer<'_> {
+    type Tab = Tab;
+
+    fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
+        tab.to_string().into()
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
+        self.app.active_tab = *tab;
+        match tab {
+            Tab::Disassembly => self.app.show_disassembly(ui),
+            Tab::Graph => self.app.show_graph(ui),
+            Tab::Decompiler => self.app.show_decompiler(ui),
+            Tab::HexView => self.app.show_hex_view(ui),
+            Tab::Strings => self.app.show_strings(ui),
+            Tab::Imports => self.app.show_imports(ui),
+            Tab::Exports => self.app.show_exports(ui),
+            Tab::Structures => self.app.show_structures(ui),
+            Tab::CallGraph => self.app.show_call_graph(ui),
+        }
+    }
+}
 
 impl eframe::App for SleuthreApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -12,9 +43,29 @@ impl eframe::App for SleuthreApp {
         }
 
         if self.trigger_decompile {
-            self.active_tab = Tab::Decompiler;
+            self.focus_or_open_tab(Tab::Decompiler);
             self.decompile_current_function();
             self.trigger_decompile = false;
+        }
+
+        // Auto-save check
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        if self.last_save_time == 0.0 {
+            self.last_save_time = now;
+        }
+
+        if now - self.last_save_time > 300.0 {
+            // 5 minutes
+            if let Some(ref mut project) = self.project {
+                let path = project.path.with_extension("slre");
+                if let Ok(()) = project.save(&path) {
+                    self.add_toast(crate::app::ToastKind::Info, "Project auto-saved.".into());
+                }
+            }
+            self.last_save_time = now;
         }
 
         // Keyboard shortcuts (only when no modal is active)
@@ -24,7 +75,7 @@ impl eframe::App for SleuthreApp {
                     self.trigger_decompile = true;
                 }
                 if i.key_pressed(egui::Key::Space) {
-                    self.active_tab = Tab::Graph;
+                    self.focus_or_open_tab(Tab::Graph);
                 }
                 if i.key_pressed(egui::Key::N) && self.focused_address.is_some() {
                     self.rename_active = true;
@@ -41,8 +92,9 @@ impl eframe::App for SleuthreApp {
                     self.xref_active = true;
                 }
                 if i.modifiers.command && i.key_pressed(egui::Key::G) {
-                    self.goto_active = true;
-                    self.goto_input = String::new();
+                    self.command_bar_active = true;
+                    self.command_bar_input.clear();
+                    self.command_bar_results.clear();
                 }
                 if i.modifiers.command && i.key_pressed(egui::Key::D) {
                     self.bookmark_active = true;
@@ -93,14 +145,180 @@ impl eframe::App for SleuthreApp {
         }
 
         self.show_top_panel(ctx);
-        self.show_bottom_panel(ctx);
+        self.show_status_bar(ctx);
+        if self.output_panel_visible {
+            self.show_bottom_panel(ctx);
+        }
         self.show_left_panel(ctx);
+        self.show_right_panel(ctx);
         self.show_central_panel(ctx);
+        self.show_command_bar_dropdown(ctx);
         self.show_modals(ctx);
+        self.show_toasts(ctx);
     }
 }
 
 impl SleuthreApp {
+    fn show_right_panel(&mut self, ctx: &egui::Context) {
+        let state = self.debugger.state();
+        if state == re_core::DebuggerState::Detached {
+            return;
+        }
+
+        egui::SidePanel::right("right_panel")
+            .resizable(true)
+            .default_width(200.0)
+            .show(ctx, |ui| {
+                ui.heading("Registers");
+                ui.separator();
+                let regs = self.debugger.registers();
+                let mut names: Vec<_> = regs.keys().collect();
+                names.sort();
+
+                egui::Grid::new("reg_grid").striped(true).show(ui, |ui| {
+                    for name in names {
+                        ui.label(name);
+                        ui.monospace(format!("{:016X}", regs[name]));
+                        ui.end_row();
+                    }
+                });
+            });
+    }
+
+    fn show_toasts(&mut self, ctx: &egui::Context) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+
+        // Expire old toasts
+        self.toasts.retain(|t| t.expires_at > now);
+
+        if self.toasts.is_empty() {
+            return;
+        }
+
+        // Render toasts in the top right corner
+        egui::Area::new(egui::Id::new("toast_area"))
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 40.0))
+            .show(ctx, |ui| {
+                ui.vertical(|ui| {
+                    for toast in &self.toasts {
+                        let (bg, text_color) = match toast.kind {
+                            crate::app::ToastKind::Info => {
+                                (egui::Color32::from_rgb(40, 40, 40), egui::Color32::WHITE)
+                            }
+                            crate::app::ToastKind::Success => {
+                                (egui::Color32::from_rgb(0, 100, 0), egui::Color32::WHITE)
+                            }
+                            crate::app::ToastKind::Warning => {
+                                (egui::Color32::from_rgb(100, 100, 0), egui::Color32::BLACK)
+                            }
+                            crate::app::ToastKind::Error => {
+                                (egui::Color32::from_rgb(100, 0, 0), egui::Color32::WHITE)
+                            }
+                        };
+
+                        egui::Frame::window(ui.style()).fill(bg).show(ui, |ui| {
+                            ui.label(egui::RichText::new(&toast.message).color(text_color));
+                        });
+                        ui.add_space(4.0);
+                    }
+                });
+            });
+    }
+
+    fn show_status_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("status_bar")
+            .exact_height(20.0)
+            .show(ctx, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.style_mut().spacing.item_spacing.x = 12.0;
+
+                    if let Some(ref project) = self.project {
+                        // File name
+                        ui.label(
+                            egui::RichText::new(&project.name)
+                                .size(11.0)
+                                .color(self.syntax.text),
+                        );
+                        ui.separator();
+
+                        // Architecture
+                        let arch_str = format!("{:?}", project.arch);
+                        ui.label(egui::RichText::new(arch_str).size(11.0));
+                        ui.separator();
+
+                        // Base address
+                        let base = project
+                            .memory_map
+                            .segments
+                            .first()
+                            .map(|s| s.start)
+                            .unwrap_or(0);
+                        ui.label(
+                            egui::RichText::new(format!("Base: {:08X}", base))
+                                .size(11.0)
+                                .monospace(),
+                        );
+                        ui.separator();
+
+                        // Cursor address (colored)
+                        ui.label(
+                            egui::RichText::new(format!("Cursor: {:08X}", self.current_address))
+                                .size(11.0)
+                                .monospace()
+                                .color(self.syntax.link),
+                        );
+                        ui.separator();
+
+                        // Function count
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} funcs",
+                                project.functions.functions.len()
+                            ))
+                            .size(11.0),
+                        );
+
+                        // Current function name
+                        if let Some(func) = project
+                            .functions
+                            .functions
+                            .range(..=self.current_address)
+                            .next_back()
+                            .map(|(_, f)| f)
+                        {
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new(&func.name)
+                                    .size(11.0)
+                                    .color(self.syntax.label),
+                            );
+                        }
+                    } else {
+                        ui.label(
+                            egui::RichText::new("No binary loaded")
+                                .size(11.0)
+                                .color(self.syntax.text_dim),
+                        );
+                    }
+
+                    // Right-aligned toggle for output panel
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let icon = if self.output_panel_visible {
+                            "Output [-]"
+                        } else {
+                            "Output [+]"
+                        };
+                        if ui.button(egui::RichText::new(icon).size(11.0)).clicked() {
+                            self.output_panel_visible = !self.output_panel_visible;
+                        }
+                    });
+                });
+            });
+    }
+
     fn show_top_panel(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             self.show_menu_bar(ui, ctx);
@@ -136,10 +354,6 @@ impl SleuthreApp {
                 if ui.button("Search").clicked() {
                     self.search_active = true;
                 }
-                if ui.button("Goto").clicked() {
-                    self.goto_active = true;
-                    self.goto_input = String::new();
-                }
                 ui.separator();
                 let has_project = self.project.is_some();
                 if ui
@@ -161,29 +375,256 @@ impl SleuthreApp {
                     self.update_cfg();
                 }
                 ui.separator();
-                ui.monospace(format!("{:08X}", self.current_address));
+
+                // Command bar (replaces static address display and Goto button)
+                self.show_command_bar(ui);
             });
             ui.separator();
             self.show_navigation_band(ui);
-            ui.horizontal(|ui| {
-                ui.style_mut().spacing.item_spacing.x = 8.0;
-                let legend = [
-                    (egui::Color32::from_rgb(0, 200, 255), "Regular function"),
-                    (egui::Color32::from_rgb(0, 0, 255), "Library function"),
-                    (egui::Color32::from_rgb(160, 80, 0), "Instruction"),
-                    (egui::Color32::from_rgb(180, 180, 180), "Data"),
-                    (egui::Color32::from_rgb(180, 180, 100), "Unexplored"),
-                ];
-                for (color, label) in legend {
-                    ui.horizontal(|ui| {
-                        let (rect, _) =
-                            ui.allocate_at_least(egui::vec2(12.0, 12.0), egui::Sense::hover());
-                        ui.painter().rect_filled(rect, 0.0, color);
-                        ui.label(egui::RichText::new(label).size(10.0));
-                    });
+        });
+    }
+
+    fn show_command_bar(&mut self, ui: &mut egui::Ui) {
+        let placeholder = format!("{:08X}", self.current_address);
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut self.command_bar_input)
+                .hint_text(placeholder)
+                .desired_width(300.0)
+                .font(egui::TextStyle::Monospace),
+        );
+
+        if response.gained_focus() {
+            self.command_bar_active = true;
+        }
+
+        // Handle keyboard navigation in the dropdown
+        if self.command_bar_active && !self.command_bar_results.is_empty() {
+            let mut navigate = false;
+            ui.input(|i| {
+                if i.key_pressed(egui::Key::ArrowDown) {
+                    self.command_bar_selected = (self.command_bar_selected + 1)
+                        .min(self.command_bar_results.len().saturating_sub(1));
+                }
+                if i.key_pressed(egui::Key::ArrowUp) {
+                    self.command_bar_selected = self.command_bar_selected.saturating_sub(1);
+                }
+                if i.key_pressed(egui::Key::Enter) {
+                    navigate = true;
+                }
+                if i.key_pressed(egui::Key::Escape) {
+                    self.command_bar_active = false;
+                    self.command_bar_results.clear();
                 }
             });
-        });
+
+            if navigate
+                && let Some(result) = self.command_bar_results.get(self.command_bar_selected)
+            {
+                let addr = result.address;
+                self.command_bar_input.clear();
+                self.command_bar_results.clear();
+                self.command_bar_active = false;
+                if let Some(ref mut project) = self.project {
+                    project.navigate_to(addr);
+                }
+                self.current_address = addr;
+                self.update_cfg();
+            }
+        } else if self.command_bar_active {
+            // Enter on empty results = try direct address
+            ui.input(|i| {
+                if i.key_pressed(egui::Key::Escape) {
+                    self.command_bar_active = false;
+                    self.command_bar_input.clear();
+                }
+            });
+            if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                self.navigate_command_bar();
+            }
+        }
+
+        // Update search results on input change
+        if response.changed() && !self.command_bar_input.is_empty() {
+            self.update_command_bar_results();
+        } else if self.command_bar_input.is_empty() {
+            self.command_bar_results.clear();
+        }
+
+        if response.lost_focus() && !ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            self.command_bar_active = false;
+        }
+    }
+
+    fn navigate_command_bar(&mut self) {
+        let input = self.command_bar_input.trim().to_string();
+        self.command_bar_input.clear();
+        self.command_bar_active = false;
+        self.command_bar_results.clear();
+
+        if input.is_empty() {
+            return;
+        }
+
+        // Try as hex address
+        let addr_str = input.trim_start_matches("0x").trim_start_matches("0X");
+        if let Ok(addr) = u64::from_str_radix(addr_str, 16) {
+            if let Some(ref mut project) = self.project {
+                project.navigate_to(addr);
+            }
+            self.current_address = addr;
+            self.update_cfg();
+        }
+    }
+
+    fn update_command_bar_results(&mut self) {
+        self.command_bar_results.clear();
+        self.command_bar_selected = 0;
+
+        let query = self.command_bar_input.to_lowercase();
+        let Some(ref project) = self.project else {
+            return;
+        };
+
+        // Check for scoped queries
+        if let Some(rest) = query.strip_prefix("#string:") {
+            for s in &project.strings.strings {
+                if s.value.to_lowercase().contains(rest) {
+                    self.command_bar_results.push(CommandBarResult {
+                        label: format!("{:08X} \"{}\"", s.address, truncate_str(&s.value, 40)),
+                        address: s.address,
+                        kind: CommandBarResultKind::StringRef,
+                    });
+                    if self.command_bar_results.len() >= 20 {
+                        break;
+                    }
+                }
+            }
+            return;
+        }
+
+        if let Some(rest) = query.strip_prefix("#import:") {
+            for imp in &project.imports {
+                if imp.name.to_lowercase().contains(rest) {
+                    self.command_bar_results.push(CommandBarResult {
+                        label: format!("{:08X} {} ({})", imp.address, imp.name, imp.library),
+                        address: imp.address,
+                        kind: CommandBarResultKind::Import,
+                    });
+                    if self.command_bar_results.len() >= 20 {
+                        break;
+                    }
+                }
+            }
+            return;
+        }
+
+        // Try hex address first
+        let addr_str = query.trim_start_matches("0x").trim_start_matches("0X");
+        if let Ok(addr) = u64::from_str_radix(addr_str, 16) {
+            self.command_bar_results.push(CommandBarResult {
+                label: format!("Go to {:08X}", addr),
+                address: addr,
+                kind: CommandBarResultKind::Function,
+            });
+        }
+
+        // Functions (fuzzy subsequence match)
+        for func in project.functions.functions.values() {
+            if fuzzy_match(&func.name, &query) {
+                self.command_bar_results.push(CommandBarResult {
+                    label: format!("{:08X} {}", func.start_address, func.name),
+                    address: func.start_address,
+                    kind: CommandBarResultKind::Function,
+                });
+                if self.command_bar_results.len() >= 20 {
+                    return;
+                }
+            }
+        }
+
+        // Imports
+        for imp in &project.imports {
+            if fuzzy_match(&imp.name, &query) {
+                self.command_bar_results.push(CommandBarResult {
+                    label: format!("{:08X} {} [import]", imp.address, imp.name),
+                    address: imp.address,
+                    kind: CommandBarResultKind::Import,
+                });
+                if self.command_bar_results.len() >= 20 {
+                    return;
+                }
+            }
+        }
+
+        // Exports
+        for exp in &project.exports {
+            if fuzzy_match(&exp.name, &query) {
+                self.command_bar_results.push(CommandBarResult {
+                    label: format!("{:08X} {} [export]", exp.address, exp.name),
+                    address: exp.address,
+                    kind: CommandBarResultKind::Export,
+                });
+                if self.command_bar_results.len() >= 20 {
+                    return;
+                }
+            }
+        }
+
+        // Strings
+        for s in &project.strings.strings {
+            if s.value.to_lowercase().contains(&query) {
+                self.command_bar_results.push(CommandBarResult {
+                    label: format!("{:08X} \"{}\"", s.address, truncate_str(&s.value, 40)),
+                    address: s.address,
+                    kind: CommandBarResultKind::StringRef,
+                });
+                if self.command_bar_results.len() >= 20 {
+                    return;
+                }
+            }
+        }
+    }
+
+    fn show_command_bar_dropdown(&mut self, ctx: &egui::Context) {
+        if !self.command_bar_active || self.command_bar_results.is_empty() {
+            return;
+        }
+
+        egui::Area::new(egui::Id::new("command_bar_dropdown"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(400.0, 80.0))
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(300.0);
+                    let mut navigate_addr = None;
+                    for (i, result) in self.command_bar_results.iter().enumerate() {
+                        let is_selected = i == self.command_bar_selected;
+                        let kind_color = match result.kind {
+                            CommandBarResultKind::Function => self.syntax.label,
+                            CommandBarResultKind::Import => self.syntax.keyword,
+                            CommandBarResultKind::Export => self.syntax.number,
+                            CommandBarResultKind::StringRef => self.syntax.string,
+                        };
+                        let text = egui::RichText::new(&result.label)
+                            .monospace()
+                            .size(11.0)
+                            .color(kind_color);
+                        if ui.selectable_label(is_selected, text).clicked() {
+                            navigate_addr = Some(result.address);
+                        }
+                    }
+                    if let Some(addr) = navigate_addr {
+                        self.command_bar_input.clear();
+                        self.command_bar_results.clear();
+                        self.command_bar_active = false;
+                        if let Some(ref mut project) = self.project {
+                            project.navigate_to(addr);
+                        }
+                        self.current_address = addr;
+                        self.update_cfg();
+                    }
+                });
+            });
     }
 
     fn show_menu_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -207,31 +648,6 @@ impl SleuthreApp {
                 }
             });
             ui.menu_button("Edit", |ui| {
-                let can_undo = self.project.as_ref().is_some_and(|p| p.can_undo());
-                let can_redo = self.project.as_ref().is_some_and(|p| p.can_redo());
-                if ui
-                    .add_enabled(can_undo, egui::Button::new("Undo (Ctrl+Z)"))
-                    .clicked()
-                {
-                    if let Some(ref mut project) = self.project
-                        && let Some(msg) = project.undo()
-                    {
-                        self.output.push_str(&format!("{}\n", msg));
-                    }
-                    ui.close();
-                }
-                if ui
-                    .add_enabled(can_redo, egui::Button::new("Redo (Ctrl+Shift+Z)"))
-                    .clicked()
-                {
-                    if let Some(ref mut project) = self.project
-                        && let Some(msg) = project.redo()
-                    {
-                        self.output.push_str(&format!("{}\n", msg));
-                    }
-                    ui.close();
-                }
-                ui.separator();
                 if ui.button("Rename (N)").clicked() {
                     if self.focused_address.is_some() {
                         self.rename_active = true;
@@ -248,27 +664,9 @@ impl SleuthreApp {
             });
             ui.menu_button("Jump", |ui| {
                 if ui.button("Go to Address (Ctrl+G)").clicked() {
-                    self.goto_active = true;
-                    self.goto_input = String::new();
-                    ui.close();
-                }
-                ui.separator();
-                if ui.button("Navigate Back (Alt+Left)").clicked() {
-                    if let Some(ref mut project) = self.project
-                        && let Some(addr) = project.navigate_back()
-                    {
-                        self.current_address = addr;
-                        self.update_cfg();
-                    }
-                    ui.close();
-                }
-                if ui.button("Navigate Forward (Alt+Right)").clicked() {
-                    if let Some(ref mut project) = self.project
-                        && let Some(addr) = project.navigate_forward()
-                    {
-                        self.current_address = addr;
-                        self.update_cfg();
-                    }
+                    self.command_bar_active = true;
+                    self.command_bar_input.clear();
+                    self.command_bar_results.clear();
                     ui.close();
                 }
                 ui.separator();
@@ -315,20 +713,41 @@ impl SleuthreApp {
                 }
             });
             ui.menu_button("Debugger", |ui| {
-                ui.label(egui::RichText::new("No debugger attached").color(egui::Color32::GRAY));
-            });
-            ui.menu_button("Options", |ui| {
-                let theme_label = match self.theme_mode {
-                    ThemeMode::Dark => "Switch to Light Theme",
-                    ThemeMode::Light => "Switch to Dark Theme",
-                };
-                if ui.button(theme_label).clicked() {
-                    self.theme_mode = match self.theme_mode {
-                        ThemeMode::Dark => ThemeMode::Light,
-                        ThemeMode::Light => ThemeMode::Dark,
-                    };
-                    self.theme_changed = true;
-                    ui.close();
+                let state = self.debugger.state();
+                ui.label(format!("State: {:?}", state));
+                ui.separator();
+                match state {
+                    re_core::DebuggerState::Detached => {
+                        if ui.button("Attach to Process...").clicked() {
+                            let _ = self.debugger.attach(1234);
+                            self.add_toast(
+                                crate::app::ToastKind::Success,
+                                "Attached to mock process 1234".into(),
+                            );
+                            ui.close();
+                        }
+                    }
+                    re_core::DebuggerState::Paused => {
+                        if ui.button("Continue (F9)").clicked() {
+                            let _ = self.debugger.continue_exec();
+                            ui.close();
+                        }
+                        if ui.button("Step Into (F7)").clicked() {
+                            let _ = self.debugger.step();
+                            ui.close();
+                        }
+                        if ui.button("Detach").clicked() {
+                            let _ = self.debugger.detach();
+                            ui.close();
+                        }
+                    }
+                    re_core::DebuggerState::Running => {
+                        if ui.button("Pause").clicked() {
+                            // Mock pause
+                            let _ = self.debugger.attach(1234);
+                            ui.close();
+                        }
+                    }
                 }
             });
             ui.menu_button("Plugins", |ui| {
@@ -337,6 +756,8 @@ impl SleuthreApp {
                         match self.plugin_manager.run_all_analysis_passes(
                             &project.memory_map,
                             &mut project.functions,
+                            &project.xrefs,
+                            &project.strings,
                         ) {
                             Ok(findings) => {
                                 self.plugin_findings = findings;
@@ -373,7 +794,7 @@ impl SleuthreApp {
                     ("Call Graph", Tab::CallGraph),
                 ] {
                     if ui.button(name).clicked() {
-                        self.active_tab = tab;
+                        self.focus_or_open_tab(tab);
                         ui.close();
                     }
                 }
@@ -388,7 +809,7 @@ impl SleuthreApp {
                 ui.monospace("N         Rename");
                 ui.monospace(";         Comment");
                 ui.monospace("X         Xrefs");
-                ui.monospace("Ctrl+G    Go to address");
+                ui.monospace("Ctrl+G    Command bar");
                 ui.monospace("Ctrl+D    Bookmark");
                 ui.monospace("Ctrl+F    Search");
                 ui.monospace("Ctrl+Z    Undo");
@@ -399,9 +820,26 @@ impl SleuthreApp {
         });
     }
 
-    fn show_navigation_band(&self, ui: &mut egui::Ui) {
-        let (rect, _) =
-            ui.allocate_at_least(egui::vec2(ui.available_width(), 14.0), egui::Sense::hover());
+    fn show_navigation_band(&mut self, ui: &mut egui::Ui) {
+        // Layer toggle buttons
+        ui.horizontal(|ui| {
+            ui.style_mut().spacing.item_spacing.x = 2.0;
+            ui.selectable_value(&mut self.nav_band_layer, NavBandLayer::Segments, "Segments");
+            ui.selectable_value(
+                &mut self.nav_band_layer,
+                NavBandLayer::Functions,
+                "Functions",
+            );
+            ui.selectable_value(
+                &mut self.nav_band_layer,
+                NavBandLayer::AnalysisState,
+                "Analysis",
+            );
+        });
+
+        let (rect, response) =
+            ui.allocate_at_least(egui::vec2(ui.available_width(), 14.0), egui::Sense::click());
+
         let painter = ui.painter();
         painter.rect_filled(rect, 0.0, self.syntax.nav_band_bg);
 
@@ -421,28 +859,175 @@ impl SleuthreApp {
             let total_size = (max_addr - min_addr) as f32;
 
             if total_size > 0.0 {
-                for segment in &project.memory_map.segments {
-                    let color = if segment
-                        .permissions
-                        .contains(re_core::memory::Permissions::EXECUTE)
-                    {
-                        self.syntax.nav_band_exec
-                    } else {
-                        self.syntax.nav_band_data
-                    };
-                    let start_ratio = (segment.start - min_addr) as f32 / total_size;
-                    let size_ratio = segment.size as f32 / total_size;
-                    let x = rect.min.x + (rect.width() * start_ratio);
-                    let w = rect.width() * size_ratio;
-                    painter.rect_filled(
-                        egui::Rect::from_min_size(
-                            egui::pos2(x, rect.min.y),
-                            egui::vec2(w, rect.height()),
-                        ),
-                        0.0,
-                        color,
-                    );
+                match self.nav_band_layer {
+                    NavBandLayer::Segments => {
+                        for segment in &project.memory_map.segments {
+                            let color = if segment
+                                .permissions
+                                .contains(re_core::memory::Permissions::EXECUTE)
+                            {
+                                self.syntax.nav_band_exec
+                            } else {
+                                self.syntax.nav_band_data
+                            };
+                            let start_ratio = (segment.start - min_addr) as f32 / total_size;
+                            let size_ratio = segment.size as f32 / total_size;
+                            let x = rect.min.x + (rect.width() * start_ratio);
+                            let w = rect.width() * size_ratio;
+                            let seg_rect = egui::Rect::from_min_size(
+                                egui::pos2(x, rect.min.y),
+                                egui::vec2(w, rect.height()),
+                            );
+                            painter.rect_filled(seg_rect, 0.0, color);
+                        }
+                    }
+                    NavBandLayer::Functions => {
+                        // Paint function ranges
+                        let import_addrs: std::collections::HashSet<u64> =
+                            project.imports.iter().map(|imp| imp.address).collect();
+                        for func in project.functions.functions.values() {
+                            let func_size = func
+                                .end_address
+                                .unwrap_or(func.start_address + 0x10)
+                                .saturating_sub(func.start_address);
+                            let start_ratio = (func.start_address - min_addr) as f32 / total_size;
+                            let size_ratio = (func_size as f32 / total_size).max(0.002);
+                            let x = rect.min.x + (rect.width() * start_ratio);
+                            let w = (rect.width() * size_ratio).max(1.0);
+                            let color = if import_addrs.contains(&func.start_address) {
+                                self.syntax.nav_band_func_lib
+                            } else {
+                                self.syntax.nav_band_func_user
+                            };
+                            let func_rect = egui::Rect::from_min_size(
+                                egui::pos2(x, rect.min.y),
+                                egui::vec2(w, rect.height()),
+                            );
+                            painter.rect_filled(func_rect, 0.0, color);
+                        }
+                    }
+                    NavBandLayer::AnalysisState => {
+                        // Color by coverage: functions = exec color, strings = string color,
+                        // segments without functions = unexplored
+                        for segment in &project.memory_map.segments {
+                            let start_ratio = (segment.start - min_addr) as f32 / total_size;
+                            let size_ratio = segment.size as f32 / total_size;
+                            let x = rect.min.x + (rect.width() * start_ratio);
+                            let w = rect.width() * size_ratio;
+                            let seg_rect = egui::Rect::from_min_size(
+                                egui::pos2(x, rect.min.y),
+                                egui::vec2(w, rect.height()),
+                            );
+                            painter.rect_filled(seg_rect, 0.0, self.syntax.nav_band_unexplored);
+                        }
+                        // Overlay functions
+                        for func in project.functions.functions.values() {
+                            let func_size = func
+                                .end_address
+                                .unwrap_or(func.start_address + 0x10)
+                                .saturating_sub(func.start_address);
+                            let start_ratio = (func.start_address - min_addr) as f32 / total_size;
+                            let size_ratio = (func_size as f32 / total_size).max(0.002);
+                            let x = rect.min.x + (rect.width() * start_ratio);
+                            let w = (rect.width() * size_ratio).max(1.0);
+                            let func_rect = egui::Rect::from_min_size(
+                                egui::pos2(x, rect.min.y),
+                                egui::vec2(w, rect.height()),
+                            );
+                            painter.rect_filled(func_rect, 0.0, self.syntax.nav_band_exec);
+                        }
+                        // Overlay strings
+                        for s in &project.strings.strings {
+                            let start_ratio = (s.address - min_addr) as f32 / total_size;
+                            let size_ratio = ((s.length as f32) / total_size).max(0.001);
+                            let x = rect.min.x + (rect.width() * start_ratio);
+                            let w = (rect.width() * size_ratio).max(1.0);
+                            let str_rect = egui::Rect::from_min_size(
+                                egui::pos2(x, rect.min.y),
+                                egui::vec2(w, rect.height()),
+                            );
+                            painter.rect_filled(str_rect, 0.0, self.syntax.nav_band_string);
+                        }
+                    }
                 }
+
+                // Enhanced tooltips
+                if let Some(hover_pos) = ui.input(|i| i.pointer.hover_pos())
+                    && rect.contains(hover_pos)
+                {
+                    let ratio = (hover_pos.x - rect.min.x) / rect.width();
+                    let hover_addr = min_addr + (total_size * ratio) as u64;
+
+                    // Find segment at hover
+                    let segment_info = project
+                        .memory_map
+                        .segments
+                        .iter()
+                        .find(|s| hover_addr >= s.start && hover_addr < s.start + s.size);
+
+                    // Find function at hover
+                    let func_info = project
+                        .functions
+                        .functions
+                        .range(..=hover_addr)
+                        .next_back()
+                        .and_then(|(_, f)| {
+                            let end = f.end_address.unwrap_or(f.start_address + 0x100);
+                            if hover_addr < end { Some(f) } else { None }
+                        });
+
+                    #[allow(deprecated)]
+                    egui::show_tooltip(ui.ctx(), ui.layer_id(), ui.id(), |ui| {
+                        ui.label(format!("Address: {:08X}", hover_addr));
+                        if let Some(seg) = segment_info {
+                            ui.label(format!(
+                                "{}: {:08X} - {:08X} ({})",
+                                seg.name,
+                                seg.start,
+                                seg.start + seg.size,
+                                if seg
+                                    .permissions
+                                    .contains(re_core::memory::Permissions::EXECUTE)
+                                {
+                                    "Code"
+                                } else {
+                                    "Data"
+                                }
+                            ));
+                        }
+                        if let Some(func) = func_info {
+                            ui.label(format!("Function: {}", func.name));
+                        }
+                    });
+                }
+
+                // Interaction: Jump to address on click
+                if response.clicked()
+                    && let Some(click_pos) = response.interact_pointer_pos()
+                {
+                    let ratio = (click_pos.x - rect.min.x) / rect.width();
+                    let target_addr = min_addr + (total_size * ratio) as u64;
+
+                    // In Functions layer, snap to nearest function start
+                    let final_addr = if self.nav_band_layer == NavBandLayer::Functions {
+                        project
+                            .functions
+                            .functions
+                            .range(..=target_addr)
+                            .next_back()
+                            .map(|(_, f)| f.start_address)
+                            .unwrap_or(target_addr)
+                    } else {
+                        target_addr
+                    };
+
+                    self.current_address = final_addr;
+                    self.update_cfg();
+                    if let Some(ref mut p) = self.project {
+                        p.navigate_to(final_addr);
+                    }
+                }
+
                 let cursor_ratio =
                     (self.current_address.saturating_sub(min_addr)) as f32 / total_size;
                 let cursor_x = rect.min.x + (rect.width() * cursor_ratio);
@@ -460,7 +1045,7 @@ impl SleuthreApp {
     fn show_bottom_panel(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::bottom("bottom_panel")
             .resizable(true)
-            .default_height(150.0)
+            .default_height(self.output_panel_height)
             .show(ctx, |ui| {
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
@@ -480,57 +1065,366 @@ impl SleuthreApp {
                     ui.separator();
                     ui.horizontal(|ui| {
                         ui.label(
-                            egui::RichText::new(" Python ")
-                                .background_color(egui::Color32::from_rgb(220, 220, 220)),
+                            egui::RichText::new(" Console ")
+                                .background_color(egui::Color32::from_rgb(220, 220, 220))
+                                .color(egui::Color32::BLACK),
                         );
-                        ui.text_edit_singleline(&mut self.command_input);
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut self.command_input)
+                                .hint_text("Enter command (e.g. g 0x401000, rename 0x123 main)..."),
+                        );
+
+                        if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            self.execute_command();
+                        }
                     });
                 });
             });
     }
 
+    fn execute_command(&mut self) {
+        let cmd = self.command_input.trim().to_string();
+        self.command_input.clear();
+
+        if cmd.is_empty() {
+            return;
+        }
+
+        // Normalize syntax: goto(0x1000) -> goto 0x1000
+        let normalized = cmd.replace("(", " ").replace(")", " ").replace(",", " ");
+        let parts: Vec<&str> = normalized.split_whitespace().collect();
+
+        match parts[0] {
+            "g" | "goto" => {
+                if parts.len() > 1 {
+                    let addr_str = parts[1].trim_start_matches("0x").trim_start_matches("0X");
+                    if let Ok(addr) = u64::from_str_radix(addr_str, 16) {
+                        self.current_address = addr;
+                        self.update_cfg();
+                        self.add_toast(
+                            crate::app::ToastKind::Info,
+                            format!("Jumped to 0x{:X}", addr),
+                        );
+                    }
+                }
+            }
+            "rename" => {
+                if parts.len() > 2 {
+                    let addr_str = parts[1].trim_start_matches("0x").trim_start_matches("0X");
+                    if let Ok(addr) = u64::from_str_radix(addr_str, 16) {
+                        let new_name = parts[2].trim_matches('"').to_string();
+                        if let Some(ref mut project) = self.project {
+                            let old_name = project
+                                .functions
+                                .functions
+                                .get(&addr)
+                                .map(|f| f.name.clone())
+                                .unwrap_or_default();
+                            project.execute(re_core::project::UndoCommand::Rename {
+                                address: addr,
+                                old_name,
+                                new_name: new_name.clone(),
+                            });
+                            self.add_toast(
+                                crate::app::ToastKind::Success,
+                                format!("Renamed 0x{:X} to {}", addr, new_name),
+                            );
+                        }
+                    }
+                }
+            }
+            "comment" => {
+                if parts.len() > 2 {
+                    let addr_str = parts[1].trim_start_matches("0x").trim_start_matches("0X");
+                    if let Ok(addr) = u64::from_str_radix(addr_str, 16) {
+                        let text = parts[2..].join(" ").trim_matches('"').to_string();
+                        if let Some(ref mut project) = self.project {
+                            let old_comment = project.comments.get(&addr).cloned();
+                            project.execute(re_core::project::UndoCommand::Comment {
+                                address: addr,
+                                old_comment,
+                                new_comment: Some(text.clone()),
+                            });
+                            self.add_toast(
+                                crate::app::ToastKind::Success,
+                                format!("Added comment at 0x{:X}", addr),
+                            );
+                        }
+                    }
+                }
+            }
+            "list" | "ls" => {
+                if let Some(ref project) = self.project {
+                    self.output.push_str("Functions:\n");
+                    for f in project.functions.functions.values().take(10) {
+                        self.output
+                            .push_str(&format!("  0x{:X} - {}\n", f.start_address, f.name));
+                    }
+                    self.output.push_str("  ...\n");
+                }
+            }
+            "help" => {
+                self.output.push_str("Commands:\n");
+                self.output
+                    .push_str("  g/goto <addr>          - Jump to address\n");
+                self.output
+                    .push_str("  rename <addr> <name>   - Rename function\n");
+                self.output
+                    .push_str("  comment <addr> <text>  - Add comment\n");
+                self.output
+                    .push_str("  list                   - List first 10 functions\n");
+                self.output
+                    .push_str("  help                   - Show this help\n");
+            }
+            _ => {
+                self.add_toast(
+                    crate::app::ToastKind::Error,
+                    format!("Unknown command: {}", parts[0]),
+                );
+            }
+        }
+    }
+
     fn show_left_panel(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("left_panel")
             .resizable(true)
-            .default_width(220.0)
+            .default_width(320.0)
             .show(ctx, |ui| {
-                ui.heading("Functions window");
+                ui.heading("Functions");
+
+                // Filter row
                 ui.horizontal(|ui| {
-                    ui.label("🔍");
-                    ui.text_edit_singleline(&mut self.function_filter);
+                    ui.label("Filter:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.function_filter).desired_width(120.0),
+                    );
+                    egui::ComboBox::from_id_salt("func_type_filter")
+                        .selected_text(match self.func_type_filter {
+                            FunctionTypeFilter::All => "All",
+                            FunctionTypeFilter::User => "User",
+                            FunctionTypeFilter::Library => "Lib",
+                        })
+                        .width(50.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.func_type_filter,
+                                FunctionTypeFilter::All,
+                                "All",
+                            );
+                            ui.selectable_value(
+                                &mut self.func_type_filter,
+                                FunctionTypeFilter::User,
+                                "User",
+                            );
+                            ui.selectable_value(
+                                &mut self.func_type_filter,
+                                FunctionTypeFilter::Library,
+                                "Library",
+                            );
+                        });
                 });
                 ui.separator();
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    let mut jump = None;
-                    if let Some(project) = &self.project {
-                        for func in project.functions.functions.values() {
-                            if self.function_filter.is_empty()
-                                || func
-                                    .name
-                                    .to_lowercase()
-                                    .contains(&self.function_filter.to_lowercase())
-                            {
-                                let is_selected = self.current_address == func.start_address;
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        egui::RichText::new(" f ")
-                                            .background_color(self.syntax.func_badge_bg),
-                                    );
-                                    if ui.selectable_label(is_selected, &func.name).clicked() {
-                                        jump = Some(func.start_address);
-                                    }
-                                });
+
+                // Column headers
+                ui.horizontal(|ui| {
+                    ui.style_mut().spacing.item_spacing.x = 4.0;
+                    let header = |ui: &mut egui::Ui,
+                                  label: &str,
+                                  col: FunctionSortColumn,
+                                  sort_col: &mut FunctionSortColumn,
+                                  ascending: &mut bool,
+                                  width: f32| {
+                        let is_active = *sort_col == col;
+                        let arrow = if is_active {
+                            if *ascending { " ^" } else { " v" }
+                        } else {
+                            ""
+                        };
+                        let text = format!("{}{}", label, arrow);
+                        let resp = ui.add_sized(
+                            egui::vec2(width, 16.0),
+                            egui::Button::new(egui::RichText::new(text).size(10.0).strong()),
+                        );
+                        if resp.clicked() {
+                            if *sort_col == col {
+                                *ascending = !*ascending;
+                            } else {
+                                *sort_col = col;
+                                *ascending = true;
                             }
                         }
-                    }
-                    if let Some(addr) = jump {
-                        if let Some(ref mut project) = self.project {
-                            project.navigate_to(addr);
-                        }
-                        self.current_address = addr;
-                        self.update_cfg();
-                    }
+                    };
+                    header(
+                        ui,
+                        "Address",
+                        FunctionSortColumn::Address,
+                        &mut self.func_sort_column,
+                        &mut self.func_sort_ascending,
+                        70.0,
+                    );
+                    header(
+                        ui,
+                        "Name",
+                        FunctionSortColumn::Name,
+                        &mut self.func_sort_column,
+                        &mut self.func_sort_ascending,
+                        120.0,
+                    );
+                    header(
+                        ui,
+                        "Size",
+                        FunctionSortColumn::Size,
+                        &mut self.func_sort_column,
+                        &mut self.func_sort_ascending,
+                        50.0,
+                    );
+                    header(
+                        ui,
+                        "Xrefs",
+                        FunctionSortColumn::XrefsIn,
+                        &mut self.func_sort_column,
+                        &mut self.func_sort_ascending,
+                        45.0,
+                    );
                 });
+                ui.separator();
+
+                // Build sorted/filtered function list
+                let mut jump = None;
+                let filter_lower = self.function_filter.to_lowercase();
+
+                if let Some(project) = &self.project {
+                    let import_addrs: std::collections::HashSet<u64> =
+                        project.imports.iter().map(|imp| imp.address).collect();
+
+                    let mut funcs: Vec<_> = project
+                        .functions
+                        .functions
+                        .values()
+                        .filter(|func| {
+                            // Text filter (fuzzy subsequence)
+                            if !filter_lower.is_empty() && !fuzzy_match(&func.name, &filter_lower) {
+                                return false;
+                            }
+                            // Type filter
+                            match self.func_type_filter {
+                                FunctionTypeFilter::All => true,
+                                FunctionTypeFilter::Library => {
+                                    import_addrs.contains(&func.start_address)
+                                }
+                                FunctionTypeFilter::User => {
+                                    !import_addrs.contains(&func.start_address)
+                                }
+                            }
+                        })
+                        .collect();
+
+                    // Sort
+                    let xref_counts = &self.func_xref_counts;
+                    match self.func_sort_column {
+                        FunctionSortColumn::Address => {
+                            funcs.sort_by_key(|f| f.start_address);
+                        }
+                        FunctionSortColumn::Name => {
+                            funcs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                        }
+                        FunctionSortColumn::Size => {
+                            funcs.sort_by_key(|f| {
+                                f.end_address
+                                    .unwrap_or(f.start_address)
+                                    .saturating_sub(f.start_address)
+                            });
+                        }
+                        FunctionSortColumn::XrefsIn => {
+                            funcs.sort_by_key(|f| {
+                                xref_counts
+                                    .get(&f.start_address)
+                                    .map(|(i, _)| *i)
+                                    .unwrap_or(0)
+                            });
+                        }
+                    }
+                    if !self.func_sort_ascending {
+                        funcs.reverse();
+                    }
+
+                    // Function count
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} / {} functions",
+                            funcs.len(),
+                            project.functions.functions.len()
+                        ))
+                        .size(10.0)
+                        .color(self.syntax.text_dim),
+                    );
+
+                    // Render list
+                    egui::ScrollArea::vertical()
+                        .id_salt("func_scroll")
+                        .show(ui, |ui| {
+                            for func in &funcs {
+                                let is_selected = self.current_address == func.start_address;
+                                let size = func
+                                    .end_address
+                                    .unwrap_or(func.start_address)
+                                    .saturating_sub(func.start_address);
+                                let xrefs = xref_counts
+                                    .get(&func.start_address)
+                                    .map(|(i, _)| *i)
+                                    .unwrap_or(0);
+                                let is_lib = import_addrs.contains(&func.start_address);
+                                let badge_text = if is_lib { " L " } else { " f " };
+                                let badge_color = if is_lib {
+                                    self.syntax.nav_band_func_lib
+                                } else {
+                                    self.syntax.func_badge_bg
+                                };
+
+                                ui.horizontal(|ui| {
+                                    ui.style_mut().spacing.item_spacing.x = 4.0;
+                                    ui.label(
+                                        egui::RichText::new(badge_text)
+                                            .size(10.0)
+                                            .background_color(badge_color),
+                                    );
+                                    ui.monospace(
+                                        egui::RichText::new(format!("{:08X}", func.start_address))
+                                            .size(10.0)
+                                            .color(self.syntax.address),
+                                    );
+                                    if ui
+                                        .selectable_label(
+                                            is_selected,
+                                            egui::RichText::new(&func.name).size(11.0),
+                                        )
+                                        .clicked()
+                                    {
+                                        jump = Some(func.start_address);
+                                    }
+                                    ui.monospace(
+                                        egui::RichText::new(format!("{:X}", size))
+                                            .size(10.0)
+                                            .color(self.syntax.text_dim),
+                                    );
+                                    ui.monospace(
+                                        egui::RichText::new(format!("{}", xrefs))
+                                            .size(10.0)
+                                            .color(self.syntax.text_dim),
+                                    );
+                                });
+                            }
+                        });
+                }
+
+                if let Some(addr) = jump {
+                    if let Some(ref mut project) = self.project {
+                        project.navigate_to(addr);
+                    }
+                    self.current_address = addr;
+                    self.update_cfg();
+                }
+
                 // Bookmarks section
                 ui.separator();
                 ui.heading("Bookmarks");
@@ -574,35 +1468,44 @@ impl SleuthreApp {
     }
 
     fn show_central_panel(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                let tabs = [
-                    ("Disassembly", Tab::Disassembly),
-                    ("Graph", Tab::Graph),
-                    ("Pseudocode", Tab::Decompiler),
-                    ("Hex View", Tab::HexView),
-                    ("Strings", Tab::Strings),
-                    ("Imports", Tab::Imports),
-                    ("Exports", Tab::Exports),
-                    ("Structures", Tab::Structures),
-                    ("Call Graph", Tab::CallGraph),
-                ];
-                for (name, tab) in tabs {
-                    ui.selectable_value(&mut self.active_tab, tab, name);
-                }
-            });
-            ui.separator();
-            match self.active_tab {
-                Tab::Disassembly => self.show_disassembly(ui),
-                Tab::Graph => self.show_graph(ui),
-                Tab::Decompiler => self.show_decompiler(ui),
-                Tab::HexView => self.show_hex_view(ui),
-                Tab::Strings => self.show_strings(ui),
-                Tab::Imports => self.show_imports(ui),
-                Tab::Exports => self.show_exports(ui),
-                Tab::Structures => self.show_structures(ui),
-                Tab::CallGraph => self.show_call_graph(ui),
+        // Use std::mem::take to temporarily extract dock_state for the viewer
+        let mut dock_state = std::mem::replace(
+            &mut self.dock_state,
+            egui_dock::DockState::new(vec![Tab::Disassembly]),
+        );
+
+        let style = egui_dock::Style::from_egui(ctx.style().as_ref());
+        let mut viewer = SleuthreTabViewer { app: self };
+
+        egui_dock::DockArea::new(&mut dock_state)
+            .style(style)
+            .show(ctx, &mut viewer);
+
+        self.dock_state = dock_state;
+    }
+}
+
+/// Case-insensitive subsequence match
+fn fuzzy_match(haystack: &str, needle: &str) -> bool {
+    let haystack = haystack.to_lowercase();
+    let mut chars = needle.chars();
+    let mut current = chars.next();
+    for h in haystack.chars() {
+        if let Some(c) = current {
+            if h == c {
+                current = chars.next();
             }
-        });
+        } else {
+            return true;
+        }
+    }
+    current.is_none()
+}
+
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.len() > max_len {
+        format!("{}...", &s[..max_len])
+    } else {
+        s.to_string()
     }
 }

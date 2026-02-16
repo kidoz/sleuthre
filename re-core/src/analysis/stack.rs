@@ -76,8 +76,8 @@ pub fn recover_stack_variables(instructions: &[crate::disasm::Instruction]) -> V
         extract_stack_accesses(op, "esp", &mut vars);
 
         // ARM64: [sp, #-NN] or [x29, #-NN]
-        extract_arm_frame_accesses(op, "x29", &mut vars);
-        extract_arm_frame_accesses(op, "sp", &mut vars);
+        extract_arm_frame_accesses(op, &insn.mnemonic, "x29", &mut vars);
+        extract_arm_frame_accesses(op, &insn.mnemonic, "sp", &mut vars);
     }
 
     // Assign names and detect buffers
@@ -152,8 +152,13 @@ fn extract_stack_accesses(op: &str, reg: &str, vars: &mut BTreeMap<i64, StackVar
     }
 }
 
-fn extract_arm_frame_accesses(op: &str, reg: &str, vars: &mut BTreeMap<i64, StackVariable>) {
-    // ARM64 pattern: [x29, #-16] or [sp, #0x20]
+fn extract_arm_frame_accesses(
+    op: &str,
+    mnemonic: &str,
+    reg: &str,
+    vars: &mut BTreeMap<i64, StackVariable>,
+) {
+    // ARM64 pattern: [x29, #-16] or [sp, #0x20] or [sp]
     if let Some(bracket_start) = op.find('[')
         && let Some(bracket_end) = op[bracket_start..].find(']')
     {
@@ -161,6 +166,9 @@ fn extract_arm_frame_accesses(op: &str, reg: &str, vars: &mut BTreeMap<i64, Stac
         if !inner.contains(reg) {
             return;
         }
+
+        let mut offset = 0i64;
+        let mut found_offset = false;
 
         if let Some(hash) = inner.find('#') {
             let after_hash = inner[hash + 1..].trim();
@@ -172,11 +180,33 @@ fn extract_arm_frame_accesses(op: &str, reg: &str, vars: &mut BTreeMap<i64, Stac
             } else {
                 abs_str.parse::<i64>()
             };
-            if let Ok(offset) = parsed {
-                let actual_offset = if is_negative { -offset } else { offset };
-                let size: u64 = if op.contains('w') { 4 } else { 8 };
-                vars.entry(actual_offset).or_insert(StackVariable {
-                    offset: actual_offset,
+            if let Ok(val) = parsed {
+                offset = if is_negative { -val } else { val };
+                found_offset = true;
+            }
+        } else {
+            // [sp] implies offset 0
+            if inner.trim() == reg {
+                found_offset = true;
+            }
+        }
+
+        if found_offset {
+            let size: u64 = if op.contains('w') { 4 } else { 8 };
+
+            // Add first variable
+            vars.entry(offset).or_insert(StackVariable {
+                offset,
+                size,
+                name: String::new(),
+                type_hint: StackVarType::from_access_size(size as u8),
+            });
+
+            // Handle Pair Load/Store (ldp/stp) - implies second variable at offset + size
+            if mnemonic == "ldp" || mnemonic == "stp" {
+                let offset2 = offset + size as i64;
+                vars.entry(offset2).or_insert(StackVariable {
+                    offset: offset2,
                     size,
                     name: String::new(),
                     type_hint: StackVarType::from_access_size(size as u8),
@@ -223,8 +253,8 @@ fn assign_names(vars: &mut [StackVariable]) {
                 StackVarType::Pointer => format!("ptr_{local_count}"),
                 _ => format!("var_{local_count}"),
             };
-        } else if var.offset > 0 {
-            // Could be saved register or argument
+        } else {
+            // Could be saved register, argument, or sp-relative local
             arg_count += 1;
             var.name = format!("arg_{arg_count}");
         }

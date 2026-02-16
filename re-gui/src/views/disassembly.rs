@@ -34,6 +34,12 @@ impl SleuthreApp {
 
                     let response = ui
                         .horizontal(|ui| {
+                            let rect = ui.max_rect();
+                            if is_focused {
+                                ui.painter()
+                                    .rect_filled(rect, 0.0, self.syntax.selection_bg);
+                            }
+
                             if ui.selectable_label(is_focused, "").clicked() {
                                 self.focused_address = Some(insn.address);
                             }

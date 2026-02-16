@@ -19,3 +19,4 @@ uuid = { workspace = true }
 gimli = { workspace = true }
 object = { workspace = true }
 pdb = { workspace = true }
+rhai = { workspace = true }

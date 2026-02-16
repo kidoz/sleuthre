@@ -9,7 +9,10 @@ use std::collections::HashMap;
 use std::path::Path;
 
 /// Extract debug info from a PDB file.
-pub fn extract_pdb_info(pdb_path: &Path) -> crate::Result<DebugInfo> {
+pub fn extract_pdb_info(
+    pdb_path: &Path,
+    arch: crate::arch::Architecture,
+) -> crate::Result<DebugInfo> {
     let file = std::fs::File::open(pdb_path).map_err(Error::Io)?;
     let mut pdb =
         PDB::open(file).map_err(|e| Error::DebugInfo(format!("PDB open error: {}", e)))?;
@@ -44,7 +47,7 @@ pub fn extract_pdb_info(pdb_path: &Path) -> crate::Result<DebugInfo> {
                             && let Some(field_list) = data.fields
                         {
                             let fields =
-                                resolve_field_list(&type_finder, &mut resolver, field_list);
+                                resolve_field_list(&type_finder, &mut resolver, field_list, arch);
                             info.types.push(CompoundType::Struct {
                                 name,
                                 fields,
@@ -56,7 +59,7 @@ pub fn extract_pdb_info(pdb_path: &Path) -> crate::Result<DebugInfo> {
                         let name = data.name.to_string().to_string();
                         if !name.is_empty() {
                             let fields =
-                                resolve_field_list(&type_finder, &mut resolver, data.fields);
+                                resolve_field_list(&type_finder, &mut resolver, data.fields, arch);
                             info.types.push(CompoundType::Union {
                                 name,
                                 fields,
@@ -72,6 +75,7 @@ pub fn extract_pdb_info(pdb_path: &Path) -> crate::Result<DebugInfo> {
                                 &type_finder,
                                 &mut resolver,
                                 data.underlying_type,
+                                arch,
                             );
                             info.types.push(CompoundType::Enum {
                                 name,
@@ -104,6 +108,7 @@ pub fn extract_pdb_info(pdb_path: &Path) -> crate::Result<DebugInfo> {
                                     &type_finder,
                                     &mut resolver,
                                     proc.type_index,
+                                    arch,
                                 );
                                 info.function_signatures.insert(
                                     addr,
@@ -119,7 +124,8 @@ pub fn extract_pdb_info(pdb_path: &Path) -> crate::Result<DebugInfo> {
                             pdb::SymbolData::Data(data) => {
                                 let name = data.name.to_string().to_string();
                                 let addr = data.offset.offset as u64;
-                                let type_ref = resolver.resolve(&type_finder, data.type_index);
+                                let type_ref =
+                                    resolver.resolve(&type_finder, data.type_index, arch);
                                 info.global_variables.insert(
                                     addr,
                                     VariableInfo {
@@ -176,7 +182,12 @@ impl PdbTypeResolver {
         }
     }
 
-    fn resolve(&mut self, type_finder: &TypeFinder, type_index: TypeIndex) -> TypeRef {
+    fn resolve(
+        &mut self,
+        type_finder: &TypeFinder,
+        type_index: TypeIndex,
+        arch: crate::arch::Architecture,
+    ) -> TypeRef {
         let idx = type_index.0;
 
         if let Some(cached) = self.cache.get(&idx) {
@@ -194,12 +205,17 @@ impl PdbTypeResolver {
         self.cache
             .insert(idx, TypeRef::Named("<resolving>".to_string()));
 
-        let resolved = self.resolve_inner(type_finder, type_index);
+        let resolved = self.resolve_inner(type_finder, type_index, arch);
         self.cache.insert(idx, resolved.clone());
         resolved
     }
 
-    fn resolve_inner(&mut self, type_finder: &TypeFinder, type_index: TypeIndex) -> TypeRef {
+    fn resolve_inner(
+        &mut self,
+        type_finder: &TypeFinder,
+        type_index: TypeIndex,
+        arch: crate::arch::Architecture,
+    ) -> TypeRef {
         let item = match type_finder.find(type_index) {
             Ok(item) => item,
             Err(_) => return TypeRef::Primitive(PrimitiveType::Void),
@@ -215,11 +231,11 @@ impl PdbTypeResolver {
                 builtin_type_from_pdb_primitive(prim.kind, prim.indirection.as_ref())
             }
             TypeData::Pointer(ptr) => {
-                let inner = self.resolve(type_finder, ptr.underlying_type);
+                let inner = self.resolve(type_finder, ptr.underlying_type, arch);
                 TypeRef::Pointer(Box::new(inner))
             }
             TypeData::Modifier(modifier) => {
-                let inner = self.resolve(type_finder, modifier.underlying_type);
+                let inner = self.resolve(type_finder, modifier.underlying_type, arch);
                 if modifier.constant {
                     TypeRef::Const(Box::new(inner))
                 } else if modifier.volatile {
@@ -229,8 +245,8 @@ impl PdbTypeResolver {
                 }
             }
             TypeData::Array(arr) => {
-                let element = self.resolve(type_finder, arr.element_type);
-                let elem_size = type_size_hint(type_finder, arr.element_type).max(1);
+                let element = self.resolve(type_finder, arr.element_type, arch);
+                let elem_size = type_size_hint(type_finder, arr.element_type, arch).max(1);
                 let total_size = arr.dimensions.iter().copied().sum::<u32>();
                 let count = (total_size as usize) / elem_size;
                 TypeRef::Array {
@@ -241,9 +257,9 @@ impl PdbTypeResolver {
             TypeData::Procedure(proc) => {
                 let return_type = proc
                     .return_type
-                    .map(|ti| self.resolve(type_finder, ti))
+                    .map(|ti| self.resolve(type_finder, ti, arch))
                     .unwrap_or(TypeRef::Primitive(PrimitiveType::Void));
-                let params = self.resolve_argument_list(type_finder, proc.argument_list);
+                let params = self.resolve_argument_list(type_finder, proc.argument_list, arch);
                 TypeRef::FunctionPointer {
                     return_type: Box::new(return_type),
                     params,
@@ -261,6 +277,7 @@ impl PdbTypeResolver {
         &mut self,
         type_finder: &TypeFinder,
         arg_list_index: TypeIndex,
+        arch: crate::arch::Architecture,
     ) -> Vec<TypeRef> {
         let item = match type_finder.find(arg_list_index) {
             Ok(item) => item,
@@ -271,7 +288,7 @@ impl PdbTypeResolver {
             Ok(TypeData::ArgumentList(args)) => args
                 .arguments
                 .iter()
-                .map(|&ti| self.resolve(type_finder, ti))
+                .map(|&ti| self.resolve(type_finder, ti, arch))
                 .collect(),
             _ => Vec::new(),
         }
@@ -355,6 +372,7 @@ fn resolve_field_list(
     type_finder: &TypeFinder,
     resolver: &mut PdbTypeResolver,
     field_list_index: TypeIndex,
+    arch: crate::arch::Architecture,
 ) -> Vec<StructField> {
     let mut fields = Vec::new();
 
@@ -367,7 +385,7 @@ fn resolve_field_list(
         for field in &fl.fields {
             if let TypeData::Member(member) = field {
                 let name = member.name.to_string().to_string();
-                let type_ref = resolver.resolve(type_finder, member.field_type);
+                let type_ref = resolver.resolve(type_finder, member.field_type, arch);
                 fields.push(StructField {
                     name,
                     type_ref,
@@ -423,6 +441,7 @@ fn resolve_procedure_type(
     type_finder: &TypeFinder,
     resolver: &mut PdbTypeResolver,
     type_index: TypeIndex,
+    arch: crate::arch::Architecture,
 ) -> (TypeRef, Vec<FunctionParameter>) {
     let item = match type_finder.find(type_index) {
         Ok(item) => item,
@@ -435,14 +454,16 @@ fn resolve_procedure_type(
         Ok(TypeData::Procedure(proc)) => {
             let return_type = proc
                 .return_type
-                .map(|ti| resolver.resolve(type_finder, ti))
+                .map(|ti| resolver.resolve(type_finder, ti, arch))
                 .unwrap_or(TypeRef::Primitive(PrimitiveType::Void));
-            let params = resolve_argument_list_as_params(type_finder, resolver, proc.argument_list);
+            let params =
+                resolve_argument_list_as_params(type_finder, resolver, proc.argument_list, arch);
             (return_type, params)
         }
         Ok(TypeData::MemberFunction(mf)) => {
-            let return_type = resolver.resolve(type_finder, mf.return_type);
-            let params = resolve_argument_list_as_params(type_finder, resolver, mf.argument_list);
+            let return_type = resolver.resolve(type_finder, mf.return_type, arch);
+            let params =
+                resolve_argument_list_as_params(type_finder, resolver, mf.argument_list, arch);
             (return_type, params)
         }
         _ => (TypeRef::Primitive(PrimitiveType::Void), Vec::new()),
@@ -453,6 +474,7 @@ fn resolve_argument_list_as_params(
     type_finder: &TypeFinder,
     resolver: &mut PdbTypeResolver,
     arg_list_index: TypeIndex,
+    arch: crate::arch::Architecture,
 ) -> Vec<FunctionParameter> {
     let item = match type_finder.find(arg_list_index) {
         Ok(item) => item,
@@ -466,7 +488,7 @@ fn resolve_argument_list_as_params(
             .enumerate()
             .map(|(i, &ti)| FunctionParameter {
                 name: format!("arg{}", i),
-                type_ref: resolver.resolve(type_finder, ti),
+                type_ref: resolver.resolve(type_finder, ti, arch),
             })
             .collect(),
         _ => Vec::new(),
@@ -477,15 +499,20 @@ fn resolve_type_size(
     type_finder: &TypeFinder,
     resolver: &mut PdbTypeResolver,
     type_index: TypeIndex,
+    arch: crate::arch::Architecture,
 ) -> usize {
-    let resolved = resolver.resolve(type_finder, type_index);
+    let resolved = resolver.resolve(type_finder, type_index, arch);
     match resolved {
-        TypeRef::Primitive(p) => p.size(),
+        TypeRef::Primitive(p) => p.size(arch),
         _ => 4,
     }
 }
 
-fn type_size_hint(type_finder: &TypeFinder, type_index: TypeIndex) -> usize {
+fn type_size_hint(
+    type_finder: &TypeFinder,
+    type_index: TypeIndex,
+    arch: crate::arch::Architecture,
+) -> usize {
     let item = match type_finder.find(type_index) {
         Ok(item) => item,
         Err(_) => return 1,
@@ -495,7 +522,7 @@ fn type_size_hint(type_finder: &TypeFinder, type_index: TypeIndex) -> usize {
         Ok(TypeData::Primitive(prim)) => {
             let tr = builtin_type_from_pdb_primitive(prim.kind, None);
             match tr {
-                TypeRef::Primitive(p) => p.size().max(1),
+                TypeRef::Primitive(p) => p.size(arch).max(1),
                 _ => 1,
             }
         }

@@ -79,6 +79,7 @@ pub struct Project {
     pub libraries: Vec<String>,
     pub types: TypeManager,
     pub bookmarks: BTreeMap<u64, String>,
+    pub decompilation_cache: HashMap<u64, crate::il::hlil::DecompiledCode>,
     pub nav_history: Vec<u64>,
     pub nav_position: usize,
     pub undo_stack: Vec<UndoCommand>,
@@ -107,6 +108,7 @@ impl Project {
             libraries: Vec::new(),
             types: TypeManager::default(),
             bookmarks: BTreeMap::new(),
+            decompilation_cache: HashMap::new(),
             nav_history: Vec::new(),
             nav_position: 0,
             undo_stack: Vec::new(),
@@ -160,6 +162,25 @@ impl Project {
                 if let Some(f) = self.functions.functions.get_mut(address) {
                     f.name = name.clone();
                 }
+                self.decompilation_cache.remove(address);
+
+                // Invalidate callers too, as they might inline the function name
+                if let Some(xrefs) = self.xrefs.to_address_xrefs.get(address) {
+                    for xref in xrefs {
+                        if xref.xref_type == crate::analysis::xrefs::XrefType::Call {
+                            // Find function containing the call site
+                            if let Some((&caller_addr, _)) = self
+                                .functions
+                                .functions
+                                .range(..=xref.from_address)
+                                .next_back()
+                            {
+                                self.decompilation_cache.remove(&caller_addr);
+                            }
+                        }
+                    }
+                }
+
                 if undo {
                     format!("Undo rename at {:08X}", address)
                 } else {
@@ -180,6 +201,7 @@ impl Project {
                         self.comments.remove(address);
                     }
                 }
+                self.decompilation_cache.remove(address);
                 if undo {
                     format!("Undo comment at {:08X}", address)
                 } else {
@@ -213,6 +235,20 @@ impl Project {
                 // Best-effort write; if the address is invalid the undo/redo is
                 // a no-op (the project state is already inconsistent).
                 let _ = self.memory_map.write_data(*address, bytes);
+
+                // Invalidate decompilation cache for any functions that overlap with this patch
+                let patch_end = *address + bytes.len() as u64;
+                let mut to_remove = Vec::new();
+                for (&f_addr, f) in self.functions.functions.range(..patch_end) {
+                    let f_end = f.end_address.unwrap_or(f_addr + 0x1000);
+                    if *address < f_end {
+                        to_remove.push(f_addr);
+                    }
+                }
+                for f_addr in to_remove {
+                    self.decompilation_cache.remove(&f_addr);
+                }
+
                 if undo {
                     format!("Undo patch at {:08X} ({} bytes)", address, old_bytes.len())
                 } else {
@@ -334,6 +370,11 @@ impl Project {
             db.save_source_line(addr, info)?;
         }
 
+        // Persist decompilation cache
+        for (&addr, code) in &self.decompilation_cache {
+            db.save_decompiled_code(addr, code)?;
+        }
+
         Ok(())
     }
 
@@ -392,6 +433,9 @@ impl Project {
 
         // Restore source lines
         project.types.source_lines = db.load_source_lines()?;
+
+        // Restore decompilation cache
+        project.decompilation_cache = db.load_decompilation_cache()?;
 
         project.db = Some(db);
         Ok(project)

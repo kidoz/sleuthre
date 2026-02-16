@@ -3,6 +3,7 @@ mod decompiler;
 mod disassembly;
 mod exports;
 mod graph;
+pub(crate) mod graph_utils;
 mod hex;
 mod imports;
 mod strings;

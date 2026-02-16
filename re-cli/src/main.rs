@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -6,6 +7,7 @@ use serde::Serialize;
 
 use re_core::analysis::functions::FunctionManager;
 use re_core::analysis::strings::StringsManager;
+use re_core::analysis::type_propagation::{FunctionTypeInfo, TypePropagator};
 use re_core::analysis::xrefs::XrefManager;
 use re_core::arch::Architecture;
 use re_core::disasm::Disassembler;
@@ -18,6 +20,24 @@ use re_core::loader::{self, LoadedBinary};
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+fn platform_string(arch: Architecture, format: loader::BinaryFormat) -> String {
+    let os = match format {
+        loader::BinaryFormat::Elf => "linux",
+        loader::BinaryFormat::Pe => "windows",
+        loader::BinaryFormat::MachO => "macos",
+        loader::BinaryFormat::Raw => "unknown",
+    };
+    let arch_str = match arch {
+        Architecture::X86_64 => "x86_64",
+        Architecture::X86 => "x86",
+        Architecture::Arm64 => "arm64",
+        Architecture::Arm => "arm",
+        Architecture::Mips => "mips",
+        Architecture::Mips64 => "mips64",
+    };
+    format!("{}_{}", os, arch_str)
 }
 
 #[derive(Subcommand)]
@@ -43,6 +63,14 @@ enum Commands {
         /// Output results as JSON
         #[arg(long)]
         json: bool,
+    },
+    /// Decompile a function at an address
+    Decompile {
+        /// Path to the binary file
+        binary: PathBuf,
+        /// Address of the function (hex)
+        #[arg(long, value_parser = parse_hex_address)]
+        address: u64,
     },
     /// List all discovered functions
     Functions {
@@ -131,8 +159,8 @@ struct AnalysisResult {
     binary: LoadedBinary,
     functions: FunctionManager,
     strings: StringsManager,
-    #[allow(dead_code)]
-    xrefs: XrefManager,
+    _xrefs: XrefManager,
+    type_info: BTreeMap<u64, FunctionTypeInfo>,
 }
 
 /// Run the full analysis pipeline: load binary, discover functions, scan strings.
@@ -159,11 +187,25 @@ fn run_analysis(path: &Path) -> Result<AnalysisResult> {
     let _ = xrefs.scan_xrefs(&binary.memory_map, &disasm, &functions);
     let _ = xrefs.scan_string_xrefs(&binary.memory_map, &disasm, &functions, &strings.strings);
 
+    // Extract debug info if available
+    let bytes = std::fs::read(path).unwrap_or_default();
+    let debug_info =
+        re_core::debuginfo::extract_debug_info(&bytes, binary.arch).unwrap_or_default();
+
+    // Type Propagation
+    let mut type_libs = re_core::typelib::TypeLibraryManager::default();
+    let platform = platform_string(binary.arch, binary.format);
+    type_libs.load_for_platform(&platform);
+
+    let propagator = TypePropagator::new(&functions, &xrefs, &type_libs, &binary.imports);
+    let type_info = propagator.propagate(&debug_info, &re_core::types::TypeManager::default());
+
     Ok(AnalysisResult {
         binary,
         functions,
         strings,
-        xrefs,
+        _xrefs: xrefs,
+        type_info,
     })
 }
 
@@ -178,6 +220,7 @@ fn main() -> Result<()> {
             count,
             json,
         } => cmd_disasm(&binary, address, count, json),
+        Commands::Decompile { binary, address } => cmd_decompile(&binary, address),
         Commands::Functions { binary, json } => cmd_functions(&binary, json),
         Commands::Strings { binary, json } => cmd_strings(&binary, json),
         Commands::Exports { binary, json } => cmd_exports(&binary, json),
@@ -211,7 +254,12 @@ fn cmd_plugins(path: &Path, json: bool) -> Result<()> {
     let mut pm = re_core::plugin::PluginManager::default();
     pm.register_analysis_pass(Box::new(re_core::analysis::passes::SuspiciousNamePass));
 
-    let findings = pm.run_all_analysis_passes(&result.binary.memory_map, &mut result.functions)?;
+    let findings = pm.run_all_analysis_passes(
+        &result.binary.memory_map,
+        &mut result.functions,
+        &result._xrefs,
+        &result.strings,
+    )?;
 
     let entries: Vec<PluginFindingEntry> = findings
         .into_iter()
@@ -345,6 +393,57 @@ fn cmd_disasm(path: &Path, address: u64, count: usize, json: bool) -> Result<()>
                 e.address, e.bytes, e.mnemonic, e.operands
             );
         }
+    }
+
+    Ok(())
+}
+
+// -- decompile ----------------------------------------------------------------
+
+fn cmd_decompile(path: &Path, address: u64) -> Result<()> {
+    let result = run_analysis(path)?;
+
+    if let Some(func) = result.functions.functions.get(&address) {
+        // Disassemble the function first
+        let size = func
+            .end_address
+            .unwrap_or(address + 0x100)
+            .saturating_sub(address);
+        // Limit size to avoid huge functions if something goes wrong
+        let size = size.min(0x10000) as usize;
+
+        let disasm = Disassembler::new(result.binary.arch)
+            .with_context(|| format!("Failed to create disassembler for {}", result.binary.arch))?;
+
+        let instructions = disasm.disassemble_range(&result.binary.memory_map, address, size)?;
+
+        // Build symbol map for resolution
+        let mut symbols = HashMap::new();
+        // 1. Functions
+        for f in result.functions.functions.values() {
+            symbols.insert(f.start_address, f.name.clone());
+        }
+        // 2. Imports/Symbols from binary
+        for sym in &result.binary.symbols {
+            symbols.insert(sym.address, sym.name.clone());
+        }
+        for imp in &result.binary.imports {
+            symbols.insert(imp.address, imp.name.clone());
+        }
+
+        let code = re_core::il::structuring::decompile(
+            &func.name,
+            &instructions,
+            result.binary.arch,
+            &symbols,
+            result.type_info.get(&address),
+            &re_core::types::TypeManager::default(),
+            &result.binary.memory_map,
+        );
+
+        println!("{}", code.text);
+    } else {
+        println!("No function found at address 0x{:x}", address);
     }
 
     Ok(())

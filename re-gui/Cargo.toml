@@ -14,3 +14,5 @@ serde = { workspace = true }
 rfd = { workspace = true }
 uuid = { workspace = true }
 petgraph = { workspace = true }
+rhai = { workspace = true }
+egui_dock = { workspace = true }

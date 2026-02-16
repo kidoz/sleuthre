@@ -17,6 +17,11 @@ impl SleuthreApp {
             ui.label("Filter:");
             ui.text_edit_singleline(&mut self.structure_filter);
             ui.label(format!("{} types", project.types.types.len()));
+            ui.add_space(8.0);
+            if ui.button("+ New Struct").clicked() {
+                self.create_struct_active = true;
+                self.new_struct_name = "NewStruct".into();
+            }
         });
         ui.separator();
 
@@ -42,7 +47,7 @@ impl SleuthreApp {
                     "{} {} (size: {} bytes)",
                     ty.kind_name(),
                     ty.name(),
-                    ty.size()
+                    ty.size(project.arch)
                 );
                 egui::CollapsingHeader::new(
                     egui::RichText::new(&header)
@@ -50,7 +55,8 @@ impl SleuthreApp {
                         .color(egui::Color32::from_rgb(0, 80, 160)),
                 )
                 .show(ui, |ui| match ty {
-                    CompoundType::Struct { fields, .. } | CompoundType::Union { fields, .. } => {
+                    CompoundType::Struct { fields, name, .. }
+                    | CompoundType::Union { fields, name, .. } => {
                         for field in fields {
                             ui.monospace(format!(
                                 "  +{:#04X}  {}  {}",
@@ -58,6 +64,15 @@ impl SleuthreApp {
                                 field.type_ref.display_name(),
                                 field.name
                             ));
+                        }
+                        if ui.button("+ Add Field").clicked() {
+                            self.editing_struct = Some(name.clone());
+                            self.new_field_name = format!("field_{}", fields.len());
+                            self.new_field_offset = fields
+                                .last()
+                                .map(|f| format!("{:#X}", f.offset + 4))
+                                .unwrap_or("0x0".into());
+                            self.new_field_type = "int32_t".into();
                         }
                     }
                     CompoundType::Enum { variants, .. } => {

@@ -1,5 +1,6 @@
 use anyhow::Result;
 use re_core::analysis::cfg::ControlFlowGraph;
+use re_core::analysis::type_propagation::FunctionTypeInfo;
 use re_core::debuginfo;
 use re_core::disasm::Disassembler;
 use re_core::il::structuring::decompile;
@@ -7,6 +8,7 @@ use re_core::loader::load_binary;
 use re_core::project::{ActionKind, PendingAction, Project};
 use re_core::signatures::SignatureDatabase;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::io::{self, BufRead};
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -553,8 +555,37 @@ impl McpServer {
                                     .as_ref()
                                     .map(|d| d.arch)
                                     .unwrap_or(re_core::arch::Architecture::X86_64);
-                                let pseudocode = decompile(&func.name, &instructions, arch);
-                                json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": pseudocode }] } })
+
+                                let mut symbols = HashMap::new();
+                                for f in project.functions.functions.values() {
+                                    symbols.insert(f.start_address, f.name.clone());
+                                }
+                                for sym in &project.symbols {
+                                    symbols.insert(sym.address, sym.name.clone());
+                                }
+                                for imp in &project.imports {
+                                    symbols.insert(imp.address, imp.name.clone());
+                                }
+
+                                // Build type info
+                                let type_info =
+                                    project.types.function_signatures.get(&addr).map(|sig| {
+                                        FunctionTypeInfo {
+                                            signature: Some(sig.clone()),
+                                            var_types: Default::default(),
+                                        }
+                                    });
+
+                                let pseudocode = decompile(
+                                    &func.name,
+                                    &instructions,
+                                    arch,
+                                    &symbols,
+                                    type_info.as_ref(),
+                                    &project.types,
+                                    &project.memory_map,
+                                );
+                                json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": pseudocode.text }] } })
                             }
                             Err(e) => {
                                 json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32002, "message": e.to_string() } })
@@ -651,9 +682,16 @@ impl McpServer {
             "run_analysis_passes" => {
                 if let Some(project) = &mut self.project {
                     let mut pm = re_core::plugin::PluginManager::default();
-                    pm.register_analysis_pass(Box::new(re_core::analysis::passes::SuspiciousNamePass));
+                    pm.register_analysis_pass(Box::new(
+                        re_core::analysis::passes::SuspiciousNamePass,
+                    ));
 
-                    match pm.run_all_analysis_passes(&project.memory_map, &mut project.functions) {
+                    match pm.run_all_analysis_passes(
+                        &project.memory_map,
+                        &mut project.functions,
+                        &project.xrefs,
+                        &project.strings,
+                    ) {
                         Ok(findings) => {
                             let result: Vec<_> = findings
                                 .iter()
@@ -726,7 +764,7 @@ impl McpServer {
                 };
                 if let Some(project) = &mut self.project {
                     let pdb_path = std::path::Path::new(path);
-                    match debuginfo::extract_pdb_info(pdb_path) {
+                    match debuginfo::extract_pdb_info(pdb_path, project.arch) {
                         Ok(debug_info) => {
                             let mut sig_count = 0usize;
                             let mut type_count = 0usize;

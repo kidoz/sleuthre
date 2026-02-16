@@ -5,10 +5,13 @@
 //! - back edges → while/do-while loops
 //! - Linear sequences → blocks
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
+use crate::analysis::stack::StackVariable;
+use crate::analysis::type_propagation::FunctionTypeInfo;
 use crate::il::hlil::{self, HlilExpr, HlilStmt};
 use crate::il::mlil::{MlilExpr, MlilFunction, MlilStmt};
+use crate::types::{PrimitiveType, TypeManager, TypeRef};
 
 /// Information recovered about a function's signature: return type, parameters,
 /// and local (stack) variables.
@@ -20,6 +23,10 @@ pub struct DecompileInfo {
     pub params: Vec<(String, String)>,
     /// Local variable declarations as (type, name) pairs.
     pub locals: Vec<(String, String)>,
+    /// Types that need to be defined before this function.
+    pub required_types: HashSet<String>,
+    /// Header files that need to be included.
+    pub includes: HashSet<String>,
 }
 
 /// ABI argument registers for SysV x86_64 calling convention.
@@ -41,14 +48,95 @@ fn analyze_function_signature(
     mlil: &MlilFunction,
     instructions: &[crate::disasm::Instruction],
     arch: crate::arch::Architecture,
-) -> DecompileInfo {
-    let params = detect_parameters(mlil, arch);
-    let return_type = detect_return_type(mlil, arch);
-    let locals = recover_locals(instructions);
-    DecompileInfo {
-        return_type,
-        params,
-        locals,
+    _symbols: &HashMap<u64, String>,
+    type_info: Option<&FunctionTypeInfo>,
+    _types: &TypeManager,
+) -> (DecompileInfo, HashMap<i64, StackVariable>) {
+    let mut params = detect_parameters(mlil, arch);
+    let mut return_type = detect_return_type(mlil, arch);
+    let mut required_types = HashSet::new();
+    let mut includes = HashSet::new();
+
+    // Default includes
+    includes.insert("stdint.h".to_string());
+    includes.insert("stdbool.h".to_string());
+
+    // Override with propagated type info if available
+    if let Some(sig) = type_info.and_then(|ti| ti.signature.as_ref()) {
+        return_type = sig.return_type.display_name();
+        params = sig
+            .parameters
+            .iter()
+            .map(|p| (p.type_ref.display_name(), p.name.clone()))
+            .collect();
+
+        // Track required types from signature
+        collect_required_types(&sig.return_type, &mut required_types);
+        for p in &sig.parameters {
+            collect_required_types(&p.type_ref, &mut required_types);
+        }
+    }
+
+    let stack_vars = recover_locals(instructions);
+
+    let locals: Vec<(String, String)> = stack_vars
+        .iter()
+        .map(|v| (format!("{}", v.type_hint), v.name.clone()))
+        .collect();
+
+    let mut stack_map = HashMap::new();
+    for var in &stack_vars {
+        stack_map.insert(var.offset, var.clone());
+    }
+
+    (
+        DecompileInfo {
+            return_type,
+            params,
+            locals,
+            required_types,
+            includes,
+        },
+        stack_map,
+    )
+}
+
+fn collect_required_types(ty: &TypeRef, required: &mut HashSet<String>) {
+    match ty {
+        TypeRef::Primitive(p) => {
+            if matches!(
+                p,
+                PrimitiveType::U8
+                    | PrimitiveType::U16
+                    | PrimitiveType::U32
+                    | PrimitiveType::U64
+                    | PrimitiveType::I8
+                    | PrimitiveType::I16
+                    | PrimitiveType::I32
+                    | PrimitiveType::I64
+            ) {
+                // stdint.h handles these
+            }
+        }
+        TypeRef::Named(name) => {
+            required.insert(name.clone());
+        }
+        TypeRef::Pointer(inner)
+        | TypeRef::Array { element: inner, .. }
+        | TypeRef::Const(inner)
+        | TypeRef::Volatile(inner) => {
+            collect_required_types(inner, required);
+        }
+        TypeRef::FunctionPointer {
+            return_type,
+            params,
+            ..
+        } => {
+            collect_required_types(return_type, required);
+            for p in params {
+                collect_required_types(p, required);
+            }
+        }
     }
 }
 
@@ -212,13 +300,81 @@ fn is_zero_const(expr: &MlilExpr) -> bool {
 }
 
 /// Recover stack-local variable declarations from raw instructions.
-fn recover_locals(instructions: &[crate::disasm::Instruction]) -> Vec<(String, String)> {
-    let stack_vars = crate::analysis::stack::recover_stack_variables(instructions);
-    stack_vars
-        .iter()
-        .filter(|v| v.offset < 0) // Only locals (negative offsets from frame pointer)
-        .map(|v| (format!("{}", v.type_hint), v.name.clone()))
-        .collect()
+fn recover_locals(instructions: &[crate::disasm::Instruction]) -> Vec<StackVariable> {
+    crate::analysis::stack::recover_stack_variables(instructions)
+}
+
+fn remove_unused_labels(stmts: &mut Vec<HlilStmt>) {
+    // 1. Collect used labels
+    let mut used = HashSet::new();
+    collect_used_labels(stmts, &mut used);
+
+    // 2. Remove unused labels
+    stmts.retain(|stmt| {
+        if let HlilStmt::Label(addr) = stmt {
+            used.contains(addr)
+        } else {
+            true
+        }
+    });
+
+    // Recurse
+    for stmt in stmts {
+        match stmt {
+            HlilStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                remove_unused_labels(then_body);
+                remove_unused_labels(else_body);
+            }
+            HlilStmt::While { body, .. }
+            | HlilStmt::DoWhile { body, .. }
+            | HlilStmt::For { body, .. } => {
+                remove_unused_labels(body);
+            }
+            HlilStmt::Block(inner) => remove_unused_labels(inner),
+            HlilStmt::Switch { cases, default, .. } => {
+                for (_, body) in cases {
+                    remove_unused_labels(body);
+                }
+                remove_unused_labels(default);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_used_labels(stmts: &[HlilStmt], used: &mut HashSet<u64>) {
+    for stmt in stmts {
+        match stmt {
+            HlilStmt::Goto(addr) => {
+                used.insert(*addr);
+            }
+            HlilStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_used_labels(then_body, used);
+                collect_used_labels(else_body, used);
+            }
+            HlilStmt::While { body, .. }
+            | HlilStmt::DoWhile { body, .. }
+            | HlilStmt::For { body, .. } => {
+                collect_used_labels(body, used);
+            }
+            HlilStmt::Block(inner) => collect_used_labels(inner, used),
+            HlilStmt::Switch { cases, default, .. } => {
+                for (_, body) in cases {
+                    collect_used_labels(body, used);
+                }
+                collect_used_labels(default, used);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Post-pass: fold `result = expr; return;` into `return expr;`.
@@ -264,6 +420,12 @@ fn fold_return_values(stmts: &mut Vec<HlilStmt>) {
                 fold_return_values(body);
             }
             HlilStmt::Block(inner) => fold_return_values(inner),
+            HlilStmt::Switch { cases, default, .. } => {
+                for (_, body) in cases {
+                    fold_return_values(body);
+                }
+                fold_return_values(default);
+            }
             _ => {}
         }
     }
@@ -318,27 +480,694 @@ fn detect_for_loops(stmts: &mut Vec<HlilStmt>) {
             }
             HlilStmt::For { body, .. } => detect_for_loops(body),
             HlilStmt::Block(inner) => detect_for_loops(inner),
+            HlilStmt::Switch { cases, default, .. } => {
+                for (_, body) in cases {
+                    detect_for_loops(body);
+                }
+                detect_for_loops(default);
+            }
             _ => {}
         }
     }
 }
 
+/// Replace stack pointer dereferences with named local variables.
+fn lift_stack_refs(stmts: &mut [HlilStmt], stack_map: &HashMap<i64, StackVariable>) {
+    for stmt in stmts {
+        lift_stack_refs_in_stmt(stmt, stack_map);
+    }
+}
+
+fn lift_stack_refs_in_stmt(stmt: &mut HlilStmt, stack_map: &HashMap<i64, StackVariable>) {
+    match stmt {
+        HlilStmt::Assign { dest, src } => {
+            lift_stack_refs_in_expr(dest, stack_map);
+            lift_stack_refs_in_expr(src, stack_map);
+        }
+        HlilStmt::Store { addr, value } => {
+            // First, process sub-expressions normally
+            lift_stack_refs_in_expr(addr, stack_map);
+            lift_stack_refs_in_expr(value, stack_map);
+
+            // Check if addr became &var (from sp+offset replacement)
+            if let HlilExpr::AddrOf(inner) = addr
+                && let HlilExpr::Var(name) = &**inner
+            {
+                *stmt = HlilStmt::Assign {
+                    dest: HlilExpr::Var(name.clone()),
+                    src: value.clone(),
+                };
+                return;
+            }
+
+            // Fallback: check raw offset (unlikely if expr lifting worked, but for completeness)
+            if let Some(offset) = extract_stack_offset(addr)
+                && let Some(var) = stack_map.get(&offset)
+            {
+                *stmt = HlilStmt::Assign {
+                    dest: HlilExpr::Var(var.name.clone()),
+                    src: value.clone(),
+                };
+            }
+        }
+        HlilStmt::Expr(e) => lift_stack_refs_in_expr(e, stack_map),
+        HlilStmt::Return(opt) => {
+            if let Some(e) = opt {
+                lift_stack_refs_in_expr(e, stack_map);
+            }
+        }
+        HlilStmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            lift_stack_refs_in_expr(cond, stack_map);
+            lift_stack_refs(then_body, stack_map);
+            lift_stack_refs(else_body, stack_map);
+        }
+        HlilStmt::While { cond, body } => {
+            lift_stack_refs_in_expr(cond, stack_map);
+            lift_stack_refs(body, stack_map);
+        }
+        HlilStmt::DoWhile { body, cond } => {
+            lift_stack_refs(body, stack_map);
+            lift_stack_refs_in_expr(cond, stack_map);
+        }
+        HlilStmt::For {
+            init,
+            cond,
+            update,
+            body,
+        } => {
+            lift_stack_refs_in_stmt(init, stack_map);
+            lift_stack_refs_in_expr(cond, stack_map);
+            lift_stack_refs_in_stmt(update, stack_map);
+            lift_stack_refs(body, stack_map);
+        }
+        HlilStmt::Block(stmts) => lift_stack_refs(stmts, stack_map),
+        HlilStmt::Switch {
+            cond,
+            cases,
+            default,
+        } => {
+            lift_stack_refs_in_expr(cond, stack_map);
+            for (_, body) in cases {
+                lift_stack_refs(body, stack_map);
+            }
+            lift_stack_refs(default, stack_map);
+        }
+        HlilStmt::Break
+        | HlilStmt::Continue
+        | HlilStmt::Label(_)
+        | HlilStmt::Goto(_)
+        | HlilStmt::Comment(_) => {}
+    }
+}
+
+fn lift_stack_refs_in_expr(expr: &mut HlilExpr, stack_map: &HashMap<i64, StackVariable>) {
+    // Top-down or bottom-up?
+    // If we have `*(sp + 8)`, that is a Deref.
+    // If we have `sp + 8`, that is a pointer calculation.
+
+    // If matches `Deref(addr, size)`:
+    if let HlilExpr::Deref { addr, .. } = expr
+        && let Some(offset) = extract_stack_offset(addr)
+        && let Some(var) = stack_map.get(&offset)
+    {
+        // Replace `*(sp + off)` with `var`
+        *expr = HlilExpr::Var(var.name.clone());
+        return;
+    }
+
+    // If matches `sp + offset` (without deref), it might be `&var`.
+    // We can replace it with `AddrOf(Var)`?
+    // HlilExpr has AddrOf.
+    if let Some(offset) = extract_stack_offset(expr)
+        && let Some(var) = stack_map.get(&offset)
+    {
+        *expr = HlilExpr::AddrOf(Box::new(HlilExpr::Var(var.name.clone())));
+        return;
+    }
+
+    // Recurse
+    match expr {
+        HlilExpr::Deref { addr, .. } => lift_stack_refs_in_expr(addr, stack_map),
+        HlilExpr::BinOp { left, right, .. } => {
+            lift_stack_refs_in_expr(left, stack_map);
+            lift_stack_refs_in_expr(right, stack_map);
+        }
+        HlilExpr::UnaryOp { operand, .. } => lift_stack_refs_in_expr(operand, stack_map),
+        HlilExpr::Call { target, args } => {
+            lift_stack_refs_in_expr(target, stack_map);
+            for arg in args {
+                lift_stack_refs_in_expr(arg, stack_map);
+            }
+        }
+        HlilExpr::AddrOf(inner) => lift_stack_refs_in_expr(inner, stack_map),
+        HlilExpr::VectorOp { operands, .. } => {
+            for op in operands {
+                lift_stack_refs_in_expr(op, stack_map);
+            }
+        }
+        HlilExpr::FieldAccess { base, .. } => {
+            lift_stack_refs_in_expr(base, stack_map);
+        }
+        HlilExpr::ArrayAccess { base, index } => {
+            lift_stack_refs_in_expr(base, stack_map);
+            lift_stack_refs_in_expr(index, stack_map);
+        }
+        HlilExpr::Var(_) | HlilExpr::Global(..) | HlilExpr::Const(_) => {}
+    }
+}
+
+fn resolve_symbols(stmts: &mut [HlilStmt], symbols: &HashMap<u64, String>) {
+    for stmt in stmts {
+        resolve_symbols_in_stmt(stmt, symbols);
+    }
+}
+
+fn resolve_symbols_in_stmt(stmt: &mut HlilStmt, symbols: &HashMap<u64, String>) {
+    match stmt {
+        HlilStmt::Assign { dest, src } => {
+            resolve_symbols_in_expr(dest, symbols);
+            resolve_symbols_in_expr(src, symbols);
+        }
+        HlilStmt::Store { addr, value } => {
+            resolve_symbols_in_expr(addr, symbols);
+            resolve_symbols_in_expr(value, symbols);
+        }
+        HlilStmt::Expr(e) => resolve_symbols_in_expr(e, symbols),
+        HlilStmt::Return(opt) => {
+            if let Some(e) = opt {
+                resolve_symbols_in_expr(e, symbols);
+            }
+        }
+        HlilStmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            resolve_symbols_in_expr(cond, symbols);
+            resolve_symbols(then_body, symbols);
+            resolve_symbols(else_body, symbols);
+        }
+        HlilStmt::While { cond, body } => {
+            resolve_symbols_in_expr(cond, symbols);
+            resolve_symbols(body, symbols);
+        }
+        HlilStmt::DoWhile { body, cond } => {
+            resolve_symbols(body, symbols);
+            resolve_symbols_in_expr(cond, symbols);
+        }
+        HlilStmt::For {
+            init,
+            cond,
+            update,
+            body,
+        } => {
+            resolve_symbols_in_stmt(init, symbols);
+            resolve_symbols_in_expr(cond, symbols);
+            resolve_symbols_in_stmt(update, symbols);
+            resolve_symbols(body, symbols);
+        }
+        HlilStmt::Block(stmts) => resolve_symbols(stmts, symbols),
+        HlilStmt::Switch {
+            cond,
+            cases,
+            default,
+        } => {
+            resolve_symbols_in_expr(cond, symbols);
+            for (_, body) in cases {
+                resolve_symbols(body, symbols);
+            }
+            resolve_symbols(default, symbols);
+        }
+        HlilStmt::Break
+        | HlilStmt::Continue
+        | HlilStmt::Label(_)
+        | HlilStmt::Goto(_)
+        | HlilStmt::Comment(_) => {}
+    }
+}
+
+fn resolve_symbols_in_expr(expr: &mut HlilExpr, symbols: &HashMap<u64, String>) {
+    match expr {
+        HlilExpr::Const(val) => {
+            if let Some(name) = symbols.get(val) {
+                *expr = HlilExpr::Global(*val, name.clone());
+            }
+        }
+        HlilExpr::Deref { addr, .. } => resolve_symbols_in_expr(addr, symbols),
+        HlilExpr::BinOp { left, right, .. } => {
+            resolve_symbols_in_expr(left, symbols);
+            resolve_symbols_in_expr(right, symbols);
+        }
+        HlilExpr::UnaryOp { operand, .. } => resolve_symbols_in_expr(operand, symbols),
+        HlilExpr::Call { target, args } => {
+            resolve_symbols_in_expr(target, symbols);
+            for arg in args {
+                resolve_symbols_in_expr(arg, symbols);
+            }
+        }
+        HlilExpr::AddrOf(inner) => resolve_symbols_in_expr(inner, symbols),
+        HlilExpr::VectorOp { operands, .. } => {
+            for op in operands {
+                resolve_symbols_in_expr(op, symbols);
+            }
+        }
+        HlilExpr::FieldAccess { base, .. } => {
+            resolve_symbols_in_expr(base, symbols);
+        }
+        HlilExpr::ArrayAccess { base, index } => {
+            resolve_symbols_in_expr(base, symbols);
+            resolve_symbols_in_expr(index, symbols);
+        }
+        HlilExpr::Var(_) | HlilExpr::Global(..) => {}
+    }
+}
+
+/// Try to extract a stack offset from an expression.
+/// Matches: `sp`, `sp + C`, `sp - C`.
+fn extract_stack_offset(expr: &HlilExpr) -> Option<i64> {
+    match expr {
+        HlilExpr::Var(name) if is_stack_pointer(name) => Some(0),
+        HlilExpr::BinOp {
+            op: crate::il::llil::BinOp::Add,
+            left,
+            right,
+        } => {
+            if let HlilExpr::Var(name) = &**left
+                && is_stack_pointer(name)
+                && let HlilExpr::Const(c) = &**right
+            {
+                Some(*c as i64)
+            } else if let HlilExpr::Var(name) = &**right
+                && is_stack_pointer(name)
+                && let HlilExpr::Const(c) = &**left
+            {
+                Some(*c as i64)
+            } else {
+                None
+            }
+        }
+        HlilExpr::BinOp {
+            op: crate::il::llil::BinOp::Sub,
+            left,
+            right,
+        } => {
+            if let HlilExpr::Var(name) = &**left
+                && is_stack_pointer(name)
+                && let HlilExpr::Const(c) = &**right
+            {
+                Some(-(*c as i64))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn is_stack_pointer(name: &str) -> bool {
+    matches!(
+        name,
+        "sp" | "rsp" | "esp" | "rbp" | "ebp" | "x29" | "fp" | "frame"
+    )
+}
+
+/// Collect all SSA variables used in the HLIL that are not already declared
+/// as parameters or locals.
+fn collect_ssa_vars_in_hlil(
+    stmts: &[HlilStmt],
+    known_vars: &HashSet<&str>,
+    type_info: Option<&FunctionTypeInfo>,
+    inferred_types: &HashMap<String, TypeRef>,
+) -> Vec<(String, String)> {
+    let mut found = HashSet::new();
+    collect_ssa_vars_stmts(stmts, &mut found);
+
+    let mut result = Vec::new();
+    for name in found {
+        if !known_vars.contains(name.as_str()) && !is_stack_pointer(&name) {
+            let ty = inferred_types
+                .get(&name)
+                .map(|t| t.display_name())
+                .or_else(|| {
+                    type_info
+                        .and_then(|ti| ti.var_types.get(&name))
+                        .map(|t| t.display_name())
+                })
+                .unwrap_or_else(|| "int64_t".to_string());
+            result.push((ty, name));
+        }
+    }
+    // Sort for stability
+    result.sort();
+    result
+}
+
+fn infer_local_types(
+    stmts: &[HlilStmt],
+    inferred_types: &mut HashMap<String, TypeRef>,
+    types: &TypeManager,
+) {
+    for stmt in stmts {
+        infer_types_in_stmt(stmt, inferred_types, types);
+    }
+}
+
+fn infer_types_in_stmt(
+    stmt: &HlilStmt,
+    inferred_types: &mut HashMap<String, TypeRef>,
+    types: &TypeManager,
+) {
+    match stmt {
+        HlilStmt::Assign { dest, src } => {
+            // Propagate type from src to dest
+            if let HlilExpr::Var(name) = dest
+                && let Some(ty) = get_expr_type(src, inferred_types, types)
+            {
+                inferred_types.insert(name.clone(), ty);
+            }
+            infer_types_in_expr(dest, inferred_types, types);
+            infer_types_in_expr(src, inferred_types, types);
+        }
+        HlilStmt::Store { addr, value } => {
+            if let HlilExpr::Var(name) = addr {
+                inferred_types.entry(name.clone()).or_insert_with(|| {
+                    TypeRef::Pointer(Box::new(TypeRef::Primitive(PrimitiveType::Void)))
+                });
+            }
+            infer_types_in_expr(addr, inferred_types, types);
+            infer_types_in_expr(value, inferred_types, types);
+        }
+        HlilStmt::Expr(e) => infer_types_in_expr(e, inferred_types, types),
+        HlilStmt::Return(opt) => {
+            if let Some(e) = opt {
+                infer_types_in_expr(e, inferred_types, types);
+            }
+        }
+        HlilStmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            infer_types_in_expr(cond, inferred_types, types);
+            infer_local_types(then_body, inferred_types, types);
+            infer_local_types(else_body, inferred_types, types);
+        }
+        HlilStmt::While { cond, body } => {
+            infer_types_in_expr(cond, inferred_types, types);
+            infer_local_types(body, inferred_types, types);
+        }
+        HlilStmt::DoWhile { body, cond } => {
+            infer_local_types(body, inferred_types, types);
+            infer_types_in_expr(cond, inferred_types, types);
+        }
+        HlilStmt::For {
+            init,
+            cond,
+            update,
+            body,
+        } => {
+            infer_types_in_stmt(init, inferred_types, types);
+            infer_types_in_expr(cond, inferred_types, types);
+            infer_types_in_stmt(update, inferred_types, types);
+            infer_local_types(body, inferred_types, types);
+        }
+        HlilStmt::Block(inner) => infer_local_types(inner, inferred_types, types),
+        HlilStmt::Switch {
+            cond,
+            cases,
+            default,
+        } => {
+            infer_types_in_expr(cond, inferred_types, types);
+            for (_, body) in cases {
+                infer_local_types(body, inferred_types, types);
+            }
+            infer_local_types(default, inferred_types, types);
+        }
+        HlilStmt::Break
+        | HlilStmt::Continue
+        | HlilStmt::Label(_)
+        | HlilStmt::Goto(_)
+        | HlilStmt::Comment(_) => {}
+    }
+}
+
+fn infer_types_in_expr(
+    expr: &HlilExpr,
+    inferred_types: &mut HashMap<String, TypeRef>,
+    types: &TypeManager,
+) {
+    match expr {
+        HlilExpr::Deref { addr, size } => {
+            if let HlilExpr::Var(name) = &**addr {
+                let inner = match *size {
+                    1 => PrimitiveType::U8,
+                    2 => PrimitiveType::U16,
+                    4 => PrimitiveType::U32,
+                    8 => PrimitiveType::U64,
+                    _ => PrimitiveType::Void,
+                };
+                inferred_types
+                    .entry(name.clone())
+                    .or_insert_with(|| TypeRef::Pointer(Box::new(TypeRef::Primitive(inner))));
+            }
+            infer_types_in_expr(addr, inferred_types, types);
+        }
+        HlilExpr::Call { target, args } => {
+            // Try to resolve target signature from TypeManager
+            let sig = if let HlilExpr::Global(addr, _) = &**target {
+                types.function_signatures.get(addr)
+            } else {
+                None
+            };
+
+            if let Some(sig) = sig {
+                // Propagate parameter types to argument variables
+                for (i, arg) in args.iter().enumerate() {
+                    if i < sig.parameters.len() {
+                        let param_type = &sig.parameters[i].type_ref;
+                        if let HlilExpr::Var(arg_name) = arg {
+                            inferred_types.insert(arg_name.clone(), param_type.clone());
+                        }
+                    }
+                }
+            } else {
+                // Fallback: infer target is a function pointer if it's a variable
+                if let HlilExpr::Var(name) = &**target {
+                    inferred_types.entry(name.clone()).or_insert_with(|| {
+                        TypeRef::Pointer(Box::new(TypeRef::Primitive(PrimitiveType::Void)))
+                    });
+                }
+            }
+
+            infer_types_in_expr(target, inferred_types, types);
+            for arg in args {
+                infer_types_in_expr(arg, inferred_types, types);
+            }
+        }
+        HlilExpr::BinOp { left, right, .. } => {
+            infer_types_in_expr(left, inferred_types, types);
+            infer_types_in_expr(right, inferred_types, types);
+        }
+        HlilExpr::UnaryOp { operand, .. } => infer_types_in_expr(operand, inferred_types, types),
+        HlilExpr::AddrOf(inner) => infer_types_in_expr(inner, inferred_types, types),
+        HlilExpr::VectorOp { operands, .. } => {
+            for op in operands {
+                infer_types_in_expr(op, inferred_types, types);
+            }
+        }
+        HlilExpr::FieldAccess { base, .. } => {
+            infer_types_in_expr(base, inferred_types, types);
+        }
+        HlilExpr::ArrayAccess { base, index } => {
+            infer_types_in_expr(base, inferred_types, types);
+            infer_types_in_expr(index, inferred_types, types);
+        }
+        HlilExpr::Var(_) | HlilExpr::Global(..) | HlilExpr::Const(_) => {}
+    }
+}
+
+fn collect_ssa_vars_stmts(stmts: &[HlilStmt], found: &mut HashSet<String>) {
+    for stmt in stmts {
+        match stmt {
+            HlilStmt::Assign { dest, src } => {
+                collect_ssa_vars_expr(dest, found);
+                collect_ssa_vars_expr(src, found);
+            }
+            HlilStmt::Store { addr, value } => {
+                collect_ssa_vars_expr(addr, found);
+                collect_ssa_vars_expr(value, found);
+            }
+            HlilStmt::Expr(e) => collect_ssa_vars_expr(e, found),
+            HlilStmt::Return(opt) => {
+                if let Some(e) = opt {
+                    collect_ssa_vars_expr(e, found);
+                }
+            }
+            HlilStmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                collect_ssa_vars_expr(cond, found);
+                collect_ssa_vars_stmts(then_body, found);
+                collect_ssa_vars_stmts(else_body, found);
+            }
+            HlilStmt::While { cond, body } => {
+                collect_ssa_vars_expr(cond, found);
+                collect_ssa_vars_stmts(body, found);
+            }
+            HlilStmt::DoWhile { body, cond } => {
+                collect_ssa_vars_stmts(body, found);
+                collect_ssa_vars_expr(cond, found);
+            }
+            HlilStmt::For {
+                init,
+                cond,
+                update,
+                body,
+            } => {
+                collect_ssa_vars_stmts(&[*init.clone()], found); // Box deref clone
+                collect_ssa_vars_expr(cond, found);
+                collect_ssa_vars_stmts(&[*update.clone()], found);
+                collect_ssa_vars_stmts(body, found);
+            }
+            HlilStmt::Block(inner) => collect_ssa_vars_stmts(inner, found),
+            HlilStmt::Switch {
+                cond,
+                cases,
+                default,
+            } => {
+                collect_ssa_vars_expr(cond, found);
+                for (_, body) in cases {
+                    collect_ssa_vars_stmts(body, found);
+                }
+                collect_ssa_vars_stmts(default, found);
+            }
+            HlilStmt::Break
+            | HlilStmt::Continue
+            | HlilStmt::Label(_)
+            | HlilStmt::Goto(_)
+            | HlilStmt::Comment(_) => {}
+        }
+    }
+}
+
+fn collect_ssa_vars_expr(expr: &HlilExpr, found: &mut HashSet<String>) {
+    match expr {
+        HlilExpr::Var(name) => {
+            found.insert(name.clone());
+        }
+        HlilExpr::Deref { addr, .. } => collect_ssa_vars_expr(addr, found),
+        HlilExpr::BinOp { left, right, .. } => {
+            collect_ssa_vars_expr(left, found);
+            collect_ssa_vars_expr(right, found);
+        }
+        HlilExpr::UnaryOp { operand, .. } => collect_ssa_vars_expr(operand, found),
+        HlilExpr::Call { target, args } => {
+            collect_ssa_vars_expr(target, found);
+            for arg in args {
+                collect_ssa_vars_expr(arg, found);
+            }
+        }
+        HlilExpr::AddrOf(inner) => collect_ssa_vars_expr(inner, found),
+        HlilExpr::VectorOp { operands, .. } => {
+            for op in operands {
+                collect_ssa_vars_expr(op, found);
+            }
+        }
+        HlilExpr::FieldAccess { base, .. } => {
+            collect_ssa_vars_expr(base, found);
+        }
+        HlilExpr::ArrayAccess { base, index } => {
+            collect_ssa_vars_expr(base, found);
+            collect_ssa_vars_expr(index, found);
+        }
+        HlilExpr::Const(_) | HlilExpr::Global(..) => {}
+    }
+}
+
 /// Convert an MLIL function into structured HLIL statements.
-pub fn structure_function(func: &MlilFunction) -> Vec<HlilStmt> {
+pub fn structure_function(
+    func: &MlilFunction,
+    memory: &crate::memory::MemoryMap,
+    arch: crate::arch::Architecture,
+) -> Vec<HlilStmt> {
+    let mut jump_targets = HashSet::new();
+    for inst in &func.instructions {
+        for stmt in &inst.stmts {
+            if let MlilStmt::Jump {
+                target: MlilExpr::Const(addr),
+            } = stmt
+            {
+                jump_targets.insert(*addr);
+            }
+            if let MlilStmt::BranchIf {
+                target: MlilExpr::Const(addr),
+                ..
+            } = stmt
+            {
+                jump_targets.insert(*addr);
+            }
+        }
+    }
+
+    let mut stmts = structure_range(
+        &func.instructions,
+        &ControlFlowContext::default(),
+        &jump_targets,
+        memory,
+        arch,
+    );
+    remove_unused_labels(&mut stmts);
+    stmts
+}
+
+fn structure_range(
+    insts: &[crate::il::mlil::MlilInst],
+    ctx: &ControlFlowContext,
+    jump_targets: &HashSet<u64>,
+    memory: &crate::memory::MemoryMap,
+    arch: crate::arch::Architecture,
+) -> Vec<HlilStmt> {
     let mut stmts = Vec::new();
     let mut i = 0;
-    let insts = &func.instructions;
 
     while i < insts.len() {
         let inst = &insts[i];
 
+        // Emit label if this address is a jump target
+        if jump_targets.contains(&inst.address) {
+            stmts.push(HlilStmt::Label(inst.address));
+        }
+
         // Check for do-while loop: look ahead for a BranchIf that targets the current
         // instruction's address (back edge), indicating this is the loop head.
         if let Some(back_branch) = find_do_while_back_edge(insts, i) {
-            let body: Vec<HlilStmt> = insts[i..back_branch.branch_idx]
-                .iter()
-                .flat_map(|inst| lower_mlil_stmts(&inst.stmts))
-                .collect();
+            // Loop head is current instruction.
+            // Loop exit is the instruction following the back branch.
+            let head_addr = insts[i].address;
+            let exit_addr = if back_branch.branch_idx + 1 < insts.len() {
+                Some(insts[back_branch.branch_idx + 1].address)
+            } else {
+                None
+            };
+
+            let loop_ctx = ControlFlowContext {
+                loop_head: Some(head_addr),
+                loop_exit: exit_addr,
+            };
+
+            let body = structure_range(
+                &insts[i..back_branch.branch_idx],
+                &loop_ctx,
+                jump_targets,
+                memory,
+                arch,
+            );
             let cond = hlil::mlil_to_hlil_expr(&back_branch.cond);
             stmts.push(HlilStmt::DoWhile { body, cond });
             i = back_branch.branch_idx + 1;
@@ -355,10 +1184,19 @@ pub fn structure_function(func: &MlilFunction) -> Vec<HlilStmt> {
         {
             // While loop: condition at top, body in middle, jump back at end
             let cond = hlil::mlil_to_hlil_expr(&branch_stmt.0);
-            let body: Vec<HlilStmt> = insts[i + 1..eidx - 1]
-                .iter()
-                .flat_map(|inst| lower_mlil_stmts(&inst.stmts))
-                .collect();
+
+            let loop_ctx = ControlFlowContext {
+                loop_head: Some(insts[i].address),
+                loop_exit: Some(*exit_addr),
+            };
+
+            let body = structure_range(
+                &insts[i + 1..eidx - 1],
+                &loop_ctx,
+                jump_targets,
+                memory,
+                arch,
+            );
             stmts.push(HlilStmt::While { cond, body });
             i = eidx;
             continue;
@@ -369,15 +1207,10 @@ pub fn structure_function(func: &MlilFunction) -> Vec<HlilStmt> {
             && let Some((then_end, else_end)) = find_if_else_bounds(insts, i, &branch_stmt)
         {
             let cond = hlil::mlil_to_hlil_expr(&branch_stmt.0);
-            let then_body: Vec<HlilStmt> = insts[i + 1..then_end]
-                .iter()
-                .flat_map(|inst| lower_mlil_stmts(&inst.stmts))
-                .collect();
-            let else_body: Vec<HlilStmt> = if else_end > then_end {
-                insts[then_end..else_end]
-                    .iter()
-                    .flat_map(|inst| lower_mlil_stmts(&inst.stmts))
-                    .collect()
+            let then_body =
+                structure_range(&insts[i + 1..then_end], ctx, jump_targets, memory, arch);
+            let else_body = if else_end > then_end {
+                structure_range(&insts[then_end..else_end], ctx, jump_targets, memory, arch)
             } else {
                 vec![]
             };
@@ -392,7 +1225,7 @@ pub fn structure_function(func: &MlilFunction) -> Vec<HlilStmt> {
         }
 
         // Default: lower each statement individually
-        stmts.extend(lower_mlil_stmts(&inst.stmts));
+        stmts.extend(lower_mlil_stmts(&inst.stmts, ctx, memory, arch));
         i += 1;
     }
 
@@ -487,8 +1320,183 @@ fn find_jump_target(stmts: &[MlilStmt]) -> Option<u64> {
     None
 }
 
+fn recover_switch(
+    target: &MlilExpr,
+    memory: &crate::memory::MemoryMap,
+    arch: crate::arch::Architecture,
+) -> Option<HlilStmt> {
+    // Pattern: Jump(Load(base + index * scale))
+    if let MlilExpr::Load { addr, size } = target
+        && let MlilExpr::BinOp {
+            op: crate::il::llil::BinOp::Add,
+            left,
+            right,
+        } = &**addr
+    {
+        let (base, offset) = if let MlilExpr::Const(c) = &**left {
+            (*c, &**right)
+        } else if let MlilExpr::Const(c) = &**right {
+            (*c, &**left)
+        } else {
+            return None;
+        };
+
+        // Offset might be index * scale or just index (if scale is 1)
+        let (index_expr, scale) = if let MlilExpr::BinOp {
+            op: crate::il::llil::BinOp::Mul,
+            left,
+            right,
+        } = offset
+        {
+            if let MlilExpr::Const(s) = &**left {
+                (&**right, *s)
+            } else if let MlilExpr::Const(s) = &**right {
+                (&**left, *s)
+            } else {
+                (offset, 1)
+            }
+        } else {
+            (offset, 1)
+        };
+
+        // Validate scale matches pointer size
+        if scale != *size as u64 {
+            return None;
+        }
+
+        // Heuristic: Read pointers from base until invalid
+        let mut cases = Vec::new();
+        let mut cursor = base;
+        let mut idx = 0;
+        let endian = arch.default_endianness();
+
+        // Limit to reasonable number of cases
+        while cases.len() < 256 {
+            let ptr = if *size == 8 {
+                match memory.read_u64(cursor, endian) {
+                    Some(p) => p,
+                    None => break,
+                }
+            } else {
+                match memory.read_u32(cursor, endian) {
+                    Some(p) => p as u64,
+                    None => break,
+                }
+            };
+
+            // Validate pointer points to executable code or is 0 (if sparse)
+            if ptr == 0 {
+                break;
+            }
+
+            cases.push((idx, vec![HlilStmt::Goto(ptr)]));
+            cursor += *size as u64;
+            idx += 1;
+        }
+
+        if !cases.is_empty() {
+            return Some(HlilStmt::Switch {
+                cond: hlil::mlil_to_hlil_expr(index_expr),
+                cases,
+                default: vec![], // Unknown default from just the jump
+            });
+        }
+    }
+    None
+}
+
+fn get_expr_type(
+    expr: &HlilExpr,
+    inferred_types: &HashMap<String, TypeRef>,
+    types: &TypeManager,
+) -> Option<TypeRef> {
+    match expr {
+        HlilExpr::Const(_) => Some(TypeRef::Primitive(PrimitiveType::U64)),
+        HlilExpr::Var(name) => inferred_types.get(name).cloned(),
+        HlilExpr::Global(addr, _) => types
+            .global_variables
+            .get(addr)
+            .map(|var| var.type_ref.clone()),
+        HlilExpr::Call { target, .. } => {
+            if let HlilExpr::Global(addr, _) = &**target {
+                types
+                    .function_signatures
+                    .get(addr)
+                    .map(|s| s.return_type.clone())
+            } else if let HlilExpr::Var(name) = &**target {
+                if let Some(TypeRef::FunctionPointer { return_type, .. }) = inferred_types.get(name)
+                {
+                    Some(*return_type.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        HlilExpr::Deref { size, .. } => Some(TypeRef::Primitive(match size {
+            1 => PrimitiveType::U8,
+            2 => PrimitiveType::U16,
+            4 => PrimitiveType::U32,
+            8 => PrimitiveType::U64,
+            _ => PrimitiveType::Void,
+        })),
+        HlilExpr::FieldAccess {
+            base,
+            field_name,
+            is_ptr,
+        } => {
+            let base_type = get_expr_type(base, inferred_types, types)?;
+            let struct_type = if *is_ptr {
+                if let TypeRef::Pointer(inner) = base_type {
+                    *inner
+                } else {
+                    return None;
+                }
+            } else {
+                base_type
+            };
+
+            if let TypeRef::Named(name) = struct_type
+                && let Some(
+                    crate::types::CompoundType::Struct { fields, .. }
+                    | crate::types::CompoundType::Union { fields, .. },
+                ) = types.get_type(&name)
+            {
+                return fields
+                    .iter()
+                    .find(|f| f.name == *field_name)
+                    .map(|f| f.type_ref.clone());
+            }
+            None
+        }
+        HlilExpr::ArrayAccess { base, .. } => {
+            let base_type = get_expr_type(base, inferred_types, types)?;
+            if let TypeRef::Array { element, .. } = base_type {
+                Some(*element)
+            } else if let TypeRef::Pointer(inner) = base_type {
+                Some(*inner)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ControlFlowContext {
+    loop_head: Option<u64>,
+    loop_exit: Option<u64>,
+}
+
 /// Lower MLIL statements into HLIL statements.
-fn lower_mlil_stmts(stmts: &[MlilStmt]) -> Vec<HlilStmt> {
+fn lower_mlil_stmts(
+    stmts: &[MlilStmt],
+    ctx: &ControlFlowContext,
+    memory: &crate::memory::MemoryMap,
+    arch: crate::arch::Architecture,
+) -> Vec<HlilStmt> {
     let mut result = Vec::new();
     for stmt in stmts {
         match stmt {
@@ -526,7 +1534,35 @@ fn lower_mlil_stmts(stmts: &[MlilStmt]) -> Vec<HlilStmt> {
             MlilStmt::Return => {
                 result.push(HlilStmt::Return(None));
             }
-            MlilStmt::Nop | MlilStmt::Jump { .. } | MlilStmt::BranchIf { .. } => {}
+            MlilStmt::Jump { target } => {
+                if let MlilExpr::Const(addr) = target {
+                    if Some(*addr) == ctx.loop_head {
+                        result.push(HlilStmt::Continue);
+                    } else if Some(*addr) == ctx.loop_exit {
+                        result.push(HlilStmt::Break);
+                    } else {
+                        result.push(HlilStmt::Goto(*addr));
+                    }
+                } else if let Some(switch_stmt) = recover_switch(target, memory, arch) {
+                    result.push(switch_stmt);
+                } else {
+                    // Indirect jump (computed goto)
+                    // Fallback to evaluating the target
+                    result.push(HlilStmt::Expr(hlil::mlil_to_hlil_expr(target)));
+                }
+            }
+            MlilStmt::BranchIf { cond, target } => {
+                if let MlilExpr::Const(addr) = target {
+                    // If we are here, it means this branch wasn't structured into an If/Loop.
+                    // We emit: if (cond) goto target;
+                    result.push(HlilStmt::If {
+                        cond: hlil::mlil_to_hlil_expr(cond),
+                        then_body: vec![HlilStmt::Goto(*addr)],
+                        else_body: vec![],
+                    });
+                }
+            }
+            MlilStmt::Nop => {}
         }
     }
     result
@@ -537,10 +1573,17 @@ pub fn decompile(
     name: &str,
     instructions: &[crate::disasm::Instruction],
     arch: crate::arch::Architecture,
-) -> String {
+    symbols: &HashMap<u64, String>,
+    type_info: Option<&FunctionTypeInfo>,
+    types: &TypeManager,
+    memory: &crate::memory::MemoryMap,
+) -> hlil::DecompiledCode {
     let llil = match arch {
         crate::arch::Architecture::Arm64 => {
             crate::il::lifter_arm64::lift_function(name, instructions[0].address, instructions)
+        }
+        crate::arch::Architecture::Mips | crate::arch::Architecture::Mips64 => {
+            crate::il::lifter_mips::lift_function(name, instructions[0].address, instructions)
         }
         _ => crate::il::lifter_x86::lift_function(name, instructions[0].address, instructions),
     };
@@ -548,11 +1591,245 @@ pub fn decompile(
     crate::il::mlil::apply_ssa(&mut mlil);
     crate::il::mlil::eliminate_dead_stores(&mut mlil);
 
-    let info = analyze_function_signature(&mlil, instructions, arch);
-    let mut hlil_stmts = structure_function(&mlil);
+    let (mut info, stack_map) =
+        analyze_function_signature(&mlil, instructions, arch, symbols, type_info, types);
+    let mut hlil_stmts = structure_function(&mlil, memory, arch);
     detect_for_loops(&mut hlil_stmts);
     fold_return_values(&mut hlil_stmts);
-    hlil::render_pseudocode_with_info(name, &hlil_stmts, &info)
+
+    // Phase 1 Improvements:
+    // 1. Lift stack references to named variables
+    lift_stack_refs(&mut hlil_stmts, &stack_map);
+
+    // 2. Resolve symbols (Phase 2)
+    resolve_symbols(&mut hlil_stmts, symbols);
+
+    // 3. Infer local types (Phase 3)
+    let mut inferred_types = HashMap::new();
+    infer_local_types(&hlil_stmts, &mut inferred_types, types);
+
+    // Phase 4: Field Access Recovery
+    fold_field_accesses(&mut hlil_stmts, type_info, &inferred_types, types);
+
+    // Phase 2 (Roadmap): Combine nested if statements
+    combine_nested_if_statements(&mut hlil_stmts);
+
+    // 4. Collect remaining SSA variables and declare them
+    let mut known_vars: HashSet<&str> = HashSet::new();
+    for (_, name) in &info.params {
+        known_vars.insert(name);
+    }
+    for (_, name) in &info.locals {
+        known_vars.insert(name);
+    }
+
+    let ssa_locals = collect_ssa_vars_in_hlil(&hlil_stmts, &known_vars, type_info, &inferred_types);
+    for (_ty, name) in &ssa_locals {
+        // Also track types from SSA locals
+        if let Some(tref) = type_info.and_then(|ti| ti.var_types.get(name)) {
+            collect_required_types(tref, &mut info.required_types);
+        }
+    }
+    info.locals.extend(ssa_locals);
+
+    hlil::render_pseudocode_with_info(name, &hlil_stmts, &info, types)
+}
+
+fn fold_field_accesses(
+    stmts: &mut [HlilStmt],
+    type_info: Option<&FunctionTypeInfo>,
+    inferred_types: &HashMap<String, TypeRef>,
+    types: &TypeManager,
+) {
+    for stmt in stmts {
+        fold_field_accesses_stmt(stmt, type_info, inferred_types, types);
+    }
+}
+
+fn fold_field_accesses_stmt(
+    stmt: &mut HlilStmt,
+    type_info: Option<&FunctionTypeInfo>,
+    inferred_types: &HashMap<String, TypeRef>,
+    types: &TypeManager,
+) {
+    match stmt {
+        HlilStmt::Assign { dest, src } => {
+            fold_field_accesses_expr(dest, type_info, inferred_types, types);
+            fold_field_accesses_expr(src, type_info, inferred_types, types);
+        }
+        HlilStmt::Store { addr, value } => {
+            fold_field_accesses_expr(addr, type_info, inferred_types, types);
+            fold_field_accesses_expr(value, type_info, inferred_types, types);
+        }
+        HlilStmt::Expr(e) => fold_field_accesses_expr(e, type_info, inferred_types, types),
+        HlilStmt::Return(opt) => {
+            if let Some(e) = opt {
+                fold_field_accesses_expr(e, type_info, inferred_types, types);
+            }
+        }
+        HlilStmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            fold_field_accesses_expr(cond, type_info, inferred_types, types);
+            fold_field_accesses(then_body, type_info, inferred_types, types);
+            fold_field_accesses(else_body, type_info, inferred_types, types);
+        }
+        HlilStmt::While { cond, body } => {
+            fold_field_accesses_expr(cond, type_info, inferred_types, types);
+            fold_field_accesses(body, type_info, inferred_types, types);
+        }
+        HlilStmt::DoWhile { body, cond } => {
+            fold_field_accesses(body, type_info, inferred_types, types);
+            fold_field_accesses_expr(cond, type_info, inferred_types, types);
+        }
+        HlilStmt::For {
+            init,
+            cond,
+            update,
+            body,
+        } => {
+            fold_field_accesses_stmt(init, type_info, inferred_types, types);
+            fold_field_accesses_expr(cond, type_info, inferred_types, types);
+            fold_field_accesses_stmt(update, type_info, inferred_types, types);
+            fold_field_accesses(body, type_info, inferred_types, types);
+        }
+        HlilStmt::Block(inner) => fold_field_accesses(inner, type_info, inferred_types, types),
+        HlilStmt::Switch {
+            cond,
+            cases,
+            default,
+        } => {
+            fold_field_accesses_expr(cond, type_info, inferred_types, types);
+            for (_, body) in cases {
+                fold_field_accesses(body, type_info, inferred_types, types);
+            }
+            fold_field_accesses(default, type_info, inferred_types, types);
+        }
+        HlilStmt::Break
+        | HlilStmt::Continue
+        | HlilStmt::Label(_)
+        | HlilStmt::Goto(_)
+        | HlilStmt::Comment(_) => {}
+    }
+}
+
+fn fold_field_accesses_expr(
+    expr: &mut HlilExpr,
+    type_info: Option<&FunctionTypeInfo>,
+    inferred_types: &HashMap<String, TypeRef>,
+    types: &TypeManager,
+) {
+    // Post-order traversal
+    match expr {
+        HlilExpr::Deref { addr, .. } => {
+            fold_field_accesses_expr(addr, type_info, inferred_types, types);
+
+            // Pattern: *(base + offset)
+            if let HlilExpr::BinOp { op, left, right } = &**addr
+                && *op == crate::il::llil::BinOp::Add
+                && let (HlilExpr::Var(name), HlilExpr::Const(offset)) = (&**left, &**right)
+            {
+                let tref = inferred_types
+                    .get(name)
+                    .or_else(|| type_info.and_then(|ti| ti.var_types.get(name)));
+
+                if let Some(TypeRef::Pointer(inner)) = tref
+                    && let TypeRef::Named(struct_name) = &**inner
+                    && let Some(crate::types::CompoundType::Struct { fields, .. }) =
+                        types.get_type(struct_name)
+                    && let Some(field) = fields.iter().find(|f| f.offset == *offset as usize)
+                {
+                    *expr = HlilExpr::FieldAccess {
+                        base: left.clone(),
+                        field_name: field.name.clone(),
+                        is_ptr: true,
+                    };
+                }
+            }
+        }
+        HlilExpr::BinOp { left, right, .. } => {
+            fold_field_accesses_expr(left, type_info, inferred_types, types);
+            fold_field_accesses_expr(right, type_info, inferred_types, types);
+        }
+        HlilExpr::UnaryOp { operand, .. } => {
+            fold_field_accesses_expr(operand, type_info, inferred_types, types);
+        }
+        HlilExpr::Call { target, args } => {
+            fold_field_accesses_expr(target, type_info, inferred_types, types);
+            for arg in args {
+                fold_field_accesses_expr(arg, type_info, inferred_types, types);
+            }
+        }
+        HlilExpr::AddrOf(inner) => {
+            fold_field_accesses_expr(inner, type_info, inferred_types, types);
+        }
+        HlilExpr::FieldAccess { base, .. } => {
+            fold_field_accesses_expr(base, type_info, inferred_types, types);
+        }
+        HlilExpr::ArrayAccess { base, index } => {
+            fold_field_accesses_expr(base, type_info, inferred_types, types);
+            fold_field_accesses_expr(index, type_info, inferred_types, types);
+        }
+        HlilExpr::VectorOp { operands, .. } => {
+            for op in operands {
+                fold_field_accesses_expr(op, type_info, inferred_types, types);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn combine_nested_if_statements(stmts: &mut [HlilStmt]) {
+    let mut i = 0;
+    while i < stmts.len() {
+        if let HlilStmt::If {
+            cond,
+            then_body,
+            else_body,
+        } = &mut stmts[i]
+        {
+            combine_nested_if_statements(then_body);
+            combine_nested_if_statements(else_body);
+
+            // Pattern: if (a) { if (b) { body } } -> if (a && b) { body }
+            if then_body.len() == 1
+                && else_body.is_empty()
+                && let HlilStmt::If {
+                    cond: inner_cond,
+                    then_body: inner_then,
+                    else_body: inner_else,
+                } = &then_body[0]
+                && inner_else.is_empty()
+            {
+                let combined_cond = HlilExpr::BinOp {
+                    op: crate::il::llil::BinOp::LogicalAnd,
+                    left: Box::new(cond.clone()),
+                    right: Box::new(inner_cond.clone()),
+                };
+                let new_then = inner_then.clone();
+                *stmts[i].as_if_mut().unwrap().0 = combined_cond;
+                *stmts[i].as_if_mut().unwrap().1 = new_then;
+                // Don't increment i, try to combine again if there's another level
+                continue;
+            }
+        }
+        i += 1;
+    }
+}
+
+impl HlilStmt {
+    fn as_if_mut(&mut self) -> Option<(&mut HlilExpr, &mut Vec<HlilStmt>, &mut Vec<HlilStmt>)> {
+        match self {
+            HlilStmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => Some((cond, then_body, else_body)),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -579,15 +1856,28 @@ mod tests {
             make_insn(0x1006, "pop", "rbp"),
             make_insn(0x1007, "ret", ""),
         ];
-        let code = decompile("simple_func", &insns, crate::arch::Architecture::X86_64);
+        let symbols = HashMap::new();
+        let code = decompile(
+            "simple_func",
+            &insns,
+            crate::arch::Architecture::X86_64,
+            &symbols,
+            None,
+            &TypeManager::default(),
+            &crate::memory::MemoryMap::default(),
+        );
         // xor eax,eax is the "return 0" idiom — detected as void.
         assert!(
-            code.contains("void simple_func(void)"),
+            code.text.contains("void simple_func(void)"),
             "expected void signature, got: {}",
             code
         );
         // xor eax,eax folded: result = 0 + return → return 0
-        assert!(code.contains("return"), "expected return, got: {}", code);
+        assert!(
+            code.text.contains("return"),
+            "expected return, got: {}",
+            code
+        );
     }
 
     #[test]
@@ -598,8 +1888,17 @@ mod tests {
             make_insn(0x1006, "pop", "rbp"),
             make_insn(0x1007, "ret", ""),
         ];
-        let code = decompile("caller", &insns, crate::arch::Architecture::X86_64);
-        assert!(code.contains("0x2000()"));
+        let symbols = HashMap::new();
+        let code = decompile(
+            "caller",
+            &insns,
+            crate::arch::Architecture::X86_64,
+            &symbols,
+            None,
+            &TypeManager::default(),
+            &crate::memory::MemoryMap::default(),
+        );
+        assert!(code.text.contains("0x2000()"));
     }
 
     #[test]
@@ -612,11 +1911,22 @@ mod tests {
             make_insn(0x100d, "nop", ""),
             make_insn(0x100e, "ret", ""),
         ];
-        let code = decompile("test_func", &insns, crate::arch::Architecture::X86_64);
+        let symbols = HashMap::new();
+        let code = decompile(
+            "test_func",
+            &insns,
+            crate::arch::Architecture::X86_64,
+            &symbols,
+            None,
+            &TypeManager::default(),
+            &crate::memory::MemoryMap::default(),
+        );
         // Stack/frame operations should be filtered out; meaningful value is
         // folded into the return statement (result_1 = 42 + return → return 42).
         assert!(
-            code.contains("return") && !code.contains("rsp") && !code.contains("rbp"),
+            code.text.contains("return")
+                && !code.text.contains("rsp")
+                && !code.text.contains("rbp"),
             "stack ops should be filtered; got: {}",
             code
         );
@@ -673,7 +1983,11 @@ mod tests {
             },
         ]);
 
-        let stmts = structure_function(&func);
+        let stmts = structure_function(
+            &func,
+            &crate::memory::MemoryMap::default(),
+            crate::arch::Architecture::X86_64,
+        );
         // Should produce DoWhile followed by Return
         assert!(
             stmts.len() >= 2,
@@ -737,7 +2051,11 @@ mod tests {
             },
         ]);
 
-        let stmts = structure_function(&func);
+        let stmts = structure_function(
+            &func,
+            &crate::memory::MemoryMap::default(),
+            crate::arch::Architecture::X86_64,
+        );
         // Should produce While followed by Return
         assert!(
             stmts.len() >= 2,
@@ -817,7 +2135,11 @@ mod tests {
             },
         ]);
 
-        let mut stmts = structure_function(&func);
+        let mut stmts = structure_function(
+            &func,
+            &crate::memory::MemoryMap::default(),
+            crate::arch::Architecture::X86_64,
+        );
         detect_for_loops(&mut stmts);
 
         // The init assign + while should be collapsed into a For
@@ -1038,10 +2360,19 @@ mod tests {
             make_insn(0x1006, "pop", "rbp"),
             make_insn(0x1007, "ret", ""),
         ];
-        let code = decompile("get_arg", &insns, crate::arch::Architecture::X86_64);
+        let symbols = HashMap::new();
+        let code = decompile(
+            "get_arg",
+            &insns,
+            crate::arch::Architecture::X86_64,
+            &symbols,
+            None,
+            &TypeManager::default(),
+            &crate::memory::MemoryMap::default(),
+        );
         // Should detect edi (mapped from rdi) as param and eax assignment as return.
         assert!(
-            code.contains("get_arg("),
+            code.text.contains("get_arg("),
             "expected function with params, got: {}",
             code
         );
@@ -1059,10 +2390,19 @@ mod tests {
             make_insn(0x1010, "xor", "eax, eax"),
             make_insn(0x1012, "ret", ""),
         ];
-        let code = decompile("with_locals", &insns, crate::arch::Architecture::X86_64);
+        let symbols = HashMap::new();
+        let code = decompile(
+            "with_locals",
+            &insns,
+            crate::arch::Architecture::X86_64,
+            &symbols,
+            None,
+            &TypeManager::default(),
+            &crate::memory::MemoryMap::default(),
+        );
         // Should have local variable declarations.
         assert!(
-            code.contains("var_"),
+            code.text.contains("var_"),
             "expected local variable declarations, got: {}",
             code
         );
@@ -1077,20 +2417,24 @@ mod tests {
                 ("int64_t".to_string(), "arg2".to_string()),
             ],
             locals: vec![("int32_t".to_string(), "var_1".to_string())],
+            required_types: HashSet::new(),
+            includes: HashSet::new(),
         };
         let stmts = vec![HlilStmt::Return(Some(HlilExpr::Const(0)))];
-        let code = hlil::render_pseudocode_with_info("add_func", &stmts, &info);
+        let code =
+            hlil::render_pseudocode_with_info("add_func", &stmts, &info, &TypeManager::default());
         assert!(
-            code.contains("int64_t add_func(int64_t arg1, int64_t arg2)"),
+            code.text
+                .contains("int64_t add_func(int64_t arg1, int64_t arg2)"),
             "wrong signature: {}",
             code
         );
         assert!(
-            code.contains("int32_t var_1;"),
+            code.text.contains("int32_t var_1;"),
             "missing local decl: {}",
             code
         );
-        assert!(code.contains("return 0;"), "missing return: {}", code);
+        assert!(code.text.contains("return 0;"), "missing return: {}", code);
     }
 
     #[test]
@@ -1099,11 +2443,14 @@ mod tests {
             return_type: "void".to_string(),
             params: vec![],
             locals: vec![],
+            required_types: HashSet::new(),
+            includes: HashSet::new(),
         };
         let stmts = vec![HlilStmt::Return(None)];
-        let code = hlil::render_pseudocode_with_info("noop", &stmts, &info);
+        let code =
+            hlil::render_pseudocode_with_info("noop", &stmts, &info, &TypeManager::default());
         assert!(
-            code.contains("void noop(void)"),
+            code.text.contains("void noop(void)"),
             "wrong void signature: {}",
             code
         );

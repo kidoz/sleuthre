@@ -10,7 +10,10 @@ type SliceReader<'a> = EndianSlice<'a, RunTimeEndian>;
 /// Extract DWARF debug info from raw binary bytes.
 ///
 /// If the binary has no DWARF sections, returns an empty `DebugInfo`.
-pub fn extract_dwarf_info(bytes: &[u8]) -> crate::Result<DebugInfo> {
+pub fn extract_dwarf_info(
+    bytes: &[u8],
+    arch: crate::arch::Architecture,
+) -> crate::Result<DebugInfo> {
     let obj = match object::File::parse(bytes) {
         Ok(o) => o,
         Err(_) => return Ok(DebugInfo::default()),
@@ -38,12 +41,15 @@ pub fn extract_dwarf_info(bytes: &[u8]) -> crate::Result<DebugInfo> {
     let dwarf = Dwarf::load(&load_section)
         .map_err(|e| crate::error::Error::DebugInfo(format!("DWARF load error: {}", e)))?;
 
-    parse_dwarf(&dwarf)
+    parse_dwarf(&dwarf, arch)
 }
 
-fn parse_dwarf<'a>(dwarf: &'a Dwarf<SliceReader<'a>>) -> crate::Result<DebugInfo> {
+fn parse_dwarf<'a>(
+    dwarf: &'a Dwarf<SliceReader<'a>>,
+    arch: crate::arch::Architecture,
+) -> crate::Result<DebugInfo> {
     let mut info = DebugInfo::default();
-    let mut type_ctx: TypeContext<SliceReader<'a>> = TypeContext::new();
+    let mut type_ctx: TypeContext<SliceReader<'a>> = TypeContext::new(arch);
 
     let mut units = dwarf.units();
     while let Ok(Some(header)) = units.next() {

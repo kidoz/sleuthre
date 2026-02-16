@@ -128,6 +128,10 @@ impl Database {
                 line INTEGER,
                 column INTEGER
             );
+            CREATE TABLE IF NOT EXISTS decompilation_cache (
+                address INTEGER PRIMARY KEY,
+                data TEXT
+            );
             COMMIT;",
             )
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
@@ -332,7 +336,8 @@ impl Database {
                  DELETE FROM function_signatures;
                  DELETE FROM global_variables;
                  DELETE FROM local_variables;
-                 DELETE FROM source_lines;",
+                 DELETE FROM source_lines;
+                 DELETE FROM decompilation_cache;",
             )
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
         Ok(())
@@ -774,6 +779,57 @@ impl Database {
             symbols.push(row.map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?);
         }
         Ok(symbols)
+    }
+
+    // --- Decompilation cache persistence ---
+
+    pub fn save_decompiled_code(
+        &self,
+        address: u64,
+        code: &crate::il::hlil::DecompiledCode,
+    ) -> Result<()> {
+        let data = serde_json::to_string(code)
+            .map_err(|e| Error::Database(format!("JSON error: {}", e)))?;
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO decompilation_cache (address, data) VALUES (?1, ?2)",
+                params![address, data],
+            )
+            .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn load_decompilation_cache(
+        &self,
+    ) -> Result<std::collections::HashMap<u64, crate::il::hlil::DecompiledCode>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT address, data FROM decompilation_cache")
+            .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
+
+        let mut result = std::collections::HashMap::new();
+        for row in rows {
+            let (addr, data) = row.map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
+            if let Ok(code) = serde_json::from_str::<crate::il::hlil::DecompiledCode>(&data) {
+                result.insert(addr, code);
+            }
+        }
+        Ok(result)
+    }
+
+    pub fn delete_decompiled_code(&self, address: u64) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM decompilation_cache WHERE address = ?1",
+                params![address],
+            )
+            .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
+        Ok(())
     }
 }
 

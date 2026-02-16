@@ -38,7 +38,17 @@ pub(crate) struct SyntaxColors {
     pub(crate) nav_band_data: egui::Color32,
     pub(crate) func_badge_bg: egui::Color32,
     pub(crate) bookmark_badge_bg: egui::Color32,
+    pub(crate) selection_bg: egui::Color32,
     pub(crate) ascii_text: egui::Color32,
+
+    // Status bar
+    pub(crate) status_bar_bg: egui::Color32,
+
+    // Navigation band layers
+    pub(crate) nav_band_func_user: egui::Color32,
+    pub(crate) nav_band_func_lib: egui::Color32,
+    pub(crate) nav_band_string: egui::Color32,
+    pub(crate) nav_band_unexplored: egui::Color32,
 }
 
 impl SyntaxColors {
@@ -78,7 +88,15 @@ impl SyntaxColors {
             nav_band_data: egui::Color32::from_rgb(180, 180, 180),
             func_badge_bg: egui::Color32::from_rgb(180, 220, 255),
             bookmark_badge_bg: egui::Color32::from_rgb(255, 220, 180),
+            selection_bg: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 20),
             ascii_text: egui::Color32::from_rgb(0, 100, 0),
+
+            status_bar_bg: egui::Color32::from_rgb(220, 220, 220),
+
+            nav_band_func_user: egui::Color32::from_rgb(0, 200, 255),
+            nav_band_func_lib: egui::Color32::from_rgb(0, 0, 255),
+            nav_band_string: egui::Color32::from_rgb(180, 180, 100),
+            nav_band_unexplored: egui::Color32::from_rgb(180, 180, 180),
         }
     }
 
@@ -111,7 +129,15 @@ impl SyntaxColors {
             nav_band_data: egui::Color32::from_rgb(70, 70, 70),
             func_badge_bg: egui::Color32::from_rgb(40, 70, 100),
             bookmark_badge_bg: egui::Color32::from_rgb(100, 80, 40),
+            selection_bg: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20),
             ascii_text: egui::Color32::from_rgb(80, 200, 80),
+
+            status_bar_bg: egui::Color32::from_rgb(25, 25, 25),
+
+            nav_band_func_user: egui::Color32::from_rgb(0, 160, 200),
+            nav_band_func_lib: egui::Color32::from_rgb(40, 40, 200),
+            nav_band_string: egui::Color32::from_rgb(180, 180, 100),
+            nav_band_unexplored: egui::Color32::from_rgb(60, 60, 60),
         }
     }
 }

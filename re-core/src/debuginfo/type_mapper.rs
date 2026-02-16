@@ -9,14 +9,16 @@ pub struct TypeContext<R: Reader> {
     cache: HashMap<(usize, usize), TypeRef>,
     /// Types that have been fully resolved into CompoundTypes
     pub compound_types: Vec<CompoundType>,
+    pub arch: crate::arch::Architecture,
     _phantom: std::marker::PhantomData<R>,
 }
 
 impl<R: Reader<Offset = usize>> TypeContext<R> {
-    pub fn new() -> Self {
+    pub fn new(arch: crate::arch::Architecture) -> Self {
         Self {
             cache: HashMap::new(),
             compound_types: Vec::new(),
+            arch,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -124,6 +126,7 @@ impl<R: Reader<Offset = usize>> TypeContext<R> {
                 2 => PrimitiveType::I16,
                 4 => PrimitiveType::I32,
                 8 => PrimitiveType::I64,
+                s if s == self.arch.pointer_size() as u64 => PrimitiveType::ISize,
                 _ => PrimitiveType::I32,
             },
             Some(gimli::DW_ATE_unsigned) => match byte_size {
@@ -131,6 +134,7 @@ impl<R: Reader<Offset = usize>> TypeContext<R> {
                 2 => PrimitiveType::U16,
                 4 => PrimitiveType::U32,
                 8 => PrimitiveType::U64,
+                s if s == self.arch.pointer_size() as u64 => PrimitiveType::USize,
                 _ => PrimitiveType::U32,
             },
             Some(gimli::DW_ATE_float) => match byte_size {
@@ -138,7 +142,13 @@ impl<R: Reader<Offset = usize>> TypeContext<R> {
                 8 => PrimitiveType::F64,
                 _ => PrimitiveType::F64,
             },
-            _ => PrimitiveType::Void,
+            _ => {
+                if byte_size == self.arch.pointer_size() as u64 {
+                    PrimitiveType::Pointer
+                } else {
+                    PrimitiveType::Void
+                }
+            }
         };
 
         TypeRef::Primitive(prim)

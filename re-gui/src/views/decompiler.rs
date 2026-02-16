@@ -5,9 +5,48 @@ use crate::theme::SyntaxColors;
 
 impl SleuthreApp {
     pub(crate) fn show_decompiler(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui
+                .button("🔄 Refresh")
+                .on_hover_text("Clear cache and re-decompile")
+                .clicked()
+                && let Some(ref mut project) = self.project
+            {
+                project.decompilation_cache.remove(&self.current_address);
+                self.trigger_decompile = true;
+            }
+            ui.add_space(8.0);
+            ui.label(format!("Function: 0x{:X}", self.current_address));
+        });
+        ui.separator();
+
         egui::ScrollArea::vertical().show(ui, |ui| {
-            let job = highlight_pseudocode(&self.decompiled_code, &self.syntax);
-            ui.add(egui::Label::new(job).selectable(true));
+            let job = highlight_pseudocode(&self.decompiled_code.text, &self.syntax);
+            let galley = ui.painter().layout_job(job);
+            let response = ui.add(egui::Label::new(galley.clone()).sense(egui::Sense::click()));
+
+            if response.clicked()
+                && let Some(pos) = response.interact_pointer_pos()
+            {
+                let relative_pos = pos - response.rect.min;
+                let cursor = galley.cursor_from_pos(relative_pos);
+                let char_idx = cursor.index;
+
+                // Find annotation at this index
+                for ann in &self.decompiled_code.annotations {
+                    if char_idx >= ann.start && char_idx < ann.end {
+                        match &ann.kind {
+                            re_core::il::hlil::AnnotationKind::Function(addr)
+                            | re_core::il::hlil::AnnotationKind::Global(addr) => {
+                                self.current_address = *addr;
+                                self.update_cfg();
+                            }
+                            _ => {}
+                        }
+                        break;
+                    }
+                }
+            }
         });
     }
 }

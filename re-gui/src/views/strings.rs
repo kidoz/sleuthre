@@ -23,8 +23,8 @@ impl SleuthreApp {
         ui.horizontal(|ui| {
             ui.monospace(
                 egui::RichText::new(format!(
-                    "{:<10} {:<6} {:<8} {}",
-                    "Address", "Len", "Encoding", "Value"
+                    "{:<10} {:<6} {:<8} {:<6} {}",
+                    "Address", "Len", "Encoding", "Xrefs", "Value"
                 ))
                 .strong(),
             );
@@ -50,6 +50,13 @@ impl SleuthreApp {
                     StringEncoding::Utf16Be => "UTF16BE",
                 };
 
+                let xref_count = project
+                    .xrefs
+                    .to_address_xrefs
+                    .get(&s.address)
+                    .map(|v| v.len())
+                    .unwrap_or(0);
+
                 let display_val = if s.value.len() > 80 {
                     format!("{}...", &s.value[..80])
                 } else {
@@ -67,7 +74,20 @@ impl SleuthreApp {
                         jump_to = Some(s.address);
                     }
                     ui.monospace(format!("{:<6}", s.length));
-                    ui.monospace(enc);
+                    ui.monospace(format!("{:<8}", enc));
+
+                    if ui
+                        .selectable_label(
+                            false,
+                            egui::RichText::new(format!("{:<6}", xref_count))
+                                .color(self.syntax.link),
+                        )
+                        .clicked()
+                    {
+                        self.focused_address = Some(s.address);
+                        self.xref_active = true;
+                    }
+
                     ui.add_space(8.0);
                     ui.monospace(&display_val);
                 });
@@ -80,7 +100,7 @@ impl SleuthreApp {
                 project.navigate_to(addr);
             }
             self.current_address = addr;
-            self.active_tab = Tab::HexView;
+            self.focus_or_open_tab(Tab::HexView);
         }
     }
 }

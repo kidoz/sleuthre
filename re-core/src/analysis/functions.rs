@@ -59,6 +59,26 @@ impl FunctionManager {
         self.functions.get(&address)
     }
 
+    /// Find the start address of the function that contains `addr`.
+    pub fn find_function_containing(&self, addr: u64) -> Option<u64> {
+        // Since functions is a BTreeMap, we can iterate in reverse to find the
+        // closest start address <= addr.
+        for (&start, func) in self.functions.iter().rev() {
+            if addr >= start {
+                if let Some(end) = func.end_address {
+                    if addr < end {
+                        return Some(start);
+                    }
+                } else {
+                    // For now, assume unbounded functions continue until next func?
+                    // Or return Some(start).
+                    return Some(start);
+                }
+            }
+        }
+        None
+    }
+
     /// Apply symbol names to discovered functions, or create new functions from symbols
     pub fn apply_symbols(&mut self, symbols: &[Symbol]) {
         for sym in symbols {

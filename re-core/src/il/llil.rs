@@ -245,9 +245,21 @@ pub enum BinOp {
     And,
     Or,
     Xor,
+    LogicalAnd,
+    LogicalOr,
     Shl,
     Shr,
     Sar,
+    CmpEq,
+    CmpNe,
+    CmpLt,
+    CmpLe,
+    CmpGt,
+    CmpGe,
+    CmpUlt,
+    CmpUle,
+    CmpUgt,
+    CmpUge,
 }
 
 /// Unary operations.
@@ -397,8 +409,16 @@ impl fmt::Display for BinOp {
             BinOp::And => "&",
             BinOp::Or => "|",
             BinOp::Xor => "^",
+            BinOp::LogicalAnd => "&&",
+            BinOp::LogicalOr => "||",
             BinOp::Shl => "<<",
             BinOp::Shr | BinOp::Sar => ">>",
+            BinOp::CmpEq => "==",
+            BinOp::CmpNe => "!=",
+            BinOp::CmpLt | BinOp::CmpUlt => "<",
+            BinOp::CmpLe | BinOp::CmpUle => "<=",
+            BinOp::CmpGt | BinOp::CmpUgt => ">",
+            BinOp::CmpGe | BinOp::CmpUge => ">=",
         };
         write!(f, "{}", s)
     }

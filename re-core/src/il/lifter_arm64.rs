@@ -178,6 +178,9 @@ fn parse_arm64_immediate(s: &str) -> Option<u64> {
     let s = s.trim();
     if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         u64::from_str_radix(hex, 16).ok()
+    } else if let Some(neg_hex) = s.strip_prefix("-0x").or_else(|| s.strip_prefix("-0X")) {
+        let val = i64::from_str_radix(neg_hex, 16).ok()?;
+        Some((-val) as u64)
     } else if s.starts_with('-') {
         s.parse::<i64>().ok().map(|v| v as u64)
     } else {

@@ -1,14 +1,16 @@
 use re_core::analysis::cfg::ControlFlowGraph;
-use re_core::analysis::type_propagation::TypePropagator;
+use re_core::analysis::type_propagation::{FunctionTypeInfo, TypePropagator};
 use re_core::debuginfo;
 use re_core::disasm::Disassembler;
 use re_core::loader::load_binary;
 use re_core::plugin::{AnalysisFinding, PluginManager};
 use re_core::project::{ActionKind, PendingAction, Project};
+use std::collections::HashMap;
 use uuid::Uuid;
 
-use re_core::analysis::passes::SuspiciousNamePass;
 use crate::theme::{SyntaxColors, ThemeMode};
+use re_core::analysis::passes::{HeuristicNamePass, SignaturePass, SuspiciousNamePass};
+use re_core::signatures::SignatureDatabase;
 
 pub(crate) struct SleuthreApp {
     pub(crate) project: Option<Project>,
@@ -18,6 +20,7 @@ pub(crate) struct SleuthreApp {
     pub(crate) function_filter: String,
     pub(crate) string_filter: String,
     pub(crate) active_tab: Tab,
+    pub(crate) dock_state: egui_dock::DockState<Tab>,
     pub(crate) current_address: u64,
 
     pub(crate) rename_active: bool,
@@ -28,7 +31,7 @@ pub(crate) struct SleuthreApp {
     pub(crate) focused_address: Option<u64>,
 
     pub(crate) approval_queue_open: bool,
-    pub(crate) decompiled_code: String,
+    pub(crate) decompiled_code: re_core::il::hlil::DecompiledCode,
     pub(crate) trigger_decompile: bool,
 
     pub(crate) command_input: String,
@@ -61,9 +64,63 @@ pub(crate) struct SleuthreApp {
     pub(crate) plugin_manager: PluginManager,
     pub(crate) plugin_findings: Vec<AnalysisFinding>,
     pub(crate) show_findings_window: bool,
+
+    // Structure creation
+    pub(crate) create_struct_active: bool,
+    pub(crate) new_struct_name: String,
+    pub(crate) editing_struct: Option<String>,
+    pub(crate) new_field_name: String,
+    pub(crate) new_field_offset: String,
+    pub(crate) new_field_type: String,
+
+    // Hex view editing
+    pub(crate) hex_selected_addr: Option<u64>,
+    pub(crate) hex_edit_buffer: String,
+
+    // Toasts
+    pub(crate) toasts: Vec<Toast>,
+
+    // Debugger
+    pub(crate) debugger: Box<dyn re_core::Debugger>,
+
+    // Auto-save
+    pub(crate) last_save_time: f64,
+
+    // Output panel
+    pub(crate) output_panel_visible: bool,
+    pub(crate) output_panel_height: f32,
+
+    // Functions list sorting/filtering
+    pub(crate) func_sort_column: FunctionSortColumn,
+    pub(crate) func_sort_ascending: bool,
+    pub(crate) func_type_filter: FunctionTypeFilter,
+    pub(crate) func_xref_counts: HashMap<u64, (usize, usize)>,
+
+    // Navigation band layer
+    pub(crate) nav_band_layer: NavBandLayer,
+
+    // Command bar
+    pub(crate) command_bar_input: String,
+    pub(crate) command_bar_results: Vec<CommandBarResult>,
+    pub(crate) command_bar_selected: usize,
+    pub(crate) command_bar_active: bool,
+}
+
+pub(crate) struct Toast {
+    pub(crate) kind: ToastKind,
+    pub(crate) message: String,
+    pub(crate) expires_at: f64,
 }
 
 #[derive(PartialEq, Clone, Copy)]
+pub(crate) enum ToastKind {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+#[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
 pub(crate) enum Tab {
     Disassembly,
     Graph,
@@ -76,11 +133,64 @@ pub(crate) enum Tab {
     CallGraph,
 }
 
+impl std::fmt::Display for Tab {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Tab::Disassembly => write!(f, "Disassembly"),
+            Tab::Graph => write!(f, "Graph"),
+            Tab::Decompiler => write!(f, "Pseudocode"),
+            Tab::HexView => write!(f, "Hex View"),
+            Tab::Strings => write!(f, "Strings"),
+            Tab::Imports => write!(f, "Imports"),
+            Tab::Exports => write!(f, "Exports"),
+            Tab::Structures => write!(f, "Structures"),
+            Tab::CallGraph => write!(f, "Call Graph"),
+        }
+    }
+}
+
 #[derive(PartialEq, Clone, Copy)]
 pub(crate) enum SearchMode {
     Address,
     HexPattern,
     String,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+pub(crate) enum FunctionSortColumn {
+    Address,
+    Name,
+    Size,
+    XrefsIn,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+pub(crate) enum FunctionTypeFilter {
+    All,
+    User,
+    Library,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+pub(crate) enum NavBandLayer {
+    Segments,
+    Functions,
+    AnalysisState,
+}
+
+#[derive(Clone)]
+pub(crate) struct CommandBarResult {
+    pub(crate) label: String,
+    pub(crate) address: u64,
+    pub(crate) kind: CommandBarResultKind,
+}
+
+#[derive(Clone, PartialEq)]
+pub(crate) enum CommandBarResultKind {
+    Function,
+    Import,
+    Export,
+    StringRef,
 }
 
 impl Default for SleuthreApp {
@@ -97,6 +207,7 @@ impl Default for SleuthreApp {
             function_filter: String::new(),
             string_filter: String::new(),
             active_tab: Tab::Disassembly,
+            dock_state: egui_dock::DockState::new(vec![Tab::Disassembly]),
             current_address: 0,
             rename_active: false,
             rename_input: String::new(),
@@ -105,7 +216,10 @@ impl Default for SleuthreApp {
             xref_active: false,
             focused_address: None,
             approval_queue_open: false,
-            decompiled_code: "// Press F5 to decompile".to_string(),
+            decompiled_code: re_core::il::hlil::DecompiledCode {
+                text: "// Press F5 to decompile".to_string(),
+                annotations: vec![],
+            },
             trigger_decompile: false,
             command_input: String::new(),
             import_filter: String::new(),
@@ -131,11 +245,45 @@ impl Default for SleuthreApp {
             },
             plugin_findings: Vec::new(),
             show_findings_window: false,
+            create_struct_active: false,
+            new_struct_name: String::new(),
+            editing_struct: None,
+            new_field_name: String::new(),
+            new_field_offset: String::new(),
+            new_field_type: String::new(),
+            hex_selected_addr: None,
+            hex_edit_buffer: String::new(),
+            toasts: Vec::new(),
+            debugger: Box::new(re_core::MockDebugger::default()),
+            last_save_time: 0.0,
+            output_panel_visible: true,
+            output_panel_height: 150.0,
+            func_sort_column: FunctionSortColumn::Address,
+            func_sort_ascending: true,
+            func_type_filter: FunctionTypeFilter::All,
+            func_xref_counts: HashMap::new(),
+            nav_band_layer: NavBandLayer::Segments,
+            command_bar_input: String::new(),
+            command_bar_results: Vec::new(),
+            command_bar_selected: 0,
+            command_bar_active: false,
         }
     }
 }
 
 impl SleuthreApp {
+    pub(crate) fn add_toast(&mut self, kind: ToastKind, message: String) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        self.toasts.push(Toast {
+            kind,
+            message,
+            expires_at: now + 5.0, // Default 5 seconds
+        });
+    }
+
     pub(crate) fn open_binary(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("Executables", &["elf", "exe", "dll", "so", "bin"])
@@ -190,7 +338,8 @@ impl SleuthreApp {
 
                     // Extract debug info from the binary
                     let bytes = std::fs::read(&path).unwrap_or_default();
-                    let debug_info = debuginfo::extract_debug_info(&bytes).unwrap_or_default();
+                    let debug_info =
+                        debuginfo::extract_debug_info(&bytes, loaded.arch).unwrap_or_default();
 
                     // Also try PDB if available
                     let pdb_debug = if let Some(ref pdb_path) = loaded.debug_info_path {
@@ -200,9 +349,10 @@ impl SleuthreApp {
                             .map(|dir| dir.join(pdb_path.file_name().unwrap_or_default()))
                             .unwrap_or_else(|| pdb_path.clone());
                         if pdb_candidate.exists() {
-                            debuginfo::extract_pdb_info(&pdb_candidate).unwrap_or_default()
+                            debuginfo::extract_pdb_info(&pdb_candidate, loaded.arch)
+                                .unwrap_or_default()
                         } else if pdb_path.exists() {
-                            debuginfo::extract_pdb_info(pdb_path).unwrap_or_default()
+                            debuginfo::extract_pdb_info(pdb_path, loaded.arch).unwrap_or_default()
                         } else {
                             Default::default()
                         }
@@ -274,14 +424,70 @@ impl SleuthreApp {
                     let sym_count = loaded.symbols.len();
                     let lib_count = project.libraries.len();
 
+                    // Configure analysis passes based on architecture
+                    self.plugin_manager.clear_analysis_passes();
+                    self.plugin_manager
+                        .register_analysis_pass(Box::new(SuspiciousNamePass));
+                    self.plugin_manager
+                        .register_analysis_pass(Box::new(HeuristicNamePass));
+
+                    let sig_db = match loaded.arch {
+                        re_core::arch::Architecture::X86_64 => SignatureDatabase::builtin_x86_64(),
+                        re_core::arch::Architecture::Arm64 => SignatureDatabase::builtin_arm64(),
+                        _ => SignatureDatabase::new(),
+                    };
+                    self.plugin_manager
+                        .register_analysis_pass(Box::new(SignaturePass::new(sig_db)));
+
+                    // Run analysis passes automatically
+                    if let Ok(findings) = self.plugin_manager.run_all_analysis_passes(
+                        &project.memory_map,
+                        &mut project.functions,
+                        &project.xrefs,
+                        &project.strings,
+                    ) {
+                        self.plugin_findings = findings;
+                        if !self.plugin_findings.is_empty() {
+                            self.add_toast(
+                                ToastKind::Success,
+                                format!("Analysis found {} items", self.plugin_findings.len()),
+                            );
+                        }
+                    }
+
+                    // Build xref counts cache
+                    self.func_xref_counts.clear();
+                    for &addr in project.functions.functions.keys() {
+                        let xrefs_in = project
+                            .xrefs
+                            .to_address_xrefs
+                            .get(&addr)
+                            .map(|v| v.len())
+                            .unwrap_or(0);
+                        let xrefs_out = project
+                            .xrefs
+                            .from_address_xrefs
+                            .get(&addr)
+                            .map(|v| v.len())
+                            .unwrap_or(0);
+                        self.func_xref_counts.insert(addr, (xrefs_in, xrefs_out));
+                    }
+
                     self.current_address = loaded.entry_point;
                     self.disasm = disasm;
                     self.project = Some(project);
                     self.update_cfg();
-                    self.output.push_str(&format!(
+                    let msg = format!(
                         "Loaded '{}': {} functions, {} symbols, {} imports, {} exports, {} libraries",
-                        path.display(), func_count, sym_count, import_count, export_count, lib_count
-                    ));
+                        path.display(),
+                        func_count,
+                        sym_count,
+                        import_count,
+                        export_count,
+                        lib_count
+                    );
+                    self.add_toast(ToastKind::Success, format!("Loaded '{}'", path.display()));
+                    self.output.push_str(&msg);
                     if debug_sig_count > 0 || debug_type_count > 0 {
                         self.output.push_str(&format!(
                             ", {} debug signatures, {} debug types",
@@ -290,26 +496,37 @@ impl SleuthreApp {
                     }
                     self.output.push('\n');
                 }
-                Err(e) => self.output.push_str(&format!("Error: {}\n", e)),
+                Err(e) => {
+                    self.add_toast(ToastKind::Error, format!("Load error: {}", e));
+                    self.output.push_str(&format!("Error: {}\n", e));
+                }
             }
         }
     }
 
     pub(crate) fn save_project(&mut self) {
         if self.project.is_none() {
-            self.output.push_str("No project to save.\n");
+            self.add_toast(ToastKind::Warning, "No project to save.".into());
             return;
         }
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Sleuthre Project", &["slre"])
-            .save_file()
+
+        let file_dialog = rfd::FileDialog::new().add_filter("Sleuthre Project", &["slre"]);
+        if let Some(path) = file_dialog.save_file()
             && let Some(ref mut project) = self.project
         {
             match project.save(&path) {
-                Ok(()) => self
-                    .output
-                    .push_str(&format!("Project saved to '{}'.\n", path.display())),
-                Err(e) => self.output.push_str(&format!("Save error: {}\n", e)),
+                Ok(()) => {
+                    self.add_toast(
+                        ToastKind::Success,
+                        format!("Project saved to '{}'", path.display()),
+                    );
+                    self.output
+                        .push_str(&format!("Project saved to '{}'.\n", path.display()));
+                }
+                Err(e) => {
+                    self.add_toast(ToastKind::Error, format!("Save error: {}", e));
+                    self.output.push_str(&format!("Save error: {}\n", e));
+                }
             }
         }
     }
@@ -321,13 +538,20 @@ impl SleuthreApp {
         {
             match Project::load(&path) {
                 Ok(project) => {
+                    self.add_toast(
+                        ToastKind::Success,
+                        format!("Project loaded from '{}'", path.display()),
+                    );
                     self.output
                         .push_str(&format!("Project loaded from '{}'.\n", path.display()));
                     self.disasm = Disassembler::new(project.arch).ok();
                     self.project = Some(project);
                     self.update_cfg();
                 }
-                Err(e) => self.output.push_str(&format!("Load error: {}\n", e)),
+                Err(e) => {
+                    self.add_toast(ToastKind::Error, format!("Load error: {}", e));
+                    self.output.push_str(&format!("Load error: {}\n", e));
+                }
             }
         }
     }
@@ -344,10 +568,16 @@ impl SleuthreApp {
     }
 
     pub(crate) fn decompile_current_function(&mut self) {
-        let (project, disasm) = match (&self.project, &self.disasm) {
+        let (project, disasm) = match (&mut self.project, &self.disasm) {
             (Some(p), Some(d)) => (p, d),
             _ => return,
         };
+
+        // Check cache first
+        if let Some(cached) = project.decompilation_cache.get(&self.current_address) {
+            self.decompiled_code = cached.clone();
+            return;
+        }
 
         if let Ok(insns) = disasm.disassemble_range(&project.memory_map, self.current_address, 500)
         {
@@ -362,32 +592,101 @@ impl SleuthreApp {
                 .as_ref()
                 .map(|d| d.arch)
                 .unwrap_or(re_core::arch::Architecture::X86_64);
-            self.decompiled_code = re_core::il::structuring::decompile(func_name, &insns, arch);
+
+            // Build symbol map
+            let mut symbols = HashMap::new();
+            for f in project.functions.functions.values() {
+                symbols.insert(f.start_address, f.name.clone());
+            }
+            for sym in &project.symbols {
+                symbols.insert(sym.address, sym.name.clone());
+            }
+            for imp in &project.imports {
+                symbols.insert(imp.address, imp.name.clone());
+            }
+
+            // Build type info for the current function
+            let type_info = project
+                .types
+                .function_signatures
+                .get(&self.current_address)
+                .map(|sig| FunctionTypeInfo {
+                    signature: Some(sig.clone()),
+                    var_types: Default::default(),
+                });
+
+            let code = re_core::il::structuring::decompile(
+                func_name,
+                &insns,
+                arch,
+                &symbols,
+                type_info.as_ref(),
+                &project.types,
+                &project.memory_map,
+            );
+
+            // Cache it
+            project
+                .decompilation_cache
+                .insert(self.current_address, code.clone());
+            self.decompiled_code = code;
         }
     }
 
     pub(crate) fn run_ai_naming_heuristics(&mut self) {
-        if let Some(ref mut project) = self.project
-            && let Some(s) = project
+        let arch = self.project.as_ref().map(|p| p.arch);
+        let current_addr = self.current_address;
+
+        let mut toast = None;
+        if let Some(ref mut project) = self.project {
+            // 1. Run Signature-based matching
+            let sig_db = match arch.unwrap_or(re_core::arch::Architecture::X86_64) {
+                re_core::arch::Architecture::X86_64 => {
+                    re_core::signatures::SignatureDatabase::builtin_x86_64()
+                }
+                re_core::arch::Architecture::Arm64 => {
+                    re_core::signatures::SignatureDatabase::builtin_arm64()
+                }
+                _ => re_core::signatures::SignatureDatabase::new(),
+            };
+
+            let matches = sig_db.scan_and_apply(&project.memory_map, &mut project.functions);
+            if !matches.is_empty() {
+                toast = Some((
+                    ToastKind::Success,
+                    format!(
+                        "Identified {} library functions via signatures.",
+                        matches.len()
+                    ),
+                ));
+            }
+
+            // 2. Original hardcoded heuristic (refined)
+            if let Some(s) = project
                 .strings
                 .strings
                 .iter()
                 .find(|s| s.value.contains("Bink") || s.value.contains("Smack"))
-        {
-            project.pending_actions.push(PendingAction {
-                id: Uuid::new_v4(),
-                kind: ActionKind::Rename {
-                    address: self.current_address,
-                    new_name: "decode_bink_frame".to_string(),
-                    old_name: "sub_401000".to_string(),
-                },
-                rationale: format!(
-                    "Function at {:X} references string '{}'",
-                    self.current_address, s.value
-                ),
-                confidence: 0.9,
-            });
-            self.approval_queue_open = true;
+            {
+                project.pending_actions.push(PendingAction {
+                    id: Uuid::new_v4(),
+                    kind: ActionKind::Rename {
+                        address: current_addr,
+                        new_name: "decode_bink_frame".to_string(),
+                        old_name: "sub_401000".to_string(),
+                    },
+                    rationale: format!(
+                        "Function at {:X} references string '{}'",
+                        current_addr, s.value
+                    ),
+                    confidence: 0.9,
+                });
+                self.approval_queue_open = true;
+            }
+        }
+
+        if let Some((kind, msg)) = toast {
+            self.add_toast(kind, msg);
         }
     }
 
@@ -399,6 +698,17 @@ impl SleuthreApp {
             || self.goto_active
             || self.bookmark_active
             || self.search_active
+    }
+
+    pub(crate) fn focus_or_open_tab(&mut self, tab: Tab) {
+        if let Some((surface, node, tab_idx)) = self.dock_state.find_tab(&tab) {
+            self.dock_state
+                .set_focused_node_and_surface((surface, node));
+            self.dock_state.set_active_tab((surface, node, tab_idx));
+        } else {
+            self.dock_state.push_to_focused_leaf(tab);
+        }
+        self.active_tab = tab;
     }
 }
 

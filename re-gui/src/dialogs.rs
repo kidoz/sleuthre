@@ -14,6 +14,134 @@ impl SleuthreApp {
         self.show_bookmark_dialog(ctx);
         self.show_search_dialog(ctx);
         self.show_findings_window(ctx);
+        self.show_create_struct_dialog(ctx);
+        self.show_add_field_dialog(ctx);
+    }
+
+    fn show_add_field_dialog(&mut self, ctx: &egui::Context) {
+        let Some(struct_name) = self.editing_struct.clone() else {
+            return;
+        };
+
+        egui::Window::new(format!("Add Field to {}", struct_name)).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Name:");
+                ui.text_edit_singleline(&mut self.new_field_name);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Offset:");
+                ui.text_edit_singleline(&mut self.new_field_offset);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Type:");
+                ui.text_edit_singleline(&mut self.new_field_type);
+            });
+
+            ui.horizontal(|ui| {
+                if ui.button("Add").clicked() {
+                    let offset = self
+                        .new_field_offset
+                        .trim_start_matches("0x")
+                        .trim_start_matches("0X");
+                    let mut toast = None;
+
+                    if let Ok(off) = usize::from_str_radix(offset, 16)
+                        && let Some(ref mut project) = self.project
+                    {
+                        let tref = match self.new_field_type.as_str() {
+                            "int8_t" => re_core::types::TypeRef::Primitive(
+                                re_core::types::PrimitiveType::I8,
+                            ),
+                            "int16_t" => re_core::types::TypeRef::Primitive(
+                                re_core::types::PrimitiveType::I16,
+                            ),
+                            "int32_t" => re_core::types::TypeRef::Primitive(
+                                re_core::types::PrimitiveType::I32,
+                            ),
+                            "int64_t" => re_core::types::TypeRef::Primitive(
+                                re_core::types::PrimitiveType::I64,
+                            ),
+                            "uint8_t" => re_core::types::TypeRef::Primitive(
+                                re_core::types::PrimitiveType::U8,
+                            ),
+                            "uint16_t" => re_core::types::TypeRef::Primitive(
+                                re_core::types::PrimitiveType::U16,
+                            ),
+                            "uint32_t" => re_core::types::TypeRef::Primitive(
+                                re_core::types::PrimitiveType::U32,
+                            ),
+                            "uint64_t" => re_core::types::TypeRef::Primitive(
+                                re_core::types::PrimitiveType::U64,
+                            ),
+                            _ if self.new_field_type.ends_with('*') => {
+                                re_core::types::TypeRef::Pointer(Box::new(
+                                    re_core::types::TypeRef::Primitive(
+                                        re_core::types::PrimitiveType::Void,
+                                    ),
+                                ))
+                            }
+                            _ => re_core::types::TypeRef::Primitive(
+                                re_core::types::PrimitiveType::I32,
+                            ),
+                        };
+
+                        project.types.add_struct_field(
+                            &struct_name,
+                            re_core::types::StructField {
+                                name: self.new_field_name.clone(),
+                                type_ref: tref,
+                                offset: off,
+                                bit_offset: None,
+                                bit_size: None,
+                            },
+                        );
+                        toast = Some(format!("Added field '{}'", self.new_field_name));
+                        // Invalidate cache since field names might change decompilation
+                        project.decompilation_cache.clear();
+                    }
+
+                    if let Some(msg) = toast {
+                        self.add_toast(crate::app::ToastKind::Success, msg);
+                    }
+                    self.editing_struct = None;
+                }
+                if ui.button("Cancel").clicked() {
+                    self.editing_struct = None;
+                }
+            });
+        });
+    }
+
+    fn show_create_struct_dialog(&mut self, ctx: &egui::Context) {
+        if !self.create_struct_active {
+            return;
+        }
+        egui::Window::new("Create New Struct").show(ctx, |ui| {
+            ui.label("Struct Name:");
+            ui.text_edit_singleline(&mut self.new_struct_name);
+            ui.horizontal(|ui| {
+                if ui.button("Create").clicked() {
+                    if let Some(ref mut project) = self.project {
+                        let name = self.new_struct_name.clone();
+                        project
+                            .types
+                            .add_type(re_core::types::CompoundType::Struct {
+                                name: name.clone(),
+                                fields: vec![],
+                                size: 0,
+                            });
+                        self.add_toast(
+                            crate::app::ToastKind::Success,
+                            format!("Created struct '{}'", name),
+                        );
+                    }
+                    self.create_struct_active = false;
+                }
+                if ui.button("Cancel").clicked() {
+                    self.create_struct_active = false;
+                }
+            });
+        });
     }
 
     fn show_rename_dialog(&mut self, ctx: &egui::Context) {
@@ -170,6 +298,11 @@ impl SleuthreApp {
                         self.current_address = addr;
                         self.update_cfg();
                         self.goto_active = false;
+                    } else {
+                        self.add_toast(
+                            crate::app::ToastKind::Error,
+                            format!("Invalid hex address: {}", cleaned),
+                        );
                     }
                 }
                 if ui.button("Cancel").clicked() {

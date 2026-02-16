@@ -65,10 +65,10 @@ impl<'a> TypePropagator<'a> {
                 info.signature = Some(sig.clone());
             }
             // Priority 3: import name → type library lookup
-            else if let Some(import_name) = self.find_import_name(addr) {
-                if let Some(lib_sig) = self.type_libs.resolve_function(&import_name) {
-                    info.signature = Some(lib_sig.clone());
-                }
+            else if let Some(import_name) = self.find_import_name(addr)
+                && let Some(lib_sig) = self.type_libs.resolve_function(&import_name)
+            {
+                info.signature = Some(lib_sig.clone());
             }
             // Priority 4: function name → type library lookup
             else if let Some(func) = self.functions.functions.get(&addr)

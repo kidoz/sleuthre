@@ -59,7 +59,7 @@ impl SleuthreApp {
                 project.navigate_to(addr);
             }
             self.current_address = addr;
-            self.active_tab = Tab::Disassembly;
+            self.focus_or_open_tab(Tab::Disassembly);
             self.update_cfg();
         }
     }
