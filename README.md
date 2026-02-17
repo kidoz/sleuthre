@@ -28,6 +28,7 @@ The project is a Cargo workspace with three crates:
 | **re-core** | Analysis engine — binary loaders, disassembly, CFG, cross-references, string/constant detection, decompiler, SQLite project database |
 | **re-gui** | Desktop UI built with egui/eframe — disassembly, graph, hex, strings, and pseudocode views |
 | **re-mcp** | Headless MCP server (JSON-RPC over stdio) for AI agent integration |
+| **re-cli** | Headless CLI tool for batch binary analysis |
 
 ## Building
 
@@ -43,6 +44,9 @@ cargo run -p re-gui
 
 # MCP server (JSON-RPC over stdio)
 cargo run -p re-mcp
+
+# CLI batch analysis
+cargo run -p re-cli -- --help
 ```
 
 ## Testing
