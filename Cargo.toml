@@ -39,3 +39,7 @@ object = { version = "0.36", default-features = false, features = ["read"] }
 pdb = "0.8"
 rhai = "1.20"
 egui_dock = "0.18"
+
+[profile.release]
+lto = true
+strip = true
