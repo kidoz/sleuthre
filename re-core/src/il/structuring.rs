@@ -1578,6 +1578,12 @@ pub fn decompile(
     types: &TypeManager,
     memory: &crate::memory::MemoryMap,
 ) -> hlil::DecompiledCode {
+    if instructions.is_empty() {
+        return hlil::DecompiledCode {
+            text: format!("// {}: empty function\n", name),
+            annotations: Vec::new(),
+        };
+    }
     let llil = match arch {
         crate::arch::Architecture::Arm64 => {
             crate::il::lifter_arm64::lift_function(name, instructions[0].address, instructions)
