@@ -6,6 +6,8 @@
 
 An open-source reverse engineering desktop application built in Rust.
 
+![sleuthre](docs/screenshots/main.png)
+
 ## Features
 
 - **Binary format support** — ELF and PE loaders with automatic format detection
