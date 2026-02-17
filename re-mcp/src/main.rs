@@ -27,6 +27,45 @@ fn missing_param_error(id: &Value, name: &str) -> Value {
     })
 }
 
+/// Build a JSON-RPC tool result wrapping a plain text string.
+fn tool_text_result(id: &Value, text: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": { "content": [{ "type": "text", "text": text }] }
+    })
+}
+
+/// Build a JSON-RPC tool result by serializing `data` to JSON text.
+/// Returns a JSON-RPC error response if serialization fails.
+fn tool_result(id: &Value, data: &impl serde::Serialize) -> Value {
+    match serde_json::to_string(data) {
+        Ok(text) => tool_text_result(id, &text),
+        Err(e) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": -32603, "message": format!("Serialization error: {}", e) }
+        }),
+    }
+}
+
+/// Build a JSON-RPC resource result by serializing `data` to JSON text.
+/// Returns a JSON-RPC error response if serialization fails.
+fn resource_result(id: &Value, uri: &str, data: &impl serde::Serialize) -> Value {
+    match serde_json::to_string(data) {
+        Ok(text) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": { "contents": [{ "uri": uri, "text": text }] }
+        }),
+        Err(e) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": -32603, "message": format!("Serialization error: {}", e) }
+        }),
+    }
+}
+
 impl McpServer {
     fn new() -> Self {
         Self {
@@ -346,7 +385,7 @@ impl McpServer {
                         }
                         project.constants.scan(&project.memory_map);
                         self.project = Some(project);
-                        json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": "Binary loaded successfully" }] } })
+                        tool_text_result(&id, "Binary loaded successfully")
                     }
                     Err(e) => {
                         json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32001, "message": e.to_string() } })
@@ -362,7 +401,7 @@ impl McpServer {
                     match disasm.disassemble_range(&project.memory_map, addr, count * 15) {
                         Ok(insns) => {
                             let result: Vec<_> = insns.into_iter().take(count).collect();
-                            json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": serde_json::to_string(&result).unwrap() }] } })
+                            tool_result(&id, &result)
                         }
                         Err(e) => {
                             json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32002, "message": e.to_string() } })
@@ -404,7 +443,7 @@ impl McpServer {
                         rationale,
                         confidence: 0.9,
                     });
-                    json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": "Rename submitted for approval" }] } })
+                    tool_text_result(&id, "Rename submitted for approval")
                 } else {
                     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": "No project loaded" } })
                 }
@@ -443,7 +482,7 @@ impl McpServer {
                             }));
                         }
                     }
-                    json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": serde_json::to_string(&result).unwrap() }] } })
+                    tool_result(&id, &result)
                 } else {
                     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": "No project loaded" } })
                 }
@@ -465,7 +504,7 @@ impl McpServer {
                     } else {
                         project.comments.insert(addr, text.clone());
                     }
-                    json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": format!("Comment set at 0x{:x}", addr) }] } })
+                    tool_text_result(&id, &format!("Comment set at 0x{:x}", addr))
                 } else {
                     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": "No project loaded" } })
                 }
@@ -481,7 +520,7 @@ impl McpServer {
                         .filter(|s| filter.is_empty() || s.value.contains(filter))
                         .take(limit)
                         .collect();
-                    json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": serde_json::to_string(&strings).unwrap() }] } })
+                    tool_result(&id, &strings)
                 } else {
                     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": "No project loaded" } })
                 }
@@ -506,7 +545,10 @@ impl McpServer {
                                     })
                                 })
                                 .collect();
-                            json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": serde_json::to_string(&json!({"blocks": blocks, "edge_count": cfg.graph.edge_count()})).unwrap() }] } })
+                            tool_result(
+                                &id,
+                                &json!({"blocks": blocks, "edge_count": cfg.graph.edge_count()}),
+                            )
                         }
                         Err(e) => {
                             json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32002, "message": e.to_string() } })
@@ -522,9 +564,7 @@ impl McpServer {
                 };
                 if let Some(project) = &mut self.project {
                     match project.save(std::path::Path::new(path)) {
-                        Ok(()) => {
-                            json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": format!("Project saved to {}", path) }] } })
-                        }
+                        Ok(()) => tool_text_result(&id, &format!("Project saved to {}", path)),
                         Err(e) => {
                             json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32003, "message": e.to_string() } })
                         }
@@ -585,7 +625,7 @@ impl McpServer {
                                     &project.types,
                                     &project.memory_map,
                                 );
-                                json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": pseudocode.text }] } })
+                                tool_text_result(&id, &pseudocode.text)
                             }
                             Err(e) => {
                                 json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32002, "message": e.to_string() } })
@@ -628,7 +668,7 @@ impl McpServer {
                         .take(limit)
                         .map(|addr| format!("0x{:x}", addr))
                         .collect();
-                    json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": serde_json::to_string(&results).unwrap() }] } })
+                    tool_result(&id, &results)
                 } else {
                     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": "No project loaded" } })
                 }
@@ -641,7 +681,7 @@ impl McpServer {
                         .iter()
                         .filter(|imp| filter.is_empty() || imp.name.contains(filter))
                         .collect();
-                    json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": serde_json::to_string(&imports).unwrap() }] } })
+                    tool_result(&id, &imports)
                 } else {
                     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": "No project loaded" } })
                 }
@@ -654,7 +694,7 @@ impl McpServer {
                         .iter()
                         .filter(|exp| filter.is_empty() || exp.name.contains(filter))
                         .collect();
-                    json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": serde_json::to_string(&exports).unwrap() }] } })
+                    tool_result(&id, &exports)
                 } else {
                     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": "No project loaded" } })
                 }
@@ -674,7 +714,7 @@ impl McpServer {
                             })
                         })
                         .collect();
-                    json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": serde_json::to_string(&result).unwrap() }] } })
+                    tool_result(&id, &result)
                 } else {
                     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": "No project loaded" } })
                 }
@@ -704,7 +744,7 @@ impl McpServer {
                                     })
                                 })
                                 .collect();
-                            json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": serde_json::to_string(&result).unwrap() }] } })
+                            tool_result(&id, &result)
                         }
                         Err(e) => {
                             json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32006, "message": e.to_string() } })
@@ -723,7 +763,7 @@ impl McpServer {
                             json!({ "address": format!("0x{:x}", addr), "note": note })
                         })
                         .collect();
-                    json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": serde_json::to_string(&bookmarks).unwrap() }] } })
+                    tool_result(&id, &bookmarks)
                 } else {
                     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": "No project loaded" } })
                 }
@@ -739,7 +779,7 @@ impl McpServer {
                     .to_string();
                 if let Some(project) = &mut self.project {
                     project.bookmarks.insert(addr, note);
-                    json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": format!("Bookmark added at 0x{:x}", addr) }] } })
+                    tool_text_result(&id, &format!("Bookmark added at 0x{:x}", addr))
                 } else {
                     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": "No project loaded" } })
                 }
@@ -750,9 +790,9 @@ impl McpServer {
                 };
                 if let Some(project) = &self.project {
                     if let Some(sig) = project.types.function_signatures.get(&addr) {
-                        json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": serde_json::to_string_pretty(sig).unwrap() }] } })
+                        tool_result(&id, sig)
                     } else {
-                        json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": format!("No signature found for 0x{:x}", addr) }] } })
+                        tool_text_result(&id, &format!("No signature found for 0x{:x}", addr))
                     }
                 } else {
                     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": "No project loaded" } })
@@ -787,7 +827,13 @@ impl McpServer {
                             for (&addr, vars) in &debug_info.local_variables {
                                 project.types.local_variables.insert(addr, vars.clone());
                             }
-                            json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": format!("PDB loaded: {} signatures, {} types", sig_count, type_count) }] } })
+                            tool_text_result(
+                                &id,
+                                &format!(
+                                    "PDB loaded: {} signatures, {} types",
+                                    sig_count, type_count
+                                ),
+                            )
                         }
                         Err(e) => {
                             json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32005, "message": e.to_string() } })
@@ -803,9 +849,9 @@ impl McpServer {
                 };
                 if let Some(project) = &self.project {
                     if let Some(info) = project.types.source_lines.get(&addr) {
-                        json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": serde_json::to_string_pretty(info).unwrap() }] } })
+                        tool_result(&id, info)
                     } else {
-                        json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": format!("No source line info for 0x{:x}", addr) }] } })
+                        tool_text_result(&id, &format!("No source line info for 0x{:x}", addr))
                     }
                 } else {
                     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": "No project loaded" } })
@@ -822,14 +868,14 @@ impl McpServer {
             "sleuthre://project/functions" => {
                 if let Some(project) = &self.project {
                     let funcs: Vec<_> = project.functions.functions.values().collect();
-                    json!({ "jsonrpc": "2.0", "id": id, "result": { "contents": [{ "uri": uri, "text": serde_json::to_string(&funcs).unwrap() }] } })
+                    resource_result(&id, uri, &funcs)
                 } else {
                     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": "No project loaded" } })
                 }
             }
             "sleuthre://project/strings" => {
                 if let Some(project) = &self.project {
-                    json!({ "jsonrpc": "2.0", "id": id, "result": { "contents": [{ "uri": uri, "text": serde_json::to_string(&project.strings.strings).unwrap() }] } })
+                    resource_result(&id, uri, &project.strings.strings)
                 } else {
                     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": "No project loaded" } })
                 }
@@ -838,28 +884,28 @@ impl McpServer {
                 if let Some(project) = &self.project {
                     let all_xrefs: Vec<_> =
                         project.xrefs.to_address_xrefs.values().flatten().collect();
-                    json!({ "jsonrpc": "2.0", "id": id, "result": { "contents": [{ "uri": uri, "text": serde_json::to_string(&all_xrefs).unwrap() }] } })
+                    resource_result(&id, uri, &all_xrefs)
                 } else {
                     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": "No project loaded" } })
                 }
             }
             "sleuthre://project/comments" => {
                 if let Some(project) = &self.project {
-                    json!({ "jsonrpc": "2.0", "id": id, "result": { "contents": [{ "uri": uri, "text": serde_json::to_string(&project.comments).unwrap() }] } })
+                    resource_result(&id, uri, &project.comments)
                 } else {
                     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": "No project loaded" } })
                 }
             }
             "sleuthre://project/imports" => {
                 if let Some(project) = &self.project {
-                    json!({ "jsonrpc": "2.0", "id": id, "result": { "contents": [{ "uri": uri, "text": serde_json::to_string(&project.imports).unwrap() }] } })
+                    resource_result(&id, uri, &project.imports)
                 } else {
                     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": "No project loaded" } })
                 }
             }
             "sleuthre://project/exports" => {
                 if let Some(project) = &self.project {
-                    json!({ "jsonrpc": "2.0", "id": id, "result": { "contents": [{ "uri": uri, "text": serde_json::to_string(&project.exports).unwrap() }] } })
+                    resource_result(&id, uri, &project.exports)
                 } else {
                     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": "No project loaded" } })
                 }
@@ -873,7 +919,7 @@ impl McpServer {
                             json!({ "address": format!("0x{:x}", addr), "note": note })
                         })
                         .collect();
-                    json!({ "jsonrpc": "2.0", "id": id, "result": { "contents": [{ "uri": uri, "text": serde_json::to_string(&bookmarks).unwrap() }] } })
+                    resource_result(&id, uri, &bookmarks)
                 } else {
                     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": "No project loaded" } })
                 }
@@ -890,10 +936,20 @@ fn main() -> Result<()> {
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
         let line = line?;
-        if let Ok(request) = serde_json::from_str::<Value>(&line) {
-            let response = server.handle_request(request);
-            if response != Value::Null {
-                println!("{}", serde_json::to_string(&response)?);
+        match serde_json::from_str::<Value>(&line) {
+            Ok(request) => {
+                let response = server.handle_request(request);
+                if response != Value::Null {
+                    println!("{}", serde_json::to_string(&response)?);
+                }
+            }
+            Err(e) => {
+                let error_response = json!({
+                    "jsonrpc": "2.0",
+                    "id": Value::Null,
+                    "error": { "code": -32700, "message": format!("Parse error: {}", e) }
+                });
+                println!("{}", serde_json::to_string(&error_response)?);
             }
         }
     }
