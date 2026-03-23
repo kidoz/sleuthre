@@ -43,6 +43,9 @@ impl eframe::App for SleuthreApp {
             self.theme_changed = false;
         }
 
+        // Poll background loader
+        self.poll_load();
+
         if self.trigger_decompile {
             self.focus_or_open_tab(Tab::Decompiler);
             self.decompile_current_function();
@@ -162,6 +165,7 @@ impl eframe::App for SleuthreApp {
         self.show_command_bar_dropdown(ctx);
         self.show_modals(ctx);
         self.show_toasts(ctx);
+        self.show_loading_overlay(ctx);
     }
 }
 
@@ -232,6 +236,40 @@ impl SleuthreApp {
                         ui.add_space(4.0);
                     }
                 });
+            });
+    }
+
+    fn show_loading_overlay(&self, ctx: &egui::Context) {
+        let Some(ref stage) = self.load_stage else {
+            return;
+        };
+        // Semi-transparent backdrop
+        egui::Area::new(egui::Id::new("loading_backdrop"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::LEFT_TOP, [0.0, 0.0])
+            .show(ctx, |ui| {
+                #[allow(deprecated)]
+                let screen = ui.ctx().screen_rect();
+                ui.allocate_exact_size(screen.size(), egui::Sense::hover());
+                ui.painter().rect_filled(
+                    screen,
+                    0.0,
+                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 120),
+                );
+            });
+        egui::Area::new(egui::Id::new("loading_overlay"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .inner_margin(egui::Margin::same(24))
+                    .show(ui, |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.spinner();
+                            ui.add_space(8.0);
+                            ui.label(egui::RichText::new(stage).size(14.0));
+                        });
+                    });
             });
     }
 
@@ -332,8 +370,8 @@ impl SleuthreApp {
             ui.separator();
             ui.horizontal(|ui| {
                 ui.style_mut().spacing.item_spacing.x = 2.0;
-                if ui.button("Open").clicked() {
-                    self.open_binary();
+                if ui.button("Open").clicked() && !self.is_loading() {
+                    self.open_binary(ui.ctx());
                 }
                 if ui.button("Save").clicked() {
                     self.save_project();
@@ -637,8 +675,8 @@ impl SleuthreApp {
     fn show_menu_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
-                if ui.button("Open Binary...").clicked() {
-                    self.open_binary();
+                if ui.button("Open Binary...").clicked() && !self.is_loading() {
+                    self.open_binary(ui.ctx());
                     ui.close();
                 }
                 if ui.button("Save Project...").clicked() {

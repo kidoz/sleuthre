@@ -1,17 +1,15 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
-use re_core::analysis::functions::FunctionManager;
-use re_core::analysis::strings::StringsManager;
-use re_core::analysis::type_propagation::{FunctionTypeInfo, TypePropagator};
-use re_core::analysis::xrefs::XrefManager;
+use re_core::analysis::pipeline;
+use re_core::analysis::type_propagation::FunctionTypeInfo;
 use re_core::arch::Architecture;
 use re_core::disasm::Disassembler;
-use re_core::loader::{self, LoadedBinary};
+use re_core::loader;
 
 #[derive(Parser)]
 #[command(name = "re-cli")]
@@ -20,26 +18,6 @@ use re_core::loader::{self, LoadedBinary};
 struct Cli {
     #[command(subcommand)]
     command: Commands,
-}
-
-fn platform_string(arch: Architecture, format: loader::BinaryFormat) -> String {
-    let os = match format {
-        loader::BinaryFormat::Elf => "linux",
-        loader::BinaryFormat::Pe => "windows",
-        loader::BinaryFormat::MachO => "macos",
-        loader::BinaryFormat::Raw => "unknown",
-    };
-    let arch_str = match arch {
-        Architecture::X86_64 => "x86_64",
-        Architecture::X86 => "x86",
-        Architecture::Arm64 => "arm64",
-        Architecture::Arm => "arm",
-        Architecture::Mips => "mips",
-        Architecture::Mips64 => "mips64",
-        Architecture::RiscV32 => "riscv32",
-        Architecture::RiscV64 => "riscv64",
-    };
-    format!("{}_{}", os, arch_str)
 }
 
 #[derive(Subcommand)]
@@ -158,56 +136,38 @@ fn parse_hex_address(s: &str) -> Result<u64, String> {
 
 /// Result of the full analysis pipeline.
 struct AnalysisResult {
-    binary: LoadedBinary,
-    functions: FunctionManager,
-    strings: StringsManager,
-    _xrefs: XrefManager,
-    type_info: BTreeMap<u64, FunctionTypeInfo>,
+    project: re_core::project::Project,
+    type_info: HashMap<u64, FunctionTypeInfo>,
+    entry_point: u64,
 }
 
-/// Run the full analysis pipeline: load binary, discover functions, scan strings.
+/// Run the full analysis pipeline using the shared `re_core::analysis::pipeline`.
 fn run_analysis(path: &Path) -> Result<AnalysisResult> {
-    let binary = loader::load_binary(path)
-        .with_context(|| format!("Failed to load binary: {}", path.display()))?;
+    let pipeline_result = pipeline::analyze_binary(path, |stage| {
+        eprintln!("[*] {}", stage);
+    })
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-    let disasm = Disassembler::new(binary.arch)
-        .with_context(|| format!("Failed to create disassembler for {}", binary.arch))?;
-
-    let mut functions = FunctionManager::default();
-    functions
-        .discover_functions(&binary.memory_map, &disasm, binary.entry_point, binary.arch)
-        .context("Function discovery (prologue scan) failed")?;
-    functions
-        .discover_functions_recursive(&binary.memory_map, &disasm)
-        .context("Function discovery (recursive descent) failed")?;
-    functions.apply_symbols(&binary.symbols);
-
-    let mut strings = StringsManager::default();
-    strings.scan_memory(&binary.memory_map);
-
-    let mut xrefs = XrefManager::new();
-    let _ = xrefs.scan_xrefs(&binary.memory_map, &disasm, &functions);
-    let _ = xrefs.scan_string_xrefs(&binary.memory_map, &disasm, &functions, &strings.strings);
-
-    // Extract debug info if available
-    let bytes = std::fs::read(path).unwrap_or_default();
-    let debug_info =
-        re_core::debuginfo::extract_debug_info(&bytes, binary.arch).unwrap_or_default();
-
-    // Type Propagation
-    let mut type_libs = re_core::typelib::TypeLibraryManager::default();
-    let platform = platform_string(binary.arch, binary.format);
-    type_libs.load_for_platform(&platform);
-
-    let propagator = TypePropagator::new(&functions, &xrefs, &type_libs, &binary.imports);
-    let type_info = propagator.propagate(&debug_info, &re_core::types::TypeManager::default());
+    let type_info: HashMap<u64, FunctionTypeInfo> = pipeline_result
+        .project
+        .types
+        .function_signatures
+        .iter()
+        .map(|(&addr, sig)| {
+            (
+                addr,
+                FunctionTypeInfo {
+                    signature: Some(sig.clone()),
+                    var_types: Default::default(),
+                },
+            )
+        })
+        .collect();
 
     Ok(AnalysisResult {
-        binary,
-        functions,
-        strings,
-        _xrefs: xrefs,
+        project: pipeline_result.project,
         type_info,
+        entry_point: pipeline_result.entry_point,
     })
 }
 
@@ -257,10 +217,10 @@ fn cmd_plugins(path: &Path, json: bool) -> Result<()> {
     pm.register_analysis_pass(Box::new(re_core::analysis::passes::SuspiciousNamePass));
 
     let findings = pm.run_all_analysis_passes(
-        &result.binary.memory_map,
-        &mut result.functions,
-        &result._xrefs,
-        &result.strings,
+        &result.project.memory_map,
+        &mut result.project.functions,
+        &result.project.xrefs,
+        &result.project.strings,
     )?;
 
     let entries: Vec<PluginFindingEntry> = findings
@@ -315,13 +275,13 @@ fn cmd_analyze(path: &Path, json: bool) -> Result<()> {
     let result = run_analysis(path)?;
 
     let summary = AnalyzeSummary {
-        arch: result.binary.arch.display_name().to_string(),
-        entry_point: format!("0x{:x}", result.binary.entry_point),
-        functions_count: result.functions.functions.len(),
-        strings_count: result.strings.strings.len(),
-        imports_count: result.binary.imports.len(),
-        exports_count: result.binary.exports.len(),
-        libraries: result.binary.libraries.clone(),
+        arch: result.project.arch.display_name().to_string(),
+        entry_point: format!("0x{:x}", result.entry_point),
+        functions_count: result.project.functions.functions.len(),
+        strings_count: result.project.strings.strings.len(),
+        imports_count: result.project.imports.len(),
+        exports_count: result.project.exports.len(),
+        libraries: result.project.libraries.clone(),
     };
 
     if json {
@@ -405,7 +365,7 @@ fn cmd_disasm(path: &Path, address: u64, count: usize, json: bool) -> Result<()>
 fn cmd_decompile(path: &Path, address: u64) -> Result<()> {
     let result = run_analysis(path)?;
 
-    if let Some(func) = result.functions.functions.get(&address) {
+    if let Some(func) = result.project.functions.functions.get(&address) {
         // Disassemble the function first
         let size = func
             .end_address
@@ -414,33 +374,34 @@ fn cmd_decompile(path: &Path, address: u64) -> Result<()> {
         // Limit size to avoid huge functions if something goes wrong
         let size = size.min(0x10000) as usize;
 
-        let disasm = Disassembler::new(result.binary.arch)
-            .with_context(|| format!("Failed to create disassembler for {}", result.binary.arch))?;
+        let disasm = Disassembler::new(result.project.arch).with_context(|| {
+            format!("Failed to create disassembler for {}", result.project.arch)
+        })?;
 
-        let instructions = disasm.disassemble_range(&result.binary.memory_map, address, size)?;
+        let instructions = disasm.disassemble_range(&result.project.memory_map, address, size)?;
 
         // Build symbol map for resolution
         let mut symbols = HashMap::new();
         // 1. Functions
-        for f in result.functions.functions.values() {
+        for f in result.project.functions.functions.values() {
             symbols.insert(f.start_address, f.name.clone());
         }
         // 2. Imports/Symbols from binary
-        for sym in &result.binary.symbols {
+        for sym in &result.project.symbols {
             symbols.insert(sym.address, sym.name.clone());
         }
-        for imp in &result.binary.imports {
+        for imp in &result.project.imports {
             symbols.insert(imp.address, imp.name.clone());
         }
 
         let code = re_core::il::structuring::decompile(
             &func.name,
             &instructions,
-            result.binary.arch,
+            result.project.arch,
             &symbols,
             result.type_info.get(&address),
             &re_core::types::TypeManager::default(),
-            &result.binary.memory_map,
+            &result.project.memory_map,
         );
 
         println!("{}", code.text);
@@ -464,11 +425,14 @@ fn cmd_functions(path: &Path, json: bool) -> Result<()> {
     let result = run_analysis(path)?;
 
     let entries: Vec<FunctionEntry> = result
+        .project
         .functions
         .functions
         .values()
         .map(|f| {
-            let size = f.end_address.map(|end| end.saturating_sub(f.start_address));
+            let size = f
+                .end_address
+                .map(|end: u64| end.saturating_sub(f.start_address));
             FunctionEntry {
                 address: format!("0x{:x}", f.start_address),
                 name: f.name.clone(),
@@ -512,6 +476,7 @@ fn cmd_strings(path: &Path, json: bool) -> Result<()> {
     let result = run_analysis(path)?;
 
     let entries: Vec<StringEntry> = result
+        .project
         .strings
         .strings
         .iter()

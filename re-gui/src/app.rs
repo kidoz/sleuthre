@@ -1,16 +1,13 @@
 use re_core::analysis::cfg::ControlFlowGraph;
-use re_core::analysis::type_propagation::{FunctionTypeInfo, TypePropagator};
-use re_core::debuginfo;
+use re_core::analysis::type_propagation::FunctionTypeInfo;
 use re_core::disasm::Disassembler;
-use re_core::loader::load_binary;
 use re_core::plugin::{AnalysisFinding, PluginManager};
 use re_core::project::{ActionKind, PendingAction, Project};
 use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::theme::{SyntaxColors, ThemeMode};
-use re_core::analysis::passes::{HeuristicNamePass, SignaturePass, SuspiciousNamePass};
-use re_core::signatures::SignatureDatabase;
+use re_core::analysis::passes::SuspiciousNamePass;
 
 pub(crate) struct SleuthreApp {
     pub(crate) project: Option<Project>,
@@ -110,6 +107,10 @@ pub(crate) struct SleuthreApp {
     pub(crate) command_bar_results: Vec<CommandBarResult>,
     pub(crate) command_bar_selected: usize,
     pub(crate) command_bar_active: bool,
+
+    // Background loading
+    pub(crate) load_receiver: Option<std::sync::mpsc::Receiver<LoadProgress>>,
+    pub(crate) load_stage: Option<String>,
 }
 
 pub(crate) struct Toast {
@@ -214,6 +215,11 @@ pub(crate) enum CommandBarResultKind {
     StringRef,
 }
 
+pub(crate) enum LoadProgress {
+    Stage(String),
+    Done(std::result::Result<Box<re_core::analysis::pipeline::AnalysisResult>, String>),
+}
+
 impl Default for SleuthreApp {
     fn default() -> Self {
         Self {
@@ -296,6 +302,8 @@ impl Default for SleuthreApp {
             command_bar_results: Vec::new(),
             command_bar_selected: 0,
             command_bar_active: false,
+            load_receiver: None,
+            load_stage: None,
         }
     }
 }
@@ -313,224 +321,81 @@ impl SleuthreApp {
         });
     }
 
-    pub(crate) fn open_binary(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
+    pub(crate) fn open_binary(&mut self, ctx: &eframe::egui::Context) {
+        let Some(path) = rfd::FileDialog::new()
             .add_filter("Executables", &["elf", "exe", "dll", "so", "bin"])
             .pick_file()
-        {
-            match load_binary(&path) {
-                Ok(loaded) => {
-                    let mut project = Project::new(
-                        path.file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .to_string(),
-                        path.clone(),
-                    );
-                    project.memory_map = loaded.memory_map;
-                    project.imports = loaded.imports;
-                    project.exports = loaded.exports;
-                    project.symbols.clone_from(&loaded.symbols);
-                    project.libraries = loaded.libraries;
+        else {
+            return;
+        };
 
-                    let disasm = Disassembler::new(loaded.arch).ok();
-                    if let Some(ref ds) = disasm {
-                        let _ = project.functions.discover_functions(
-                            &project.memory_map,
-                            ds,
-                            loaded.entry_point,
-                            loaded.arch,
-                        );
-                        project.functions.apply_symbols(&loaded.symbols);
-                        let _ = project
-                            .functions
-                            .discover_functions_recursive(&project.memory_map, ds);
-                        let _ =
-                            project
-                                .xrefs
-                                .scan_xrefs(&project.memory_map, ds, &project.functions);
-                    }
-                    project.strings.scan_memory(&project.memory_map);
-                    if let Some(ref ds) = disasm {
-                        let _ = project.xrefs.scan_string_xrefs(
-                            &project.memory_map,
-                            ds,
-                            &project.functions,
-                            &project.strings.strings,
-                        );
-                    }
-                    project.constants.scan(&project.memory_map);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx_clone = ctx.clone();
 
-                    // Store arch and format
-                    project.arch = loaded.arch;
-                    project.binary_format = loaded.format;
+        std::thread::spawn(move || {
+            let result = re_core::analysis::pipeline::analyze_binary(&path, |stage| {
+                let _ = tx.send(LoadProgress::Stage(stage.to_string()));
+                ctx_clone.request_repaint();
+            });
+            let _ = tx.send(LoadProgress::Done(
+                result.map(Box::new).map_err(|e| e.to_string()),
+            ));
+            ctx_clone.request_repaint();
+        });
 
-                    // Extract debug info from the binary
-                    let bytes = std::fs::read(&path).unwrap_or_default();
-                    let debug_info =
-                        debuginfo::extract_debug_info(&bytes, loaded.arch).unwrap_or_default();
+        self.load_receiver = Some(rx);
+        self.load_stage = Some("Loading...".into());
+    }
 
-                    // Also try PDB if available
-                    let pdb_debug = if let Some(ref pdb_path) = loaded.debug_info_path {
-                        // Try relative to binary directory
-                        let pdb_candidate = path
-                            .parent()
-                            .map(|dir| dir.join(pdb_path.file_name().unwrap_or_default()))
-                            .unwrap_or_else(|| pdb_path.clone());
-                        if pdb_candidate.exists() {
-                            debuginfo::extract_pdb_info(&pdb_candidate, loaded.arch)
-                                .unwrap_or_default()
-                        } else if pdb_path.exists() {
-                            debuginfo::extract_pdb_info(pdb_path, loaded.arch).unwrap_or_default()
-                        } else {
-                            Default::default()
-                        }
-                    } else {
-                        Default::default()
-                    };
+    /// Poll the background loader for progress/completion.
+    pub(crate) fn poll_load(&mut self) {
+        let Some(ref rx) = self.load_receiver else {
+            return;
+        };
 
-                    // Merge debug info into project
-                    let mut debug_type_count = 0usize;
-                    let mut debug_sig_count = 0usize;
-                    for di in [&debug_info, &pdb_debug] {
-                        for ty in &di.types {
-                            project.types.add_type(ty.clone());
-                            debug_type_count += 1;
-                        }
-                        for (&addr, sig) in &di.function_signatures {
-                            project.types.function_signatures.insert(addr, sig.clone());
-                            debug_sig_count += 1;
-                            // Update function names from debug info
-                            if let Some(func) = project.functions.functions.get_mut(&addr)
-                                && func.name.starts_with("sub_")
-                            {
-                                func.name.clone_from(&sig.name);
-                            }
-                        }
-                        for (&addr, var) in &di.global_variables {
-                            project.types.global_variables.insert(addr, var.clone());
-                        }
-                        for (&addr, vars) in &di.local_variables {
-                            project.types.local_variables.insert(addr, vars.clone());
-                        }
-                        for (&addr, line_info) in &di.source_lines {
-                            project.types.source_lines.insert(addr, line_info.clone());
-                        }
-                    }
-
-                    // Load type libraries
-                    let platform = platform_string(loaded.arch, loaded.format);
-                    project.type_libs.load_for_platform(&platform);
-
-                    // Type propagation
-                    let propagator = TypePropagator::new(
-                        &project.functions,
-                        &project.xrefs,
-                        &project.type_libs,
-                        &project.imports,
-                    );
-                    let type_info = propagator.propagate(&debug_info, &project.types);
-                    // Apply propagated signatures back
-                    for (&addr, info) in &type_info {
-                        if let Some(ref sig) = info.signature {
-                            project
-                                .types
-                                .function_signatures
-                                .entry(addr)
-                                .or_insert_with(|| sig.clone());
-                            // Update function names from type propagation
-                            if let Some(func) = project.functions.functions.get_mut(&addr)
-                                && func.name.starts_with("sub_")
-                            {
-                                func.name.clone_from(&sig.name);
-                            }
-                        }
-                    }
-
-                    let func_count = project.functions.functions.len();
-                    let import_count = project.imports.len();
-                    let export_count = project.exports.len();
-                    let sym_count = loaded.symbols.len();
-                    let lib_count = project.libraries.len();
-
-                    // Configure analysis passes based on architecture
-                    self.plugin_manager.clear_analysis_passes();
-                    self.plugin_manager
-                        .register_analysis_pass(Box::new(SuspiciousNamePass));
-                    self.plugin_manager
-                        .register_analysis_pass(Box::new(HeuristicNamePass));
-
-                    let sig_db = match loaded.arch {
-                        re_core::arch::Architecture::X86_64 => SignatureDatabase::builtin_x86_64(),
-                        re_core::arch::Architecture::Arm64 => SignatureDatabase::builtin_arm64(),
-                        _ => SignatureDatabase::new(),
-                    };
-                    self.plugin_manager
-                        .register_analysis_pass(Box::new(SignaturePass::new(sig_db)));
-
-                    // Run analysis passes automatically
-                    if let Ok(findings) = self.plugin_manager.run_all_analysis_passes(
-                        &project.memory_map,
-                        &mut project.functions,
-                        &project.xrefs,
-                        &project.strings,
-                    ) {
-                        self.plugin_findings = findings;
-                        if !self.plugin_findings.is_empty() {
-                            self.add_toast(
-                                ToastKind::Success,
-                                format!("Analysis found {} items", self.plugin_findings.len()),
-                            );
-                        }
-                    }
-
-                    // Build xref counts cache
-                    self.func_xref_counts.clear();
-                    for &addr in project.functions.functions.keys() {
-                        let xrefs_in = project
-                            .xrefs
-                            .to_address_xrefs
-                            .get(&addr)
-                            .map(|v| v.len())
-                            .unwrap_or(0);
-                        let xrefs_out = project
-                            .xrefs
-                            .from_address_xrefs
-                            .get(&addr)
-                            .map(|v| v.len())
-                            .unwrap_or(0);
-                        self.func_xref_counts.insert(addr, (xrefs_in, xrefs_out));
-                    }
-
-                    self.current_address = loaded.entry_point;
-                    self.disasm = disasm;
-                    self.project = Some(project);
-                    self.update_cfg();
-                    let msg = format!(
-                        "Loaded '{}': {} functions, {} symbols, {} imports, {} exports, {} libraries",
-                        path.display(),
-                        func_count,
-                        sym_count,
-                        import_count,
-                        export_count,
-                        lib_count
-                    );
-                    self.add_toast(ToastKind::Success, format!("Loaded '{}'", path.display()));
-                    self.output.push_str(&msg);
-                    if debug_sig_count > 0 || debug_type_count > 0 {
-                        self.output.push_str(&format!(
-                            ", {} debug signatures, {} debug types",
-                            debug_sig_count, debug_type_count
-                        ));
-                    }
-                    self.output.push('\n');
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                LoadProgress::Stage(s) => {
+                    self.load_stage = Some(s);
                 }
-                Err(e) => {
+                LoadProgress::Done(Ok(result)) => {
+                    // Create a fresh Disassembler on the main thread
+                    // (Capstone is !Send so it cannot come from the worker)
+                    self.disasm = Disassembler::new(result.project.arch).ok();
+                    self.current_address = result.entry_point;
+                    self.func_xref_counts = result.func_xref_counts;
+                    if !result.findings.is_empty() {
+                        self.add_toast(
+                            ToastKind::Success,
+                            format!("Analysis found {} items", result.findings.len()),
+                        );
+                    }
+                    self.plugin_findings = result.findings;
+                    self.add_toast(
+                        ToastKind::Success,
+                        format!("Loaded '{}'", result.project.name),
+                    );
+                    self.output.push_str(&result.summary);
+                    self.output.push('\n');
+                    self.project = Some(result.project);
+                    self.update_cfg();
+                    self.load_receiver = None;
+                    self.load_stage = None;
+                    return;
+                }
+                LoadProgress::Done(Err(e)) => {
                     self.add_toast(ToastKind::Error, format!("Load error: {}", e));
                     self.output.push_str(&format!("Error: {}\n", e));
+                    self.load_receiver = None;
+                    self.load_stage = None;
+                    return;
                 }
             }
         }
+    }
+
+    pub(crate) fn is_loading(&self) -> bool {
+        self.load_receiver.is_some()
     }
 
     pub(crate) fn save_project(&mut self) {
@@ -739,27 +604,4 @@ impl SleuthreApp {
         }
         self.active_tab = tab;
     }
-}
-
-fn platform_string(
-    arch: re_core::arch::Architecture,
-    format: re_core::loader::BinaryFormat,
-) -> String {
-    let os = match format {
-        re_core::loader::BinaryFormat::Elf => "linux",
-        re_core::loader::BinaryFormat::Pe => "windows",
-        re_core::loader::BinaryFormat::MachO => "macos",
-        re_core::loader::BinaryFormat::Raw => "unknown",
-    };
-    let arch_str = match arch {
-        re_core::arch::Architecture::X86_64 => "x86_64",
-        re_core::arch::Architecture::X86 => "x86",
-        re_core::arch::Architecture::Arm64 => "arm64",
-        re_core::arch::Architecture::Arm => "arm",
-        re_core::arch::Architecture::Mips => "mips",
-        re_core::arch::Architecture::Mips64 => "mips64",
-        re_core::arch::Architecture::RiscV32 => "riscv32",
-        re_core::arch::Architecture::RiscV64 => "riscv64",
-    };
-    format!("{}_{}", os, arch_str)
 }

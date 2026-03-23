@@ -4,7 +4,6 @@ use re_core::analysis::type_propagation::FunctionTypeInfo;
 use re_core::debuginfo;
 use re_core::disasm::Disassembler;
 use re_core::il::structuring::decompile;
-use re_core::loader::load_binary;
 use re_core::project::{ActionKind, PendingAction, Project};
 use re_core::signatures::SignatureDatabase;
 use serde_json::{Value, json};
@@ -347,44 +346,11 @@ impl McpServer {
                 let Some(path) = args.get("path").and_then(|p| p.as_str()) else {
                     return missing_param_error(&id, "path");
                 };
-                match load_binary(&PathBuf::from(path)) {
-                    Ok(loaded) => {
-                        let mut project =
-                            Project::new("mcp_project".to_string(), PathBuf::from(path));
-                        project.memory_map = loaded.memory_map;
-                        project.imports = loaded.imports;
-                        project.exports = loaded.exports;
-                        project.symbols.clone_from(&loaded.symbols);
-                        project.libraries = loaded.libraries;
-                        self.disasm = Disassembler::new(loaded.arch).ok();
-                        if let Some(ref ds) = self.disasm {
-                            let _ = project.functions.discover_functions(
-                                &project.memory_map,
-                                ds,
-                                loaded.entry_point,
-                                loaded.arch,
-                            );
-                            project.functions.apply_symbols(&loaded.symbols);
-                            let _ = project
-                                .functions
-                                .discover_functions_recursive(&project.memory_map, ds);
-                            let _ = project.xrefs.scan_xrefs(
-                                &project.memory_map,
-                                ds,
-                                &project.functions,
-                            );
-                        }
-                        project.strings.scan_memory(&project.memory_map);
-                        if let Some(ref ds) = self.disasm {
-                            let _ = project.xrefs.scan_string_xrefs(
-                                &project.memory_map,
-                                ds,
-                                &project.functions,
-                                &project.strings.strings,
-                            );
-                        }
-                        project.constants.scan(&project.memory_map);
-                        self.project = Some(project);
+                let path = PathBuf::from(path);
+                match re_core::analysis::pipeline::analyze_binary(&path, |_| {}) {
+                    Ok(result) => {
+                        self.disasm = Disassembler::new(result.project.arch).ok();
+                        self.project = Some(result.project);
                         tool_text_result(&id, "Binary loaded successfully")
                     }
                     Err(e) => {
