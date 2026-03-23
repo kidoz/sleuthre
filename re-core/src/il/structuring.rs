@@ -746,6 +746,158 @@ fn resolve_symbols_in_expr(expr: &mut HlilExpr, symbols: &HashMap<u64, String>) 
     }
 }
 
+// ---- Global Variable Resolution ----
+
+fn resolve_globals(stmts: &mut [HlilStmt], types: &TypeManager) {
+    for stmt in stmts {
+        resolve_globals_in_stmt(stmt, types);
+    }
+}
+
+fn resolve_globals_in_stmt(stmt: &mut HlilStmt, types: &TypeManager) {
+    match stmt {
+        HlilStmt::Store { addr, value } => {
+            resolve_globals_in_expr(addr, types);
+            resolve_globals_in_expr(value, types);
+        }
+        HlilStmt::Assign { dest, src } => {
+            resolve_globals_in_expr(dest, types);
+            resolve_globals_in_expr(src, types);
+        }
+        HlilStmt::Expr(e) => resolve_globals_in_expr(e, types),
+        HlilStmt::Return(opt) => {
+            if let Some(e) = opt {
+                resolve_globals_in_expr(e, types);
+            }
+        }
+        HlilStmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            resolve_globals_in_expr(cond, types);
+            resolve_globals(then_body, types);
+            resolve_globals(else_body, types);
+        }
+        HlilStmt::While { cond, body } => {
+            resolve_globals_in_expr(cond, types);
+            resolve_globals(body, types);
+        }
+        HlilStmt::DoWhile { body, cond } => {
+            resolve_globals(body, types);
+            resolve_globals_in_expr(cond, types);
+        }
+        HlilStmt::For {
+            init,
+            cond,
+            update,
+            body,
+        } => {
+            resolve_globals_in_stmt(init, types);
+            resolve_globals_in_expr(cond, types);
+            resolve_globals_in_stmt(update, types);
+            resolve_globals(body, types);
+        }
+        HlilStmt::Block(inner) => resolve_globals(inner, types),
+        HlilStmt::Switch {
+            cond,
+            cases,
+            default,
+        } => {
+            resolve_globals_in_expr(cond, types);
+            for (_, body) in cases {
+                resolve_globals(body, types);
+            }
+            resolve_globals(default, types);
+        }
+        HlilStmt::Break
+        | HlilStmt::Continue
+        | HlilStmt::Label(_)
+        | HlilStmt::Goto(_)
+        | HlilStmt::Comment(_) => {}
+    }
+
+    // Post-pass: convert Store to Assign when address is a known global variable
+    let replace_with = match &*stmt {
+        HlilStmt::Store { addr, value } => {
+            if let HlilExpr::Global(addr_val, name) = addr {
+                if types.global_variables.contains_key(addr_val) {
+                    Some(HlilStmt::Assign {
+                        dest: HlilExpr::Global(*addr_val, name.clone()),
+                        src: value.clone(),
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    if let Some(new_stmt) = replace_with {
+        *stmt = new_stmt;
+    }
+}
+
+fn resolve_globals_in_expr(expr: &mut HlilExpr, types: &TypeManager) {
+    match expr {
+        HlilExpr::Const(val) => {
+            if let Some(var) = types.global_variables.get(val) {
+                *expr = HlilExpr::Global(*val, var.name.clone());
+            }
+        }
+        HlilExpr::Global(addr, name) => {
+            // Prefer global variable name over symbol name
+            if let Some(var) = types.global_variables.get(addr) {
+                *name = var.name.clone();
+            }
+        }
+        HlilExpr::Deref { addr, .. } => {
+            resolve_globals_in_expr(addr, types);
+            // Fold: *(global_var_addr) → global_var
+            let resolved = match &**addr {
+                HlilExpr::Global(addr_val, name)
+                    if types.global_variables.contains_key(addr_val) =>
+                {
+                    Some(HlilExpr::Global(*addr_val, name.clone()))
+                }
+                HlilExpr::Const(val) if types.global_variables.contains_key(val) => {
+                    let var = &types.global_variables[val];
+                    Some(HlilExpr::Global(*val, var.name.clone()))
+                }
+                _ => None,
+            };
+            if let Some(g) = resolved {
+                *expr = g;
+            }
+        }
+        HlilExpr::BinOp { left, right, .. } => {
+            resolve_globals_in_expr(left, types);
+            resolve_globals_in_expr(right, types);
+        }
+        HlilExpr::UnaryOp { operand, .. } => resolve_globals_in_expr(operand, types),
+        HlilExpr::Call { target, args } => {
+            resolve_globals_in_expr(target, types);
+            for arg in args {
+                resolve_globals_in_expr(arg, types);
+            }
+        }
+        HlilExpr::AddrOf(inner) => resolve_globals_in_expr(inner, types),
+        HlilExpr::FieldAccess { base, .. } => resolve_globals_in_expr(base, types),
+        HlilExpr::ArrayAccess { base, index } => {
+            resolve_globals_in_expr(base, types);
+            resolve_globals_in_expr(index, types);
+        }
+        HlilExpr::VectorOp { operands, .. } => {
+            for op in operands {
+                resolve_globals_in_expr(op, types);
+            }
+        }
+        HlilExpr::Var(_) => {}
+    }
+}
+
 /// Try to extract a stack offset from an expression.
 /// Matches: `sp`, `sp + C`, `sp - C`.
 fn extract_stack_offset(expr: &HlilExpr) -> Option<i64> {
@@ -1484,6 +1636,258 @@ fn get_expr_type(
     }
 }
 
+// ---- Struct/Array Access Helpers ----
+
+/// Get the type of an expression, combining inferred types and external type info.
+fn expr_type(
+    expr: &HlilExpr,
+    type_info: Option<&FunctionTypeInfo>,
+    inferred_types: &HashMap<String, TypeRef>,
+    types: &TypeManager,
+) -> Option<TypeRef> {
+    get_expr_type(expr, inferred_types, types).or_else(|| {
+        if let HlilExpr::Var(name) = expr {
+            type_info.and_then(|ti| ti.var_types.get(name)).cloned()
+        } else {
+            None
+        }
+    })
+}
+
+/// Try to resolve `*(base + offset)` as a struct field access.
+fn try_struct_field_access(
+    base: &HlilExpr,
+    offset: u64,
+    type_info: Option<&FunctionTypeInfo>,
+    inferred_types: &HashMap<String, TypeRef>,
+    types: &TypeManager,
+) -> Option<HlilExpr> {
+    let base_type = expr_type(base, type_info, inferred_types, types)?;
+
+    // Pointer-to-struct: base->field
+    if let TypeRef::Pointer(inner) = &base_type
+        && let Some(result) = resolve_struct_field(base, offset, true, inner, types)
+    {
+        return Some(result);
+    }
+
+    // Direct struct (e.g. stack-allocated or embedded): base.field
+    if matches!(&base_type, TypeRef::Named(_))
+        && let Some(result) = resolve_struct_field(base, offset, false, &base_type, types)
+    {
+        return Some(result);
+    }
+
+    None
+}
+
+/// Recursively resolve a struct field at a given byte offset, handling nested structs
+/// and arrays of structs.
+fn resolve_struct_field(
+    base: &HlilExpr,
+    offset: u64,
+    is_ptr: bool,
+    struct_type_ref: &TypeRef,
+    types: &TypeManager,
+) -> Option<HlilExpr> {
+    let (fields, struct_size) = resolve_to_struct_fields(struct_type_ref, types)?;
+
+    // Direct field match
+    if let Some(field) = fields.iter().find(|f| f.offset == offset as usize) {
+        return Some(HlilExpr::FieldAccess {
+            base: Box::new(base.clone()),
+            field_name: field.name.clone(),
+            is_ptr,
+        });
+    }
+
+    // Nested struct: find the containing field and recurse
+    for field in fields {
+        // Embedded struct
+        if let Some((_, nested_size)) = resolve_to_struct_info(&field.type_ref, types)
+            && offset as usize >= field.offset
+            && (offset as usize) < field.offset + nested_size
+        {
+            let inner_offset = offset - field.offset as u64;
+            let field_access = HlilExpr::FieldAccess {
+                base: Box::new(base.clone()),
+                field_name: field.name.clone(),
+                is_ptr,
+            };
+            return resolve_struct_field(
+                &field_access,
+                inner_offset,
+                false, // nested access is always direct (embedded struct)
+                &field.type_ref,
+                types,
+            );
+        }
+
+        // Array of structs
+        if let TypeRef::Array { element, count } = &field.type_ref
+            && let Some((_, elem_size)) = resolve_to_struct_info(element, types)
+            && elem_size > 0
+        {
+            let array_end = field.offset + elem_size * count;
+            if offset as usize >= field.offset && (offset as usize) < array_end {
+                let array_offset = offset as usize - field.offset;
+                let index = array_offset / elem_size;
+                let inner_offset = (array_offset % elem_size) as u64;
+
+                let field_access = HlilExpr::FieldAccess {
+                    base: Box::new(base.clone()),
+                    field_name: field.name.clone(),
+                    is_ptr,
+                };
+                let array_access = HlilExpr::ArrayAccess {
+                    base: Box::new(field_access),
+                    index: Box::new(HlilExpr::Const(index as u64)),
+                };
+
+                if inner_offset == 0 {
+                    return Some(array_access);
+                } else {
+                    return resolve_struct_field(
+                        &array_access,
+                        inner_offset,
+                        false,
+                        element,
+                        types,
+                    );
+                }
+            }
+        }
+    }
+
+    // Check if offset is still within the struct but between known fields
+    // (padding or unknown field) — don't resolve
+    if (offset as usize) < struct_size {
+        return None;
+    }
+
+    None
+}
+
+/// Resolve a TypeRef to its struct/union fields, following typedefs.
+fn resolve_to_struct_fields<'a>(
+    type_ref: &TypeRef,
+    types: &'a TypeManager,
+) -> Option<(&'a [crate::types::StructField], usize)> {
+    match type_ref {
+        TypeRef::Named(name) => {
+            let ct = types.get_type(name)?;
+            match ct {
+                crate::types::CompoundType::Struct { fields, size, .. }
+                | crate::types::CompoundType::Union { fields, size, .. } => {
+                    Some((fields.as_slice(), *size))
+                }
+                crate::types::CompoundType::Typedef { target, .. } => {
+                    resolve_to_struct_fields(target, types)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Resolve a TypeRef to struct name and size, following typedefs.
+fn resolve_to_struct_info<'a>(
+    type_ref: &TypeRef,
+    types: &'a TypeManager,
+) -> Option<(&'a str, usize)> {
+    match type_ref {
+        TypeRef::Named(name) => {
+            let ct = types.get_type(name)?;
+            match ct {
+                crate::types::CompoundType::Struct { name, size, .. }
+                | crate::types::CompoundType::Union { name, size, .. } => {
+                    Some((name.as_str(), *size))
+                }
+                crate::types::CompoundType::Typedef { target, .. } => {
+                    resolve_to_struct_info(target, types)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Try to match an array access pattern: `*(base + index * elem_size)`.
+fn try_array_access(
+    base: &HlilExpr,
+    index_expr: &HlilExpr,
+    type_info: Option<&FunctionTypeInfo>,
+    inferred_types: &HashMap<String, TypeRef>,
+    types: &TypeManager,
+) -> Option<HlilExpr> {
+    let base_type = expr_type(base, type_info, inferred_types, types)?;
+    let expected_elem_size = match &base_type {
+        TypeRef::Pointer(inner) | TypeRef::Array { element: inner, .. } => types.size_of(inner),
+        _ => return None,
+    };
+    if expected_elem_size == 0 {
+        return None;
+    }
+
+    match index_expr {
+        // base + index * elem_size
+        HlilExpr::BinOp {
+            op,
+            left: mul_left,
+            right: mul_right,
+        } if *op == crate::il::llil::BinOp::Mul => {
+            if let HlilExpr::Const(size) = &**mul_right
+                && *size == expected_elem_size as u64
+            {
+                return Some(HlilExpr::ArrayAccess {
+                    base: Box::new(base.clone()),
+                    index: mul_left.clone(),
+                });
+            }
+            // elem_size * index (commutative)
+            if let HlilExpr::Const(size) = &**mul_left
+                && *size == expected_elem_size as u64
+            {
+                return Some(HlilExpr::ArrayAccess {
+                    base: Box::new(base.clone()),
+                    index: mul_right.clone(),
+                });
+            }
+            None
+        }
+        // base + index << log2(elem_size)
+        HlilExpr::BinOp {
+            op,
+            left: shl_left,
+            right: shl_right,
+        } if *op == crate::il::llil::BinOp::Shl => {
+            if let HlilExpr::Const(shift) = &**shl_right
+                && expected_elem_size.is_power_of_two()
+                && (1usize << shift) == expected_elem_size
+            {
+                return Some(HlilExpr::ArrayAccess {
+                    base: Box::new(base.clone()),
+                    index: shl_left.clone(),
+                });
+            }
+            None
+        }
+        // base + index (element size 1, e.g. byte array / char*)
+        _ => {
+            if expected_elem_size == 1 {
+                Some(HlilExpr::ArrayAccess {
+                    base: Box::new(base.clone()),
+                    index: Box::new(index_expr.clone()),
+                })
+            } else {
+                None
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct ControlFlowContext {
     loop_head: Option<u64>,
@@ -1610,6 +2014,9 @@ pub fn decompile(
     // 2. Resolve symbols (Phase 2)
     resolve_symbols(&mut hlil_stmts, symbols);
 
+    // 2b. Resolve global variables from TypeManager
+    resolve_globals(&mut hlil_stmts, types);
+
     // 3. Infer local types (Phase 3)
     let mut inferred_types = HashMap::new();
     infer_local_types(&hlil_stmts, &mut inferred_types, types);
@@ -1732,26 +2139,31 @@ fn fold_field_accesses_expr(
         HlilExpr::Deref { addr, .. } => {
             fold_field_accesses_expr(addr, type_info, inferred_types, types);
 
-            // Pattern: *(base + offset)
             if let HlilExpr::BinOp { op, left, right } = &**addr
                 && *op == crate::il::llil::BinOp::Add
-                && let (HlilExpr::Var(name), HlilExpr::Const(offset)) = (&**left, &**right)
             {
-                let tref = inferred_types
-                    .get(name)
-                    .or_else(|| type_info.and_then(|ti| ti.var_types.get(name)));
-
-                if let Some(TypeRef::Pointer(inner)) = tref
-                    && let TypeRef::Named(struct_name) = &**inner
-                    && let Some(crate::types::CompoundType::Struct { fields, .. }) =
-                        types.get_type(struct_name)
-                    && let Some(field) = fields.iter().find(|f| f.offset == *offset as usize)
+                // Pattern 1: *(base + const_offset) → struct field access
+                if let HlilExpr::Const(offset) = &**right
+                    && let Some(result) =
+                        try_struct_field_access(left, *offset, type_info, inferred_types, types)
                 {
-                    *expr = HlilExpr::FieldAccess {
-                        base: left.clone(),
-                        field_name: field.name.clone(),
-                        is_ptr: true,
-                    };
+                    *expr = result;
+                    return;
+                }
+                // Reversed operands: *(const_offset + base)
+                if let HlilExpr::Const(offset) = &**left
+                    && let Some(result) =
+                        try_struct_field_access(right, *offset, type_info, inferred_types, types)
+                {
+                    *expr = result;
+                    return;
+                }
+
+                // Pattern 2: *(base + index * elem_size) → array access
+                if let Some(result) =
+                    try_array_access(left, right, type_info, inferred_types, types)
+                {
+                    *expr = result;
                 }
             }
         }
@@ -2459,6 +2871,362 @@ mod tests {
             code.text.contains("void noop(void)"),
             "wrong void signature: {}",
             code
+        );
+    }
+
+    // ---- Tests for Global Variable Resolution ----
+
+    #[test]
+    fn resolve_globals_deref_const() {
+        // *(0x404000) where 0x404000 is a known global → g_counter
+        let mut types = TypeManager::default();
+        types.global_variables.insert(
+            0x404000,
+            crate::types::VariableInfo {
+                name: "g_counter".to_string(),
+                type_ref: TypeRef::Primitive(PrimitiveType::I32),
+                location: crate::types::VariableLocation::Address(0x404000),
+            },
+        );
+
+        let mut stmts = vec![HlilStmt::Assign {
+            dest: HlilExpr::Var("result_1".into()),
+            src: HlilExpr::Deref {
+                addr: Box::new(HlilExpr::Const(0x404000)),
+                size: 4,
+            },
+        }];
+
+        resolve_globals(&mut stmts, &types);
+
+        if let HlilStmt::Assign { src, .. } = &stmts[0] {
+            assert!(
+                matches!(src, HlilExpr::Global(0x404000, name) if name == "g_counter"),
+                "expected Global(0x404000, g_counter), got {:?}",
+                src
+            );
+        } else {
+            panic!("expected Assign, got {:?}", stmts[0]);
+        }
+    }
+
+    #[test]
+    fn resolve_globals_store_to_assign() {
+        // Store { addr: Const(0x404000), value: 42 } → Assign { dest: Global, src: 42 }
+        let mut types = TypeManager::default();
+        types.global_variables.insert(
+            0x404000,
+            crate::types::VariableInfo {
+                name: "g_counter".to_string(),
+                type_ref: TypeRef::Primitive(PrimitiveType::I32),
+                location: crate::types::VariableLocation::Address(0x404000),
+            },
+        );
+
+        let mut stmts = vec![HlilStmt::Store {
+            addr: HlilExpr::Const(0x404000),
+            value: HlilExpr::Const(42),
+        }];
+
+        resolve_globals(&mut stmts, &types);
+
+        assert!(
+            matches!(
+                &stmts[0],
+                HlilStmt::Assign {
+                    dest: HlilExpr::Global(0x404000, _),
+                    src: HlilExpr::Const(42),
+                }
+            ),
+            "expected Assign to global, got {:?}",
+            stmts[0]
+        );
+    }
+
+    #[test]
+    fn resolve_globals_prefers_variable_name_over_symbol() {
+        // If symbol was already resolved as Global("sym_name"), but global_variables
+        // has a user-defined name, the user name wins.
+        let mut types = TypeManager::default();
+        types.global_variables.insert(
+            0x404000,
+            crate::types::VariableInfo {
+                name: "g_my_var".to_string(),
+                type_ref: TypeRef::Primitive(PrimitiveType::I32),
+                location: crate::types::VariableLocation::Address(0x404000),
+            },
+        );
+
+        let mut stmts = vec![HlilStmt::Expr(HlilExpr::Global(
+            0x404000,
+            "data_404000".to_string(),
+        ))];
+
+        resolve_globals(&mut stmts, &types);
+
+        if let HlilStmt::Expr(HlilExpr::Global(_, name)) = &stmts[0] {
+            assert_eq!(name, "g_my_var", "expected user-defined name");
+        } else {
+            panic!("expected Global expr");
+        }
+    }
+
+    // ---- Tests for Struct/Array Propagation ----
+
+    fn make_test_types_with_structs() -> TypeManager {
+        let mut types = TypeManager::default();
+        types.arch = crate::arch::Architecture::X86_64;
+
+        // struct Point { int32_t x; int32_t y; } — size 8
+        types.add_type(crate::types::CompoundType::Struct {
+            name: "Point".to_string(),
+            fields: vec![
+                crate::types::StructField {
+                    name: "x".to_string(),
+                    type_ref: TypeRef::Primitive(PrimitiveType::I32),
+                    offset: 0,
+                    bit_offset: None,
+                    bit_size: None,
+                },
+                crate::types::StructField {
+                    name: "y".to_string(),
+                    type_ref: TypeRef::Primitive(PrimitiveType::I32),
+                    offset: 4,
+                    bit_offset: None,
+                    bit_size: None,
+                },
+            ],
+            size: 8,
+        });
+
+        // struct Rect { Point origin; Point size; } — size 16
+        types.add_type(crate::types::CompoundType::Struct {
+            name: "Rect".to_string(),
+            fields: vec![
+                crate::types::StructField {
+                    name: "origin".to_string(),
+                    type_ref: TypeRef::Named("Point".to_string()),
+                    offset: 0,
+                    bit_offset: None,
+                    bit_size: None,
+                },
+                crate::types::StructField {
+                    name: "size".to_string(),
+                    type_ref: TypeRef::Named("Point".to_string()),
+                    offset: 8,
+                    bit_offset: None,
+                    bit_size: None,
+                },
+            ],
+            size: 16,
+        });
+
+        types
+    }
+
+    #[test]
+    fn fold_field_access_any_base() {
+        // *(Global(0x404000, "g_point") + 4) where g_point is Point* → g_point->y
+        let mut types = make_test_types_with_structs();
+        types.global_variables.insert(
+            0x404000,
+            crate::types::VariableInfo {
+                name: "g_point".to_string(),
+                type_ref: TypeRef::Pointer(Box::new(TypeRef::Named("Point".to_string()))),
+                location: crate::types::VariableLocation::Address(0x404000),
+            },
+        );
+        let inferred = HashMap::new();
+
+        let mut expr = HlilExpr::Deref {
+            addr: Box::new(HlilExpr::BinOp {
+                op: BinOp::Add,
+                left: Box::new(HlilExpr::Global(0x404000, "g_point".to_string())),
+                right: Box::new(HlilExpr::Const(4)),
+            }),
+            size: 4,
+        };
+
+        fold_field_accesses_expr(&mut expr, None, &inferred, &types);
+
+        assert!(
+            matches!(&expr, HlilExpr::FieldAccess { field_name, is_ptr: true, .. } if field_name == "y"),
+            "expected ->y field access, got {:?}",
+            expr
+        );
+    }
+
+    #[test]
+    fn fold_nested_struct_access() {
+        // *(rect_ptr + 12) where rect_ptr: Rect* → rect_ptr->size.y
+        // Rect.size is at offset 8, Point.y is at offset 4 → total offset 12
+        let types = make_test_types_with_structs();
+        let mut inferred = HashMap::new();
+        inferred.insert(
+            "rect_ptr".to_string(),
+            TypeRef::Pointer(Box::new(TypeRef::Named("Rect".to_string()))),
+        );
+
+        let mut expr = HlilExpr::Deref {
+            addr: Box::new(HlilExpr::BinOp {
+                op: BinOp::Add,
+                left: Box::new(HlilExpr::Var("rect_ptr".to_string())),
+                right: Box::new(HlilExpr::Const(12)),
+            }),
+            size: 4,
+        };
+
+        fold_field_accesses_expr(&mut expr, None, &inferred, &types);
+
+        // Should be rect_ptr->size.y
+        if let HlilExpr::FieldAccess {
+            base,
+            field_name,
+            is_ptr: false,
+        } = &expr
+        {
+            assert_eq!(field_name, "y", "inner field should be y");
+            if let HlilExpr::FieldAccess {
+                field_name: outer_name,
+                is_ptr: true,
+                ..
+            } = &**base
+            {
+                assert_eq!(outer_name, "size", "outer field should be size");
+            } else {
+                panic!("expected outer FieldAccess, got {:?}", base);
+            }
+        } else {
+            panic!("expected nested FieldAccess, got {:?}", expr);
+        }
+    }
+
+    #[test]
+    fn fold_array_access_mul_pattern() {
+        // *(arr_ptr + index * 4) where arr_ptr: int32_t* → arr_ptr[index]
+        let types = TypeManager {
+            arch: crate::arch::Architecture::X86_64,
+            ..TypeManager::default()
+        };
+        let mut inferred = HashMap::new();
+        inferred.insert(
+            "arr_ptr".to_string(),
+            TypeRef::Pointer(Box::new(TypeRef::Primitive(PrimitiveType::I32))),
+        );
+
+        let mut expr = HlilExpr::Deref {
+            addr: Box::new(HlilExpr::BinOp {
+                op: BinOp::Add,
+                left: Box::new(HlilExpr::Var("arr_ptr".to_string())),
+                right: Box::new(HlilExpr::BinOp {
+                    op: BinOp::Mul,
+                    left: Box::new(HlilExpr::Var("index".to_string())),
+                    right: Box::new(HlilExpr::Const(4)),
+                }),
+            }),
+            size: 4,
+        };
+
+        fold_field_accesses_expr(&mut expr, None, &inferred, &types);
+
+        assert!(
+            matches!(&expr, HlilExpr::ArrayAccess { .. }),
+            "expected ArrayAccess, got {:?}",
+            expr
+        );
+    }
+
+    #[test]
+    fn fold_array_access_shl_pattern() {
+        // *(arr_ptr + index << 3) where arr_ptr: int64_t* → arr_ptr[index]
+        let types = TypeManager {
+            arch: crate::arch::Architecture::X86_64,
+            ..TypeManager::default()
+        };
+        let mut inferred = HashMap::new();
+        inferred.insert(
+            "arr_ptr".to_string(),
+            TypeRef::Pointer(Box::new(TypeRef::Primitive(PrimitiveType::I64))),
+        );
+
+        let mut expr = HlilExpr::Deref {
+            addr: Box::new(HlilExpr::BinOp {
+                op: BinOp::Add,
+                left: Box::new(HlilExpr::Var("arr_ptr".to_string())),
+                right: Box::new(HlilExpr::BinOp {
+                    op: BinOp::Shl,
+                    left: Box::new(HlilExpr::Var("index".to_string())),
+                    right: Box::new(HlilExpr::Const(3)),
+                }),
+            }),
+            size: 8,
+        };
+
+        fold_field_accesses_expr(&mut expr, None, &inferred, &types);
+
+        assert!(
+            matches!(&expr, HlilExpr::ArrayAccess { .. }),
+            "expected ArrayAccess, got {:?}",
+            expr
+        );
+    }
+
+    #[test]
+    fn fold_byte_array_access() {
+        // *(buf + index) where buf: uint8_t* → buf[index]
+        let types = TypeManager {
+            arch: crate::arch::Architecture::X86_64,
+            ..TypeManager::default()
+        };
+        let mut inferred = HashMap::new();
+        inferred.insert(
+            "buf".to_string(),
+            TypeRef::Pointer(Box::new(TypeRef::Primitive(PrimitiveType::U8))),
+        );
+
+        let mut expr = HlilExpr::Deref {
+            addr: Box::new(HlilExpr::BinOp {
+                op: BinOp::Add,
+                left: Box::new(HlilExpr::Var("buf".to_string())),
+                right: Box::new(HlilExpr::Var("index".to_string())),
+            }),
+            size: 1,
+        };
+
+        fold_field_accesses_expr(&mut expr, None, &inferred, &types);
+
+        assert!(
+            matches!(&expr, HlilExpr::ArrayAccess { .. }),
+            "expected ArrayAccess, got {:?}",
+            expr
+        );
+    }
+
+    #[test]
+    fn fold_direct_struct_access() {
+        // *(stack_var + 4) where stack_var has type Named("Point") → stack_var.y
+        let types = make_test_types_with_structs();
+        let mut inferred = HashMap::new();
+        inferred.insert(
+            "local_point".to_string(),
+            TypeRef::Named("Point".to_string()),
+        );
+
+        let mut expr = HlilExpr::Deref {
+            addr: Box::new(HlilExpr::BinOp {
+                op: BinOp::Add,
+                left: Box::new(HlilExpr::Var("local_point".to_string())),
+                right: Box::new(HlilExpr::Const(4)),
+            }),
+            size: 4,
+        };
+
+        fold_field_accesses_expr(&mut expr, None, &inferred, &types);
+
+        assert!(
+            matches!(&expr, HlilExpr::FieldAccess { field_name, is_ptr: false, .. } if field_name == "y"),
+            "expected .y field access, got {:?}",
+            expr
         );
     }
 }
