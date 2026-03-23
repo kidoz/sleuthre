@@ -26,17 +26,22 @@ impl SleuthreApp {
 
         let mut jump_to = None;
 
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for exp in &project.exports {
-                if !self.export_filter.is_empty()
-                    && !exp
-                        .name
-                        .to_lowercase()
-                        .contains(&self.export_filter.to_lowercase())
-                {
-                    continue;
-                }
+        let filter_lower = self.export_filter.to_lowercase();
+        let filtered: Vec<usize> = project
+            .exports
+            .iter()
+            .enumerate()
+            .filter(|(_, exp)| {
+                filter_lower.is_empty() || exp.name.to_lowercase().contains(&filter_lower)
+            })
+            .map(|(i, _)| i)
+            .collect();
 
+        let row_height = 18.0;
+        let total = filtered.len();
+        egui::ScrollArea::vertical().show_rows(ui, row_height, total, |ui, range| {
+            for &idx in &filtered[range] {
+                let exp = &project.exports[idx];
                 ui.horizontal(|ui| {
                     if ui
                         .monospace(

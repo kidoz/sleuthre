@@ -1488,91 +1488,112 @@ impl SleuthreApp {
                 });
                 ui.separator();
 
-                // Build sorted/filtered function list
+                // Rebuild cached function list only when inputs change
                 let mut jump = None;
-                let filter_lower = self.function_filter.to_lowercase();
 
                 if let Some(project) = &self.project {
+                    let func_count = project.functions.functions.len();
+                    let needs_rebuild = self.cached_func_list_dirty
+                        || self.cached_func_filter != self.function_filter
+                        || self.cached_func_sort_col != self.func_sort_column
+                        || self.cached_func_sort_asc != self.func_sort_ascending
+                        || self.cached_func_type_filter != self.func_type_filter
+                        || self.cached_func_count != func_count;
+
+                    if needs_rebuild {
+                        let filter_lower = self.function_filter.to_lowercase();
+                        let import_addrs: std::collections::HashSet<u64> =
+                            project.imports.iter().map(|imp| imp.address).collect();
+
+                        let mut funcs: Vec<_> = project
+                            .functions
+                            .functions
+                            .values()
+                            .filter(|func| {
+                                if !filter_lower.is_empty()
+                                    && !fuzzy_match(&func.name, &filter_lower)
+                                {
+                                    return false;
+                                }
+                                match self.func_type_filter {
+                                    FunctionTypeFilter::All => true,
+                                    FunctionTypeFilter::Library => {
+                                        import_addrs.contains(&func.start_address)
+                                    }
+                                    FunctionTypeFilter::User => {
+                                        !import_addrs.contains(&func.start_address)
+                                    }
+                                }
+                            })
+                            .collect();
+
+                        let xref_counts = &self.func_xref_counts;
+                        match self.func_sort_column {
+                            FunctionSortColumn::Address => {
+                                funcs.sort_by_key(|f| f.start_address);
+                            }
+                            FunctionSortColumn::Name => {
+                                funcs.sort_by(|a, b| {
+                                    a.name.to_lowercase().cmp(&b.name.to_lowercase())
+                                });
+                            }
+                            FunctionSortColumn::Size => {
+                                funcs.sort_by_key(|f| {
+                                    f.end_address
+                                        .unwrap_or(f.start_address)
+                                        .saturating_sub(f.start_address)
+                                });
+                            }
+                            FunctionSortColumn::XrefsIn => {
+                                funcs.sort_by_key(|f| {
+                                    xref_counts
+                                        .get(&f.start_address)
+                                        .map(|(i, _)| *i)
+                                        .unwrap_or(0)
+                                });
+                            }
+                        }
+                        if !self.func_sort_ascending {
+                            funcs.reverse();
+                        }
+
+                        self.cached_func_list = funcs.iter().map(|f| f.start_address).collect();
+                        self.cached_func_filter = self.function_filter.clone();
+                        self.cached_func_sort_col = self.func_sort_column;
+                        self.cached_func_sort_asc = self.func_sort_ascending;
+                        self.cached_func_type_filter = self.func_type_filter;
+                        self.cached_func_count = func_count;
+                        self.cached_func_list_dirty = false;
+                    }
+
                     let import_addrs: std::collections::HashSet<u64> =
                         project.imports.iter().map(|imp| imp.address).collect();
 
-                    let mut funcs: Vec<_> = project
-                        .functions
-                        .functions
-                        .values()
-                        .filter(|func| {
-                            // Text filter (fuzzy subsequence)
-                            if !filter_lower.is_empty() && !fuzzy_match(&func.name, &filter_lower) {
-                                return false;
-                            }
-                            // Type filter
-                            match self.func_type_filter {
-                                FunctionTypeFilter::All => true,
-                                FunctionTypeFilter::Library => {
-                                    import_addrs.contains(&func.start_address)
-                                }
-                                FunctionTypeFilter::User => {
-                                    !import_addrs.contains(&func.start_address)
-                                }
-                            }
-                        })
-                        .collect();
-
-                    // Sort
-                    let xref_counts = &self.func_xref_counts;
-                    match self.func_sort_column {
-                        FunctionSortColumn::Address => {
-                            funcs.sort_by_key(|f| f.start_address);
-                        }
-                        FunctionSortColumn::Name => {
-                            funcs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-                        }
-                        FunctionSortColumn::Size => {
-                            funcs.sort_by_key(|f| {
-                                f.end_address
-                                    .unwrap_or(f.start_address)
-                                    .saturating_sub(f.start_address)
-                            });
-                        }
-                        FunctionSortColumn::XrefsIn => {
-                            funcs.sort_by_key(|f| {
-                                xref_counts
-                                    .get(&f.start_address)
-                                    .map(|(i, _)| *i)
-                                    .unwrap_or(0)
-                            });
-                        }
-                    }
-                    if !self.func_sort_ascending {
-                        funcs.reverse();
-                    }
-
-                    // Function count
                     ui.label(
                         egui::RichText::new(format!(
                             "{} / {} functions",
-                            funcs.len(),
-                            project.functions.functions.len()
+                            self.cached_func_list.len(),
+                            func_count
                         ))
                         .size(10.0)
                         .color(self.syntax.text_dim),
                     );
 
-                    // Render list
+                    let row_height = 18.0;
+                    let total = self.cached_func_list.len();
+                    let xref_counts = &self.func_xref_counts;
                     egui::ScrollArea::vertical()
                         .id_salt("func_scroll")
-                        .show(ui, |ui| {
-                            for func in &funcs {
-                                let is_selected = self.current_address == func.start_address;
-                                let size = func
-                                    .end_address
-                                    .unwrap_or(func.start_address)
-                                    .saturating_sub(func.start_address);
-                                let xrefs = xref_counts
-                                    .get(&func.start_address)
-                                    .map(|(i, _)| *i)
-                                    .unwrap_or(0);
-                                let is_lib = import_addrs.contains(&func.start_address);
+                        .show_rows(ui, row_height, total, |ui, range| {
+                            for &addr in &self.cached_func_list[range] {
+                                let func = match project.functions.functions.get(&addr) {
+                                    Some(f) => f,
+                                    None => continue,
+                                };
+                                let is_selected = self.current_address == addr;
+                                let size = func.end_address.unwrap_or(addr).saturating_sub(addr);
+                                let xrefs = xref_counts.get(&addr).map(|(i, _)| *i).unwrap_or(0);
+                                let is_lib = import_addrs.contains(&addr);
                                 let badge_text = if is_lib { " L " } else { " f " };
                                 let badge_color = if is_lib {
                                     self.syntax.nav_band_func_lib
@@ -1588,7 +1609,7 @@ impl SleuthreApp {
                                             .background_color(badge_color),
                                     );
                                     ui.monospace(
-                                        egui::RichText::new(format!("{:08X}", func.start_address))
+                                        egui::RichText::new(format!("{:08X}", addr))
                                             .size(10.0)
                                             .color(self.syntax.address),
                                     );
@@ -1599,7 +1620,7 @@ impl SleuthreApp {
                                         )
                                         .clicked()
                                     {
-                                        jump = Some(func.start_address);
+                                        jump = Some(addr);
                                     }
                                     ui.monospace(
                                         egui::RichText::new(format!("{:X}", size))

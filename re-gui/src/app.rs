@@ -102,6 +102,21 @@ pub(crate) struct SleuthreApp {
     // Navigation band layer
     pub(crate) nav_band_layer: NavBandLayer,
 
+    // Cached sorted/filtered function list (addresses only).
+    // Rebuilt only when filter/sort/type changes or functions are modified.
+    pub(crate) cached_func_list: Vec<u64>,
+    pub(crate) cached_func_list_dirty: bool,
+    // Snapshot of the inputs that produced the cache, for invalidation.
+    pub(crate) cached_func_filter: String,
+    pub(crate) cached_func_sort_col: FunctionSortColumn,
+    pub(crate) cached_func_sort_asc: bool,
+    pub(crate) cached_func_type_filter: FunctionTypeFilter,
+    pub(crate) cached_func_count: usize,
+
+    // Cached disassembly for the visible window
+    pub(crate) disasm_cache: Vec<re_core::disasm::Instruction>,
+    pub(crate) disasm_cache_base: u64,
+
     // Command bar
     pub(crate) command_bar_input: String,
     pub(crate) command_bar_results: Vec<CommandBarResult>,
@@ -298,6 +313,15 @@ impl Default for SleuthreApp {
             func_type_filter: FunctionTypeFilter::All,
             func_xref_counts: HashMap::new(),
             nav_band_layer: NavBandLayer::Segments,
+            cached_func_list: Vec::new(),
+            cached_func_list_dirty: true,
+            cached_func_filter: String::new(),
+            cached_func_sort_col: FunctionSortColumn::Address,
+            cached_func_sort_asc: true,
+            cached_func_type_filter: FunctionTypeFilter::All,
+            cached_func_count: 0,
+            disasm_cache: Vec::new(),
+            disasm_cache_base: u64::MAX,
             command_bar_input: String::new(),
             command_bar_results: Vec::new(),
             command_bar_selected: 0,
@@ -378,6 +402,7 @@ impl SleuthreApp {
                     self.output.push_str(&result.summary);
                     self.output.push('\n');
                     self.project = Some(result.project);
+                    self.cached_func_list_dirty = true;
                     self.update_cfg();
                     self.load_receiver = None;
                     self.load_stage = None;
@@ -440,6 +465,7 @@ impl SleuthreApp {
                         .push_str(&format!("Project loaded from '{}'.\n", path.display()));
                     self.disasm = Disassembler::new(project.arch).ok();
                     self.project = Some(project);
+                    self.cached_func_list_dirty = true;
                     self.update_cfg();
                 }
                 Err(e) => {
@@ -456,6 +482,8 @@ impl SleuthreApp {
             let _ = cfg.build_for_function(&project.memory_map, disasm, self.current_address);
             self.current_cfg = Some(cfg);
         }
+        // Invalidate disassembly cache on navigation
+        self.disasm_cache_base = u64::MAX;
         if self.active_tab == Tab::Decompiler {
             self.decompile_current_function();
         }

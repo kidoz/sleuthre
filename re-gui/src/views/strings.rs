@@ -33,16 +33,24 @@ impl SleuthreApp {
 
         let mut jump_to = None;
 
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for s in &project.strings.strings {
-                if !self.string_filter.is_empty()
-                    && !s
-                        .value
-                        .to_lowercase()
-                        .contains(&self.string_filter.to_lowercase())
-                {
-                    continue;
-                }
+        // Pre-filter into index list (cheap — only indices, not clones)
+        let filter_lower = self.string_filter.to_lowercase();
+        let filtered_indices: Vec<usize> = project
+            .strings
+            .strings
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                filter_lower.is_empty() || s.value.to_lowercase().contains(&filter_lower)
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        let row_height = 18.0;
+        let total = filtered_indices.len();
+        egui::ScrollArea::vertical().show_rows(ui, row_height, total, |ui, range| {
+            for &idx in &filtered_indices[range] {
+                let s = &project.strings.strings[idx];
 
                 let enc = match s.encoding {
                     StringEncoding::Ascii => "ASCII",

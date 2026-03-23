@@ -34,27 +34,35 @@ impl SleuthreApp {
         let mut patch_request = None;
         let mut select_request = None;
 
+        // Identify the segment once for zero-copy row access
+        let seg_idx = self
+            .project
+            .as_ref()
+            .and_then(|p| {
+                p.memory_map
+                    .segments
+                    .iter()
+                    .position(|s| start_addr >= s.start && start_addr < s.start + s.size)
+            })
+            .unwrap_or(0);
+
         egui::ScrollArea::vertical().show_rows(ui, 18.0, total_rows, |ui, range| {
+            let seg_data = self
+                .project
+                .as_ref()
+                .and_then(|p| p.memory_map.segments.get(seg_idx))
+                .map(|s| &s.data[..]);
+
             for row in range {
                 let offset = row * bytes_per_row;
                 let addr = start_addr + offset as u64;
 
-                // We need to re-fetch the segment data safely
-                let row_data_vec = if let Some(ref project) = self.project {
-                    let segment = project
-                        .memory_map
-                        .segments
-                        .iter()
-                        .find(|s| addr >= s.start && addr < s.start + s.size);
-                    if let Some(s) = segment {
-                        let end = (offset + bytes_per_row).min(s.data.len());
-                        s.data[offset..end].to_vec()
-                    } else {
-                        vec![]
-                    }
-                } else {
-                    vec![]
-                };
+                let row_data: &[u8] = seg_data
+                    .and_then(|data| {
+                        let end = (offset + bytes_per_row).min(data.len());
+                        data.get(offset..end)
+                    })
+                    .unwrap_or(&[]);
 
                 ui.horizontal(|ui| {
                     ui.style_mut().spacing.item_spacing.x = 2.0;
@@ -62,7 +70,7 @@ impl SleuthreApp {
                         egui::RichText::new(format!("{:08X}  ", addr)).color(self.syntax.address),
                     );
 
-                    for (i, &byte) in row_data_vec.iter().enumerate() {
+                    for (i, &byte) in row_data.iter().enumerate() {
                         let byte_addr = addr + i as u64;
                         let is_selected = self.hex_selected_addr == Some(byte_addr);
 
@@ -109,9 +117,8 @@ impl SleuthreApp {
                         }
                     }
 
-                    // Fill remaining space if row is short
-                    if row_data_vec.len() < bytes_per_row {
-                        for i in row_data_vec.len()..bytes_per_row {
+                    if row_data.len() < bytes_per_row {
+                        for i in row_data.len()..bytes_per_row {
                             ui.label("   ");
                             if i == 7 {
                                 ui.label(" ");
@@ -121,7 +128,7 @@ impl SleuthreApp {
 
                     ui.add_space(8.0);
 
-                    let ascii: String = row_data_vec
+                    let ascii: String = row_data
                         .iter()
                         .map(|&b| {
                             if (0x20..=0x7E).contains(&b) {

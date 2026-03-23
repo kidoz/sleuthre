@@ -32,21 +32,24 @@ impl SleuthreApp {
 
         let mut jump_to = None;
 
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for imp in &project.imports {
-                if !self.import_filter.is_empty()
-                    && !imp
-                        .name
-                        .to_lowercase()
-                        .contains(&self.import_filter.to_lowercase())
-                    && !imp
-                        .library
-                        .to_lowercase()
-                        .contains(&self.import_filter.to_lowercase())
-                {
-                    continue;
-                }
+        let filter_lower = self.import_filter.to_lowercase();
+        let filtered: Vec<usize> = project
+            .imports
+            .iter()
+            .enumerate()
+            .filter(|(_, imp)| {
+                filter_lower.is_empty()
+                    || imp.name.to_lowercase().contains(&filter_lower)
+                    || imp.library.to_lowercase().contains(&filter_lower)
+            })
+            .map(|(i, _)| i)
+            .collect();
 
+        let row_height = 18.0;
+        let total = filtered.len();
+        egui::ScrollArea::vertical().show_rows(ui, row_height, total, |ui, range| {
+            for &idx in &filtered[range] {
+                let imp = &project.imports[idx];
                 ui.horizontal(|ui| {
                     if ui
                         .monospace(
