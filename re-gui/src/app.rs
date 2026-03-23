@@ -51,9 +51,11 @@ pub(crate) struct SleuthreApp {
 
     pub(crate) structure_filter: String,
     pub(crate) call_graph_filter: String,
+    pub(crate) xref_filter: String,
 
     // Graph view state
     pub(crate) graph_zoom: f32,
+    pub(crate) graph_options: GraphOptions,
 
     // Theme
     pub(crate) theme_mode: ThemeMode,
@@ -82,6 +84,10 @@ pub(crate) struct SleuthreApp {
 
     // Debugger
     pub(crate) debugger: Box<dyn re_core::Debugger>,
+
+    // Scripting
+    pub(crate) script_engine: re_core::scripting::ScriptEngine,
+    pub(crate) script_input: String,
 
     // Auto-save
     pub(crate) last_save_time: f64,
@@ -131,6 +137,7 @@ pub(crate) enum Tab {
     Exports,
     Structures,
     CallGraph,
+    Xrefs,
 }
 
 impl std::fmt::Display for Tab {
@@ -145,6 +152,7 @@ impl std::fmt::Display for Tab {
             Tab::Exports => write!(f, "Exports"),
             Tab::Structures => write!(f, "Structures"),
             Tab::CallGraph => write!(f, "Call Graph"),
+            Tab::Xrefs => write!(f, "Cross References"),
         }
     }
 }
@@ -176,6 +184,19 @@ pub(crate) enum NavBandLayer {
     Segments,
     Functions,
     AnalysisState,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+pub(crate) enum GraphLayoutMode {
+    Hierarchical,
+    Compact,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+pub(crate) struct GraphOptions {
+    pub(crate) layout_mode: GraphLayoutMode,
+    pub(crate) show_edge_labels: bool,
+    pub(crate) show_minimap: bool,
 }
 
 #[derive(Clone)]
@@ -234,7 +255,13 @@ impl Default for SleuthreApp {
             search_mode: SearchMode::String,
             structure_filter: String::new(),
             call_graph_filter: String::new(),
+            xref_filter: String::new(),
             graph_zoom: 1.0,
+            graph_options: GraphOptions {
+                layout_mode: GraphLayoutMode::Hierarchical,
+                show_edge_labels: true,
+                show_minimap: true,
+            },
             theme_mode: ThemeMode::Dark,
             syntax: SyntaxColors::for_theme(ThemeMode::Dark),
             theme_changed: true, // Apply on first frame
@@ -255,6 +282,8 @@ impl Default for SleuthreApp {
             hex_edit_buffer: String::new(),
             toasts: Vec::new(),
             debugger: Box::new(re_core::MockDebugger::default()),
+            script_engine: re_core::scripting::ScriptEngine::new(),
+            script_input: String::new(),
             last_save_time: 0.0,
             output_panel_visible: true,
             output_panel_height: 150.0,
@@ -729,6 +758,8 @@ fn platform_string(
         re_core::arch::Architecture::Arm => "arm",
         re_core::arch::Architecture::Mips => "mips",
         re_core::arch::Architecture::Mips64 => "mips64",
+        re_core::arch::Architecture::RiscV32 => "riscv32",
+        re_core::arch::Architecture::RiscV64 => "riscv64",
     };
     format!("{}_{}", os, arch_str)
 }

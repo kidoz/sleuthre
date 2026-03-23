@@ -36,6 +36,8 @@ fn platform_string(arch: Architecture, format: loader::BinaryFormat) -> String {
         Architecture::Arm => "arm",
         Architecture::Mips => "mips",
         Architecture::Mips64 => "mips64",
+        Architecture::RiscV32 => "riscv32",
+        Architecture::RiscV64 => "riscv64",
     };
     format!("{}_{}", os, arch_str)
 }
@@ -703,8 +705,10 @@ fn parse_arch(s: &str) -> Result<Architecture> {
         "arm64" | "aarch64" => Ok(Architecture::Arm64),
         "mips" | "mips32" => Ok(Architecture::Mips),
         "mips64" => Ok(Architecture::Mips64),
+        "riscv" | "riscv32" | "rv32" => Ok(Architecture::RiscV32),
+        "riscv64" | "rv64" => Ok(Architecture::RiscV64),
         _ => anyhow::bail!(
-            "Unknown architecture '{}'. Supported: x86, x86_64, arm, arm64, mips, mips64",
+            "Unknown architecture '{}'. Supported: x86, x86_64, arm, arm64, mips, mips64, riscv32, riscv64",
             s
         ),
     }

@@ -1,4 +1,4 @@
-use crate::app::SleuthreApp;
+use crate::app::{GraphLayoutMode, SleuthreApp};
 use crate::views::graph_utils::{GenericGraph, GraphEdge, GraphNode};
 use eframe::egui;
 use petgraph::visit::EdgeRef;
@@ -13,6 +13,25 @@ impl SleuthreApp {
                 return;
             }
         };
+
+        // Layout controls
+        ui.horizontal(|ui| {
+            ui.label("Layout:");
+            ui.selectable_value(
+                &mut self.graph_options.layout_mode,
+                GraphLayoutMode::Hierarchical,
+                "Hierarchical",
+            );
+            ui.selectable_value(
+                &mut self.graph_options.layout_mode,
+                GraphLayoutMode::Compact,
+                "Compact",
+            );
+            ui.separator();
+            ui.checkbox(&mut self.graph_options.show_edge_labels, "Edge labels");
+            ui.checkbox(&mut self.graph_options.show_minimap, "Minimap");
+        });
+        ui.separator();
 
         let mut gg = GenericGraph::new();
         let mut node_map = std::collections::HashMap::new();
@@ -71,7 +90,13 @@ impl SleuthreApp {
             .and_then(|idx| node_map.get(idx))
             .copied();
 
-        if let Some(addr) = gg.show(ui, &mut self.graph_zoom, &self.syntax, self.current_address) {
+        if let Some(addr) = gg.show_with_options(
+            ui,
+            &mut self.graph_zoom,
+            &self.syntax,
+            self.current_address,
+            &self.graph_options,
+        ) {
             self.current_address = addr;
             self.focused_address = Some(addr);
         }

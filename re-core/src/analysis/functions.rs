@@ -157,6 +157,7 @@ impl FunctionManager {
             Architecture::Arm => self.check_arm_prologue(data, addr),
             Architecture::Arm64 => self.check_arm64_prologue(data, addr),
             Architecture::Mips | Architecture::Mips64 => self.check_mips_prologue(data, addr),
+            Architecture::RiscV32 | Architecture::RiscV64 => self.check_riscv_prologue(data, addr),
         }
     }
 
@@ -285,6 +286,34 @@ impl FunctionManager {
             return true;
         }
 
+        false
+    }
+
+    fn check_riscv_prologue(&mut self, data: &[u8], addr: u64) -> bool {
+        if data.len() < 4 {
+            return false;
+        }
+        // RISC-V: addi sp, sp, -N (standard prologue)
+        // RV32I encoding: imm[11:0] | rs1(sp=2) | funct3(000) | rd(sp=2) | opcode(0010011)
+        // Lower 20 bits: rs1=2(5b) | f3=000(3b) | rd=2(5b) | op=0010011(7b)
+        // = 00010 | 000 | 00010 | 0010011 = 0x00010113 mask on lower 20 bits
+        // Full: negative imm in top 12 bits, so bit 31 should be 1 (negative offset)
+        let word = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        let mask = 0x000F_FFFF; // lower 20 bits
+        let expected = 0x0001_0113; // addi sp, sp, ?
+        if (word & mask) == expected && (word & 0x8000_0000) != 0 {
+            self.add_discovered(addr);
+            return true;
+        }
+        // Also check compressed: c.addi16sp (opcode 0x6101..0x7FFF range)
+        if data.len() >= 2 {
+            let hw = u16::from_le_bytes([data[0], data[1]]);
+            // c.addi16sp: funct3=011, rd=2, op=01 — bits [15:13]=011, [11:7]=00010, [1:0]=01
+            if (hw & 0xEF83) == 0x6101 {
+                self.add_discovered(addr);
+                return true;
+            }
+        }
         false
     }
 

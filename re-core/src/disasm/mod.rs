@@ -60,6 +60,28 @@ impl Disassembler {
                 .detail(true)
                 .build()
                 .map_err(|e: capstone::Error| Error::Analysis(e.to_string()))?,
+            Architecture::RiscV32 => Capstone::new()
+                .riscv()
+                .mode(capstone::arch::riscv::ArchMode::RiscV32)
+                .extra_mode(
+                    [capstone::arch::riscv::ArchExtraMode::RiscVC]
+                        .iter()
+                        .copied(),
+                )
+                .detail(true)
+                .build()
+                .map_err(|e: capstone::Error| Error::Analysis(e.to_string()))?,
+            Architecture::RiscV64 => Capstone::new()
+                .riscv()
+                .mode(capstone::arch::riscv::ArchMode::RiscV64)
+                .extra_mode(
+                    [capstone::arch::riscv::ArchExtraMode::RiscVC]
+                        .iter()
+                        .copied(),
+                )
+                .detail(true)
+                .build()
+                .map_err(|e: capstone::Error| Error::Analysis(e.to_string()))?,
         };
 
         Ok(Self { cs, arch })
@@ -153,6 +175,8 @@ mod tests {
             Architecture::Arm64,
             Architecture::Mips,
             Architecture::Mips64,
+            Architecture::RiscV32,
+            Architecture::RiscV64,
         ] {
             let d = Disassembler::new(arch);
             assert!(d.is_ok(), "Failed to create disassembler for {}", arch);

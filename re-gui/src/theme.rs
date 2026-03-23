@@ -4,6 +4,7 @@ use eframe::egui;
 pub(crate) enum ThemeMode {
     Light,
     Dark,
+    Solarized,
 }
 
 /// Colors used for syntax highlighting in disassembly and graph views
@@ -56,6 +57,7 @@ impl SyntaxColors {
         match mode {
             ThemeMode::Light => Self::light(),
             ThemeMode::Dark => Self::dark(),
+            ThemeMode::Solarized => Self::solarized(),
         }
     }
 
@@ -140,6 +142,64 @@ impl SyntaxColors {
             nav_band_unexplored: egui::Color32::from_rgb(60, 60, 60),
         }
     }
+
+    /// Solarized Dark palette (Ethan Schoonover)
+    fn solarized() -> Self {
+        // Base tones
+        let base03 = egui::Color32::from_rgb(0, 43, 54);
+        let base02 = egui::Color32::from_rgb(7, 54, 66);
+        let base01 = egui::Color32::from_rgb(88, 110, 117);
+        let base0 = egui::Color32::from_rgb(131, 148, 150);
+        let _base1 = egui::Color32::from_rgb(147, 161, 161);
+        // Accent colors
+        let yellow = egui::Color32::from_rgb(181, 137, 0);
+        let orange = egui::Color32::from_rgb(203, 75, 22);
+        let red = egui::Color32::from_rgb(220, 50, 47);
+        let magenta = egui::Color32::from_rgb(211, 54, 130);
+        let violet = egui::Color32::from_rgb(108, 113, 196);
+        let blue = egui::Color32::from_rgb(38, 139, 210);
+        let cyan = egui::Color32::from_rgb(42, 161, 152);
+        let green = egui::Color32::from_rgb(133, 153, 0);
+
+        Self {
+            address: base01,
+            mnemonic: blue,
+            register: violet,
+            number: cyan,
+            string: orange,
+            comment: base01,
+            keyword: magenta,
+            simd: yellow,
+            bytes: base02,
+            label: yellow,
+            text: base0,
+            text_dim: base01,
+
+            edge_true: green,
+            edge_false: red,
+            edge_unconditional: blue,
+            edge_fallthrough: base01,
+            edge_back: magenta,
+
+            link: blue,
+            block_bg: base03,
+            block_border: base01,
+            nav_band_bg: base02,
+            nav_band_exec: blue,
+            nav_band_data: base02,
+            func_badge_bg: egui::Color32::from_rgb(7, 70, 90),
+            bookmark_badge_bg: egui::Color32::from_rgb(90, 70, 7),
+            selection_bg: egui::Color32::from_rgba_unmultiplied(131, 148, 150, 30),
+            ascii_text: green,
+
+            status_bar_bg: base03,
+
+            nav_band_func_user: cyan,
+            nav_band_func_lib: violet,
+            nav_band_string: yellow,
+            nav_band_unexplored: base02,
+        }
+    }
 }
 
 pub(crate) fn apply_theme(ctx: &egui::Context, mode: ThemeMode) {
@@ -156,6 +216,20 @@ pub(crate) fn apply_theme(ctx: &egui::Context, mode: ThemeMode) {
             visuals.panel_fill = egui::Color32::from_rgb(30, 30, 30);
             visuals.window_fill = egui::Color32::from_rgb(35, 35, 35);
             visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(30, 30, 30);
+            ctx.set_visuals(visuals);
+        }
+        ThemeMode::Solarized => {
+            let mut visuals = egui::Visuals::dark();
+            visuals.panel_fill = egui::Color32::from_rgb(0, 43, 54);
+            visuals.window_fill = egui::Color32::from_rgb(7, 54, 66);
+            visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(0, 43, 54);
+            visuals.widgets.noninteractive.fg_stroke =
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(131, 148, 150));
+            visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(7, 54, 66);
+            visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(7, 70, 90);
+            visuals.widgets.active.bg_fill = egui::Color32::from_rgb(7, 80, 100);
+            visuals.extreme_bg_color = egui::Color32::from_rgb(0, 43, 54);
+            visuals.faint_bg_color = egui::Color32::from_rgb(7, 54, 66);
             ctx.set_visuals(visuals);
         }
     }

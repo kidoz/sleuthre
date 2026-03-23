@@ -36,6 +36,27 @@ impl GenericGraph {
         syntax: &crate::theme::SyntaxColors,
         current_addr: u64,
     ) -> Option<u64> {
+        self.show_with_options(
+            ui,
+            zoom,
+            syntax,
+            current_addr,
+            &crate::app::GraphOptions {
+                layout_mode: crate::app::GraphLayoutMode::Hierarchical,
+                show_edge_labels: true,
+                show_minimap: true,
+            },
+        )
+    }
+
+    pub fn show_with_options(
+        &self,
+        ui: &mut egui::Ui,
+        zoom: &mut f32,
+        syntax: &crate::theme::SyntaxColors,
+        current_addr: u64,
+        options: &crate::app::GraphOptions,
+    ) -> Option<u64> {
         let mut jump_to = None;
 
         if self.graph.node_count() == 0 {
@@ -111,17 +132,19 @@ impl GenericGraph {
         }
 
         // --- Compute sizes and positions ---
+        let is_compact = options.layout_mode == crate::app::GraphLayoutMode::Compact;
+        let node_width = if is_compact { 240.0 } else { 300.0 };
         let mut node_sizes: HashMap<NodeIndex, egui::Vec2> = HashMap::new();
         for node_idx in self.graph.node_indices() {
             let node = &self.graph[node_idx];
-            let w = 300.0 * zoom_val;
+            let w = node_width * zoom_val;
             let h = (node.lines.len() as f32 * 16.0 * zoom_val) + 28.0 * zoom_val;
             node_sizes.insert(node_idx, egui::vec2(w, h));
         }
 
-        let h_gap = 40.0 * zoom_val;
-        let v_gap = 60.0 * zoom_val;
-        let padding = 30.0 * zoom_val;
+        let h_gap = if is_compact { 20.0 } else { 40.0 } * zoom_val;
+        let v_gap = if is_compact { 30.0 } else { 60.0 } * zoom_val;
+        let padding = if is_compact { 15.0 } else { 30.0 } * zoom_val;
 
         let mut layer_widths = vec![0.0f32; layers.len()];
         let mut layer_heights = vec![0.0f32; layers.len()];
@@ -398,7 +421,9 @@ impl GenericGraph {
                         .line_segment([to, to + egui::vec2(arrow_size * 0.5, -arrow_size)], stroke);
 
                     // Branch label at midpoint
-                    if let Some(ref label) = weight.label {
+                    if options.show_edge_labels
+                        && let Some(ref label) = weight.label
+                    {
                         let mid = egui::pos2(
                             (from.x + to.x) / 2.0 + 6.0 * zoom_val,
                             (from.y + to.y) / 2.0,
@@ -470,57 +495,61 @@ impl GenericGraph {
             }
 
             // --- Minimap overlay ---
-            let minimap_w = 120.0;
-            let minimap_h = 80.0;
-            let minimap_margin = 8.0;
-            let minimap_origin = egui::pos2(
-                canvas_rect.max.x - minimap_w - minimap_margin,
-                canvas_rect.min.y + minimap_margin,
-            );
-            let minimap_rect =
-                egui::Rect::from_min_size(minimap_origin, egui::vec2(minimap_w, minimap_h));
+            if !options.show_minimap {
+                // Skip minimap rendering
+            } else {
+                let minimap_w = 120.0;
+                let minimap_h = 80.0;
+                let minimap_margin = 8.0;
+                let minimap_origin = egui::pos2(
+                    canvas_rect.max.x - minimap_w - minimap_margin,
+                    canvas_rect.min.y + minimap_margin,
+                );
+                let minimap_rect =
+                    egui::Rect::from_min_size(minimap_origin, egui::vec2(minimap_w, minimap_h));
 
-            // Semi-transparent background
-            painter.rect_filled(
-                minimap_rect,
-                4.0,
-                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 140),
-            );
-            painter.rect_stroke(
-                minimap_rect,
-                4.0,
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 80, 80)),
-                egui::StrokeKind::Outside,
-            );
+                // Semi-transparent background
+                painter.rect_filled(
+                    minimap_rect,
+                    4.0,
+                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 140),
+                );
+                painter.rect_stroke(
+                    minimap_rect,
+                    4.0,
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 80, 80)),
+                    egui::StrokeKind::Outside,
+                );
 
-            if canvas_width > 0.0 && canvas_height > 0.0 {
-                let scale_x = minimap_w / canvas_width;
-                let scale_y = minimap_h / canvas_height;
-                let scale = scale_x.min(scale_y);
+                if canvas_width > 0.0 && canvas_height > 0.0 {
+                    let scale_x = minimap_w / canvas_width;
+                    let scale_y = minimap_h / canvas_height;
+                    let scale = scale_x.min(scale_y);
 
-                // Draw scaled-down node rectangles
-                for node_idx in self.graph.node_indices() {
-                    let pos = node_pos[&node_idx];
-                    let size = node_sizes[&node_idx];
-                    let mini_rect = egui::Rect::from_min_size(
-                        egui::pos2(
-                            minimap_origin.x + pos.x * scale,
-                            minimap_origin.y + pos.y * scale,
-                        ),
-                        egui::vec2((size.x * scale).max(2.0), (size.y * scale).max(1.0)),
-                    );
-                    let color = if self.graph[node_idx].address == current_addr
-                        || self.graph[node_idx]
-                            .instruction_addresses
-                            .contains(&current_addr)
-                    {
-                        syntax.link
-                    } else {
-                        egui::Color32::from_rgb(100, 100, 100)
-                    };
-                    painter.rect_filled(mini_rect, 0.0, color);
+                    // Draw scaled-down node rectangles
+                    for node_idx in self.graph.node_indices() {
+                        let pos = node_pos[&node_idx];
+                        let size = node_sizes[&node_idx];
+                        let mini_rect = egui::Rect::from_min_size(
+                            egui::pos2(
+                                minimap_origin.x + pos.x * scale,
+                                minimap_origin.y + pos.y * scale,
+                            ),
+                            egui::vec2((size.x * scale).max(2.0), (size.y * scale).max(1.0)),
+                        );
+                        let color = if self.graph[node_idx].address == current_addr
+                            || self.graph[node_idx]
+                                .instruction_addresses
+                                .contains(&current_addr)
+                        {
+                            syntax.link
+                        } else {
+                            egui::Color32::from_rgb(100, 100, 100)
+                        };
+                        painter.rect_filled(mini_rect, 0.0, color);
+                    }
                 }
-            }
+            } // end if show_minimap
         });
 
         jump_to

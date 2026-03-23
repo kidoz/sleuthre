@@ -30,6 +30,7 @@ impl TabViewer for SleuthreTabViewer<'_> {
             Tab::Exports => self.app.show_exports(ui),
             Tab::Structures => self.app.show_structures(ui),
             Tab::CallGraph => self.app.show_call_graph(ui),
+            Tab::Xrefs => self.app.show_xrefs(ui),
         }
     }
 }
@@ -46,6 +47,12 @@ impl eframe::App for SleuthreApp {
             self.focus_or_open_tab(Tab::Decompiler);
             self.decompile_current_function();
             self.trigger_decompile = false;
+        }
+
+        // Deferred script execution (from file picker)
+        if !self.script_input.is_empty() {
+            let src = std::mem::take(&mut self.script_input);
+            self.run_script(&src);
         }
 
         // Auto-save check
@@ -694,18 +701,32 @@ impl SleuthreApp {
                     ui.close();
                 }
                 ui.separator();
-                let theme_label = match self.theme_mode {
-                    ThemeMode::Dark => "Switch to Light Theme",
-                    ThemeMode::Light => "Switch to Dark Theme",
-                };
-                if ui.button(theme_label).clicked() {
-                    self.theme_mode = match self.theme_mode {
-                        ThemeMode::Dark => ThemeMode::Light,
-                        ThemeMode::Light => ThemeMode::Dark,
-                    };
-                    self.theme_changed = true;
-                    ui.close();
-                }
+                ui.menu_button(
+                    format!(
+                        "Theme: {}",
+                        match self.theme_mode {
+                            ThemeMode::Dark => "Dark",
+                            ThemeMode::Light => "Light",
+                            ThemeMode::Solarized => "Solarized",
+                        }
+                    ),
+                    |ui| {
+                        for (label, mode) in [
+                            ("Dark", ThemeMode::Dark),
+                            ("Light", ThemeMode::Light),
+                            ("Solarized", ThemeMode::Solarized),
+                        ] {
+                            if ui
+                                .selectable_label(self.theme_mode == mode, label)
+                                .clicked()
+                            {
+                                self.theme_mode = mode;
+                                self.theme_changed = true;
+                                ui.close();
+                            }
+                        }
+                    },
+                );
                 ui.separator();
                 if ui.button("AI Naming Heuristics").clicked() {
                     self.run_ai_naming_heuristics();
@@ -792,6 +813,7 @@ impl SleuthreApp {
                     ("Exports", Tab::Exports),
                     ("Structures", Tab::Structures),
                     ("Call Graph", Tab::CallGraph),
+                    ("Cross References", Tab::Xrefs),
                 ] {
                     if ui.button(name).clicked() {
                         self.focus_or_open_tab(tab);
@@ -1050,10 +1072,29 @@ impl SleuthreApp {
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
                         ui.label("Output");
-                        ui.add_space(ui.available_width() - 60.0);
-                        if ui.button("Clear").clicked() {
+                        ui.add_space(4.0);
+                        if ui.small_button("Clear").clicked() {
                             self.output.clear();
                         }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Run Script...").clicked()
+                                && let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("Rhai Scripts", &["rhai", "rs", "txt"])
+                                    .pick_file()
+                            {
+                                match std::fs::read_to_string(&path) {
+                                    Ok(src) => {
+                                        self.output
+                                            .push_str(&format!("Running {}...\n", path.display()));
+                                        self.script_input = src;
+                                    }
+                                    Err(e) => {
+                                        self.output
+                                            .push_str(&format!("Error reading file: {}\n", e));
+                                    }
+                                }
+                            }
+                        });
                     });
                     ui.separator();
                     egui::ScrollArea::vertical()
@@ -1070,8 +1111,9 @@ impl SleuthreApp {
                                 .color(egui::Color32::BLACK),
                         );
                         let response = ui.add(
-                            egui::TextEdit::singleline(&mut self.command_input)
-                                .hint_text("Enter command (e.g. g 0x401000, rename 0x123 main)..."),
+                            egui::TextEdit::singleline(&mut self.command_input).hint_text(
+                                "Commands: help, goto, rename, script <expr>, run [path]",
+                            ),
                         );
 
                         if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -1163,6 +1205,56 @@ impl SleuthreApp {
                     self.output.push_str("  ...\n");
                 }
             }
+            "script" | "eval" => {
+                // Evaluate inline Rhai script: script <expression>
+                let script_src = parts[1..].join(" ");
+                if script_src.is_empty() {
+                    self.output.push_str("Usage: script <rhai expression>\n");
+                } else {
+                    self.run_script(&script_src);
+                }
+            }
+            "run" | "load" => {
+                // Load and run a Rhai script file: run <path>
+                if parts.len() > 1 {
+                    let path = parts[1..].join(" ").trim_matches('"').to_string();
+                    let path = std::path::PathBuf::from(path);
+                    if path.exists() {
+                        match std::fs::read_to_string(&path) {
+                            Ok(script_src) => {
+                                self.output
+                                    .push_str(&format!("Running {}...\n", path.display()));
+                                self.run_script(&script_src);
+                            }
+                            Err(e) => {
+                                self.output
+                                    .push_str(&format!("Error reading file: {}\n", e));
+                            }
+                        }
+                    } else {
+                        self.output
+                            .push_str(&format!("File not found: {}\n", path.display()));
+                    }
+                } else {
+                    // Open file picker
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Rhai Scripts", &["rhai", "rs", "txt"])
+                        .pick_file()
+                    {
+                        match std::fs::read_to_string(&path) {
+                            Ok(script_src) => {
+                                self.output
+                                    .push_str(&format!("Running {}...\n", path.display()));
+                                self.run_script(&script_src);
+                            }
+                            Err(e) => {
+                                self.output
+                                    .push_str(&format!("Error reading file: {}\n", e));
+                            }
+                        }
+                    }
+                }
+            }
             "help" => {
                 self.output.push_str("Commands:\n");
                 self.output
@@ -1174,6 +1266,10 @@ impl SleuthreApp {
                 self.output
                     .push_str("  list                   - List first 10 functions\n");
                 self.output
+                    .push_str("  script <expr>          - Evaluate Rhai expression\n");
+                self.output
+                    .push_str("  run [path]             - Run a Rhai script file\n");
+                self.output
                     .push_str("  help                   - Show this help\n");
             }
             _ => {
@@ -1182,6 +1278,71 @@ impl SleuthreApp {
                     format!("Unknown command: {}", parts[0]),
                 );
             }
+        }
+    }
+
+    fn run_script(&mut self, source: &str) {
+        let mut goto_addr = None;
+
+        if let Some(ref mut project) = self.project {
+            match self.script_engine.eval(source, project) {
+                Ok(result) => {
+                    for action in &result.actions {
+                        match action {
+                            re_core::scripting::ScriptAction::Rename { address, new_name } => {
+                                let old_name = project
+                                    .functions
+                                    .functions
+                                    .get(address)
+                                    .map(|f| f.name.clone())
+                                    .unwrap_or_default();
+                                project.execute(re_core::project::UndoCommand::Rename {
+                                    address: *address,
+                                    old_name,
+                                    new_name: new_name.clone(),
+                                });
+                                self.output.push_str(&format!(
+                                    "Renamed 0x{:x} -> {}\n",
+                                    address, new_name
+                                ));
+                            }
+                            re_core::scripting::ScriptAction::Comment { address, text } => {
+                                let old_comment = project.comments.get(address).cloned();
+                                project.execute(re_core::project::UndoCommand::Comment {
+                                    address: *address,
+                                    old_comment,
+                                    new_comment: Some(text.clone()),
+                                });
+                                self.output
+                                    .push_str(&format!("Comment at 0x{:x}: {}\n", address, text));
+                            }
+                            re_core::scripting::ScriptAction::Goto(addr) => {
+                                self.current_address = *addr;
+                                goto_addr = Some(*addr);
+                                self.output.push_str(&format!("Jumped to 0x{:x}\n", addr));
+                            }
+                            re_core::scripting::ScriptAction::Print(msg) => {
+                                self.output.push_str(msg);
+                                self.output.push('\n');
+                            }
+                        }
+                    }
+                    if !result.output.is_empty() {
+                        self.output.push_str("=> ");
+                        self.output.push_str(&result.output);
+                        self.output.push('\n');
+                    }
+                }
+                Err(e) => {
+                    self.output.push_str(&format!("Script error: {}\n", e));
+                }
+            }
+        } else {
+            self.output.push_str("No project loaded.\n");
+        }
+
+        if goto_addr.is_some() {
+            self.update_cfg();
         }
     }
 
