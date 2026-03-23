@@ -1,11 +1,14 @@
 mod callgraph;
 mod decompiler;
+mod diff;
 mod disassembly;
+mod entropy;
 mod exports;
 mod graph;
 pub(crate) mod graph_utils;
 mod hex;
 mod imports;
+mod signatures;
 mod strings;
 mod structures;
 mod xrefs;

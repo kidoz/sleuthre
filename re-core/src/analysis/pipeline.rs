@@ -12,6 +12,35 @@ use crate::plugin::{AnalysisFinding, PluginManager};
 use crate::project::Project;
 use crate::signatures::SignatureDatabase;
 
+/// Configuration for which analysis stages to run.
+/// All stages are enabled by default.
+#[derive(Debug, Clone)]
+pub struct AnalysisConfig {
+    pub discover_functions: bool,
+    pub recursive_descent: bool,
+    pub scan_strings: bool,
+    pub scan_xrefs: bool,
+    pub scan_constants: bool,
+    pub extract_debug_info: bool,
+    pub type_propagation: bool,
+    pub run_analysis_passes: bool,
+}
+
+impl Default for AnalysisConfig {
+    fn default() -> Self {
+        Self {
+            discover_functions: true,
+            recursive_descent: true,
+            scan_strings: true,
+            scan_xrefs: true,
+            scan_constants: true,
+            extract_debug_info: true,
+            type_propagation: true,
+            run_analysis_passes: true,
+        }
+    }
+}
+
 /// Describes which stage the analysis pipeline is currently executing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnalysisStage {
@@ -311,6 +340,122 @@ fn analyze_loaded_with_bytes(
         entry_point: loaded.entry_point,
         summary,
     })
+}
+
+/// Re-run selected analysis stages on an existing project.
+///
+/// This is useful after manual edits (e.g., defining new types, adding
+/// signatures) to propagate changes without reloading the binary.
+pub fn reanalyze(
+    project: &mut Project,
+    config: &AnalysisConfig,
+    mut on_progress: impl FnMut(AnalysisStage),
+) -> Vec<AnalysisFinding> {
+    let disasm = crate::disasm::Disassembler::new(project.arch).ok();
+
+    if config.discover_functions {
+        on_progress(AnalysisStage::DiscoveringFunctions);
+        if let Some(ref ds) = disasm {
+            // Get entry point from first function or 0
+            let entry = project
+                .functions
+                .functions
+                .keys()
+                .next()
+                .copied()
+                .unwrap_or(0);
+            let _ =
+                project
+                    .functions
+                    .discover_functions(&project.memory_map, ds, entry, project.arch);
+        }
+    }
+
+    if config.recursive_descent {
+        on_progress(AnalysisStage::RecursiveDescent);
+        if let Some(ref ds) = disasm {
+            let _ = project
+                .functions
+                .discover_functions_recursive(&project.memory_map, ds);
+        }
+    }
+
+    if config.scan_strings {
+        on_progress(AnalysisStage::ScanningStrings);
+        project.strings.scan_memory(&project.memory_map);
+    }
+
+    if config.scan_xrefs
+        && let Some(ref ds) = disasm
+    {
+        on_progress(AnalysisStage::ScanningXrefs);
+        let _ = project.xrefs.scan_all(
+            &project.memory_map,
+            ds,
+            &project.functions,
+            &project.strings.strings,
+        );
+    }
+
+    if config.scan_constants {
+        on_progress(AnalysisStage::ScanningConstants);
+        project.constants.scan(&project.memory_map);
+    }
+
+    if config.type_propagation {
+        on_progress(AnalysisStage::TypePropagation);
+        let propagator = TypePropagator::new(
+            &project.functions,
+            &project.xrefs,
+            &project.type_libs,
+            &project.imports,
+        );
+        let debug_info = Default::default();
+        let type_info = propagator.propagate(&debug_info, &project.types);
+        for (&addr, info) in &type_info {
+            if let Some(ref sig) = info.signature {
+                project
+                    .types
+                    .function_signatures
+                    .entry(addr)
+                    .or_insert_with(|| sig.clone());
+                if let Some(func) = project.functions.functions.get_mut(&addr)
+                    && func.name.starts_with("sub_")
+                {
+                    func.name.clone_from(&sig.name);
+                }
+            }
+        }
+    }
+
+    let mut findings = Vec::new();
+    if config.run_analysis_passes {
+        on_progress(AnalysisStage::RunningAnalysisPasses);
+        let mut pm = PluginManager::default();
+        pm.register_analysis_pass(Box::new(SuspiciousNamePass));
+        pm.register_analysis_pass(Box::new(HeuristicNamePass));
+
+        let sig_db = match project.arch {
+            Architecture::X86_64 => SignatureDatabase::builtin_x86_64(),
+            Architecture::Arm64 => SignatureDatabase::builtin_arm64(),
+            _ => SignatureDatabase::new(),
+        };
+        pm.register_analysis_pass(Box::new(SignaturePass::new(sig_db)));
+
+        findings = pm
+            .run_all_analysis_passes(
+                &project.memory_map,
+                &mut project.functions,
+                &project.xrefs,
+                &project.strings,
+            )
+            .unwrap_or_default();
+    }
+
+    // Clear decompilation cache since analysis may have changed things
+    project.decompilation_cache.clear();
+    on_progress(AnalysisStage::Done);
+    findings
 }
 
 #[cfg(test)]

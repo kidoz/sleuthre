@@ -60,6 +60,14 @@ pub enum UndoCommand {
         old_bytes: Vec<u8>,
         new_bytes: Vec<u8>,
     },
+    AddTag {
+        address: u64,
+        tag: String,
+    },
+    RemoveTag {
+        address: u64,
+        tag: String,
+    },
 }
 
 pub struct Project {
@@ -79,6 +87,7 @@ pub struct Project {
     pub libraries: Vec<String>,
     pub types: TypeManager,
     pub bookmarks: BTreeMap<u64, String>,
+    pub tags: BTreeMap<u64, Vec<String>>,
     pub decompilation_cache: HashMap<u64, crate::il::hlil::DecompiledCode>,
     pub nav_history: Vec<u64>,
     pub nav_position: usize,
@@ -108,6 +117,7 @@ impl Project {
             libraries: Vec::new(),
             types: TypeManager::default(),
             bookmarks: BTreeMap::new(),
+            tags: BTreeMap::new(),
             decompilation_cache: HashMap::new(),
             nav_history: Vec::new(),
             nav_position: 0,
@@ -255,7 +265,46 @@ impl Project {
                     format!("Patched {:08X} ({} bytes)", address, new_bytes.len())
                 }
             }
+            UndoCommand::AddTag { address, tag } => {
+                if undo {
+                    if let Some(tags) = self.tags.get_mut(address) {
+                        tags.retain(|t| t != tag);
+                        if tags.is_empty() {
+                            self.tags.remove(address);
+                        }
+                    }
+                    format!("Undo tag '{}' at {:08X}", tag, address)
+                } else {
+                    self.tags.entry(*address).or_default().push(tag.clone());
+                    format!("Tagged {:08X} '{}'", address, tag)
+                }
+            }
+            UndoCommand::RemoveTag { address, tag } => {
+                if undo {
+                    self.tags.entry(*address).or_default().push(tag.clone());
+                    format!("Undo remove tag '{}' at {:08X}", tag, address)
+                } else {
+                    if let Some(tags) = self.tags.get_mut(address) {
+                        tags.retain(|t| t != tag);
+                        if tags.is_empty() {
+                            self.tags.remove(address);
+                        }
+                    }
+                    format!("Removed tag '{}' at {:08X}", tag, address)
+                }
+            }
         }
+    }
+
+    /// Get all unique tags used across the project.
+    pub fn all_tags(&self) -> Vec<String> {
+        let mut set = std::collections::BTreeSet::new();
+        for tags in self.tags.values() {
+            for t in tags {
+                set.insert(t.clone());
+            }
+        }
+        set.into_iter().collect()
     }
 
     pub fn navigate_to(&mut self, address: u64) {
@@ -350,6 +399,13 @@ impl Project {
             db.save_bookmark(addr, note)?;
         }
 
+        // Persist tags
+        for (&addr, tags) in &self.tags {
+            for tag in tags {
+                db.save_tag(addr, tag)?;
+            }
+        }
+
         // Persist function signatures
         for (&addr, sig) in &self.types.function_signatures {
             db.save_function_signature(addr, sig)?;
@@ -421,6 +477,9 @@ impl Project {
 
         // Restore bookmarks
         project.bookmarks = db.load_bookmarks()?;
+
+        // Restore tags
+        project.tags = db.load_tags()?;
 
         // Restore function signatures
         project.types.function_signatures = db.load_function_signatures()?;
@@ -532,6 +591,47 @@ mod tests {
         });
         assert!(!p.can_redo());
         assert_eq!(p.comments[&0x1000], "second");
+    }
+
+    #[test]
+    fn undo_redo_tag() {
+        let mut p = test_project();
+        p.execute(UndoCommand::AddTag {
+            address: 0x1000,
+            tag: "crypto".into(),
+        });
+        assert_eq!(p.tags[&0x1000], vec!["crypto"]);
+
+        p.execute(UndoCommand::AddTag {
+            address: 0x1000,
+            tag: "suspicious".into(),
+        });
+        assert_eq!(p.tags[&0x1000], vec!["crypto", "suspicious"]);
+
+        p.undo();
+        assert_eq!(p.tags[&0x1000], vec!["crypto"]);
+
+        p.redo();
+        assert_eq!(p.tags[&0x1000], vec!["crypto", "suspicious"]);
+
+        p.execute(UndoCommand::RemoveTag {
+            address: 0x1000,
+            tag: "crypto".into(),
+        });
+        assert_eq!(p.tags[&0x1000], vec!["suspicious"]);
+
+        p.undo();
+        assert_eq!(p.tags[&0x1000], vec!["suspicious", "crypto"]);
+    }
+
+    #[test]
+    fn all_tags_returns_unique_sorted() {
+        let mut p = test_project();
+        p.tags
+            .insert(0x1000, vec!["crypto".into(), "network".into()]);
+        p.tags.insert(0x2000, vec!["crypto".into(), "vuln".into()]);
+        let tags = p.all_tags();
+        assert_eq!(tags, vec!["crypto", "network", "vuln"]);
     }
 
     #[test]

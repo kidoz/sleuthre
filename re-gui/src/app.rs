@@ -72,6 +72,24 @@ pub(crate) struct SleuthreApp {
     pub(crate) new_field_offset: String,
     pub(crate) new_field_type: String,
 
+    // Struct field editing
+    pub(crate) edit_field_active: bool,
+    pub(crate) edit_field_struct: String,
+    pub(crate) edit_field_index: usize,
+    pub(crate) edit_field_name: String,
+    pub(crate) edit_field_offset: String,
+    pub(crate) edit_field_type: String,
+
+    // Type rename
+    pub(crate) rename_type_active: bool,
+    pub(crate) rename_type_old: String,
+    pub(crate) rename_type_new: String,
+
+    // Enum creation
+    pub(crate) create_enum_active: bool,
+    pub(crate) new_enum_name: String,
+    pub(crate) new_enum_variants: Vec<(String, String)>,
+
     // Hex view editing
     pub(crate) hex_selected_addr: Option<u64>,
     pub(crate) hex_edit_buffer: String,
@@ -102,6 +120,12 @@ pub(crate) struct SleuthreApp {
     // Navigation band layer
     pub(crate) nav_band_layer: NavBandLayer,
 
+    // Tags
+    pub(crate) func_tag_filter: Option<String>,
+    pub(crate) tag_active: bool,
+    pub(crate) tag_input: String,
+    pub(crate) cached_func_tag_filter: Option<String>,
+
     // Cached sorted/filtered function list (addresses only).
     // Rebuilt only when filter/sort/type changes or functions are modified.
     pub(crate) cached_func_list: Vec<u64>,
@@ -126,6 +150,27 @@ pub(crate) struct SleuthreApp {
     // Background loading
     pub(crate) load_receiver: Option<std::sync::mpsc::Receiver<LoadProgress>>,
     pub(crate) load_stage: Option<String>,
+
+    // Entropy
+    pub(crate) entropy_map: Option<re_core::analysis::entropy::EntropyMap>,
+
+    // Re-analysis
+    pub(crate) reanalyze_active: bool,
+    pub(crate) reanalyze_config: re_core::analysis::pipeline::AnalysisConfig,
+
+    // Binary diff
+    pub(crate) diff_project_b: Option<re_core::project::Project>,
+    pub(crate) diff_result: Option<re_core::analysis::diff::DiffResult>,
+    pub(crate) diff_filter: String,
+    pub(crate) diff_selected: Option<usize>,
+    pub(crate) diff_lines: Vec<re_core::analysis::diff::DiffLine>,
+
+    // Signature manager
+    pub(crate) user_sig_db: re_core::signatures::SignatureDatabase,
+    pub(crate) sig_filter: String,
+    pub(crate) new_sig_name: String,
+    pub(crate) new_sig_pattern: String,
+    pub(crate) new_sig_library: String,
 }
 
 pub(crate) struct Toast {
@@ -154,6 +199,9 @@ pub(crate) enum Tab {
     Structures,
     CallGraph,
     Xrefs,
+    Entropy,
+    Signatures,
+    Diff,
 }
 
 impl std::fmt::Display for Tab {
@@ -169,6 +217,9 @@ impl std::fmt::Display for Tab {
             Tab::Structures => write!(f, "Structures"),
             Tab::CallGraph => write!(f, "Call Graph"),
             Tab::Xrefs => write!(f, "Cross References"),
+            Tab::Entropy => write!(f, "Entropy"),
+            Tab::Signatures => write!(f, "Signatures"),
+            Tab::Diff => write!(f, "Binary Diff"),
         }
     }
 }
@@ -200,6 +251,7 @@ pub(crate) enum NavBandLayer {
     Segments,
     Functions,
     AnalysisState,
+    Entropy,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -299,6 +351,18 @@ impl Default for SleuthreApp {
             new_field_name: String::new(),
             new_field_offset: String::new(),
             new_field_type: String::new(),
+            edit_field_active: false,
+            edit_field_struct: String::new(),
+            edit_field_index: 0,
+            edit_field_name: String::new(),
+            edit_field_offset: String::new(),
+            edit_field_type: String::new(),
+            rename_type_active: false,
+            rename_type_old: String::new(),
+            rename_type_new: String::new(),
+            create_enum_active: false,
+            new_enum_name: String::new(),
+            new_enum_variants: Vec::new(),
             hex_selected_addr: None,
             hex_edit_buffer: String::new(),
             toasts: Vec::new(),
@@ -313,6 +377,10 @@ impl Default for SleuthreApp {
             func_type_filter: FunctionTypeFilter::All,
             func_xref_counts: HashMap::new(),
             nav_band_layer: NavBandLayer::Segments,
+            func_tag_filter: None,
+            tag_active: false,
+            tag_input: String::new(),
+            cached_func_tag_filter: None,
             cached_func_list: Vec::new(),
             cached_func_list_dirty: true,
             cached_func_filter: String::new(),
@@ -328,6 +396,19 @@ impl Default for SleuthreApp {
             command_bar_active: false,
             load_receiver: None,
             load_stage: None,
+            entropy_map: None,
+            diff_project_b: None,
+            diff_result: None,
+            diff_filter: String::new(),
+            diff_selected: None,
+            diff_lines: Vec::new(),
+            reanalyze_active: false,
+            reanalyze_config: re_core::analysis::pipeline::AnalysisConfig::default(),
+            user_sig_db: re_core::signatures::SignatureDatabase::new(),
+            sig_filter: String::new(),
+            new_sig_name: String::new(),
+            new_sig_pattern: String::new(),
+            new_sig_library: "user".into(),
         }
     }
 }
@@ -403,6 +484,14 @@ impl SleuthreApp {
                     self.output.push('\n');
                     self.project = Some(result.project);
                     self.cached_func_list_dirty = true;
+                    // Compute entropy map
+                    if let Some(ref project) = self.project {
+                        self.entropy_map = Some(re_core::analysis::entropy::compute_entropy_map(
+                            &project.memory_map,
+                            256,
+                            256,
+                        ));
+                    }
                     self.update_cfg();
                     self.load_receiver = None;
                     self.load_stage = None;
@@ -620,6 +709,7 @@ impl SleuthreApp {
             || self.goto_active
             || self.bookmark_active
             || self.search_active
+            || self.tag_active
     }
 
     pub(crate) fn focus_or_open_tab(&mut self, tab: Tab) {

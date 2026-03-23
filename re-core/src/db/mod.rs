@@ -132,6 +132,13 @@ impl Database {
                 address INTEGER PRIMARY KEY,
                 data TEXT
             );
+            CREATE TABLE IF NOT EXISTS tags (
+                address INTEGER NOT NULL,
+                tag TEXT NOT NULL,
+                PRIMARY KEY (address, tag)
+            );
+            CREATE INDEX IF NOT EXISTS idx_tags_address ON tags(address);
+            CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(tag);
             COMMIT;",
             )
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
@@ -337,7 +344,8 @@ impl Database {
                  DELETE FROM global_variables;
                  DELETE FROM local_variables;
                  DELETE FROM source_lines;
-                 DELETE FROM decompilation_cache;",
+                 DELETE FROM decompilation_cache;
+                 DELETE FROM tags;",
             )
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
         Ok(())
@@ -598,6 +606,37 @@ impl Database {
             bookmarks.insert(addr, note);
         }
         Ok(bookmarks)
+    }
+
+    // --- Tag persistence ---
+
+    pub fn save_tag(&self, address: u64, tag: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO tags (address, tag) VALUES (?1, ?2)",
+                params![address, tag],
+            )
+            .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn load_tags(&self) -> Result<std::collections::BTreeMap<u64, Vec<String>>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT address, tag FROM tags ORDER BY address, tag")
+            .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
+
+        let mut tags = std::collections::BTreeMap::<u64, Vec<String>>::new();
+        for row in rows {
+            let (addr, tag) = row.map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
+            tags.entry(addr).or_default().push(tag);
+        }
+        Ok(tags)
     }
 
     // --- Function signature persistence ---

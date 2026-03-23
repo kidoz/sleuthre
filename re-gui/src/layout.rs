@@ -31,6 +31,9 @@ impl TabViewer for SleuthreTabViewer<'_> {
             Tab::Structures => self.app.show_structures(ui),
             Tab::CallGraph => self.app.show_call_graph(ui),
             Tab::Xrefs => self.app.show_xrefs(ui),
+            Tab::Entropy => self.app.show_entropy(ui),
+            Tab::Signatures => self.app.show_signatures(ui),
+            Tab::Diff => self.app.show_diff(ui),
         }
     }
 }
@@ -770,6 +773,11 @@ impl SleuthreApp {
                     self.run_ai_naming_heuristics();
                     ui.close();
                 }
+                ui.separator();
+                if ui.button("Re-Analyze...").clicked() {
+                    self.reanalyze_active = true;
+                    ui.close();
+                }
             });
             ui.menu_button("Debugger", |ui| {
                 let state = self.debugger.state();
@@ -852,6 +860,9 @@ impl SleuthreApp {
                     ("Structures", Tab::Structures),
                     ("Call Graph", Tab::CallGraph),
                     ("Cross References", Tab::Xrefs),
+                    ("Entropy", Tab::Entropy),
+                    ("Signatures", Tab::Signatures),
+                    ("Binary Diff", Tab::Diff),
                 ] {
                     if ui.button(name).clicked() {
                         self.focus_or_open_tab(tab);
@@ -895,6 +906,7 @@ impl SleuthreApp {
                 NavBandLayer::AnalysisState,
                 "Analysis",
             );
+            ui.selectable_value(&mut self.nav_band_layer, NavBandLayer::Entropy, "Entropy");
         });
 
         let (rect, response) =
@@ -1007,6 +1019,23 @@ impl SleuthreApp {
                                 egui::vec2(w, rect.height()),
                             );
                             painter.rect_filled(str_rect, 0.0, self.syntax.nav_band_string);
+                        }
+                    }
+                    NavBandLayer::Entropy => {
+                        if let Some(ref emap) = self.entropy_map {
+                            for sample in &emap.samples {
+                                let start_ratio = (sample.address - min_addr) as f32 / total_size;
+                                let size_ratio = (sample.size as f32 / total_size).max(0.001);
+                                let x = rect.min.x + (rect.width() * start_ratio);
+                                let w = (rect.width() * size_ratio).max(1.0);
+                                let norm = (sample.entropy as f32 / 8.0).clamp(0.0, 1.0);
+                                let color = entropy_nav_color(norm);
+                                let e_rect = egui::Rect::from_min_size(
+                                    egui::pos2(x, rect.min.y),
+                                    egui::vec2(w, rect.height()),
+                                );
+                                painter.rect_filled(e_rect, 0.0, color);
+                            }
                         }
                     }
                 }
@@ -1421,6 +1450,37 @@ impl SleuthreApp {
                                 "Library",
                             );
                         });
+                    // Tag filter
+                    let all_tags = self
+                        .project
+                        .as_ref()
+                        .map(|p| p.all_tags())
+                        .unwrap_or_default();
+                    if !all_tags.is_empty() {
+                        let tag_label = self.func_tag_filter.as_deref().unwrap_or("Tag");
+                        egui::ComboBox::from_id_salt("func_tag_filter")
+                            .selected_text(tag_label)
+                            .width(60.0)
+                            .show_ui(ui, |ui| {
+                                if ui
+                                    .selectable_label(self.func_tag_filter.is_none(), "All")
+                                    .clicked()
+                                {
+                                    self.func_tag_filter = None;
+                                }
+                                for tag in &all_tags {
+                                    if ui
+                                        .selectable_label(
+                                            self.func_tag_filter.as_deref() == Some(tag.as_str()),
+                                            tag,
+                                        )
+                                        .clicked()
+                                    {
+                                        self.func_tag_filter = Some(tag.clone());
+                                    }
+                                }
+                            });
+                    }
                 });
                 ui.separator();
 
@@ -1498,6 +1558,7 @@ impl SleuthreApp {
                         || self.cached_func_sort_col != self.func_sort_column
                         || self.cached_func_sort_asc != self.func_sort_ascending
                         || self.cached_func_type_filter != self.func_type_filter
+                        || self.cached_func_tag_filter != self.func_tag_filter
                         || self.cached_func_count != func_count;
 
                     if needs_rebuild {
@@ -1515,7 +1576,7 @@ impl SleuthreApp {
                                 {
                                     return false;
                                 }
-                                match self.func_type_filter {
+                                let type_ok = match self.func_type_filter {
                                     FunctionTypeFilter::All => true,
                                     FunctionTypeFilter::Library => {
                                         import_addrs.contains(&func.start_address)
@@ -1523,6 +1584,18 @@ impl SleuthreApp {
                                     FunctionTypeFilter::User => {
                                         !import_addrs.contains(&func.start_address)
                                     }
+                                };
+                                if !type_ok {
+                                    return false;
+                                }
+                                if let Some(ref tag_filter) = self.func_tag_filter {
+                                    project
+                                        .tags
+                                        .get(&func.start_address)
+                                        .map(|tags| tags.contains(tag_filter))
+                                        .unwrap_or(false)
+                                } else {
+                                    true
                                 }
                             })
                             .collect();
@@ -1562,6 +1635,7 @@ impl SleuthreApp {
                         self.cached_func_sort_col = self.func_sort_column;
                         self.cached_func_sort_asc = self.func_sort_ascending;
                         self.cached_func_type_filter = self.func_type_filter;
+                        self.cached_func_tag_filter = self.func_tag_filter.clone();
                         self.cached_func_count = func_count;
                         self.cached_func_list_dirty = false;
                     }
@@ -1613,14 +1687,49 @@ impl SleuthreApp {
                                             .size(10.0)
                                             .color(self.syntax.address),
                                     );
-                                    if ui
-                                        .selectable_label(
-                                            is_selected,
-                                            egui::RichText::new(&func.name).size(11.0),
-                                        )
-                                        .clicked()
-                                    {
+                                    let name_resp = ui.selectable_label(
+                                        is_selected,
+                                        egui::RichText::new(&func.name).size(11.0),
+                                    );
+                                    if name_resp.clicked() {
                                         jump = Some(addr);
+                                    }
+                                    name_resp.context_menu(|ui| {
+                                        if ui.button("Add Tag...").clicked() {
+                                            self.focused_address = Some(addr);
+                                            self.tag_active = true;
+                                            self.tag_input.clear();
+                                            ui.close();
+                                        }
+                                        // Show existing tags with remove option
+                                        if let Some(project) = &self.project
+                                            && let Some(tags) = project.tags.get(&addr)
+                                            && !tags.is_empty()
+                                        {
+                                            ui.separator();
+                                            ui.label(egui::RichText::new("Tags:").strong());
+                                            for tag in tags {
+                                                if ui.button(format!("  x  {}", tag)).clicked() {
+                                                    // Will be handled below
+                                                    self.focused_address = Some(addr);
+                                                    self.tag_input = format!("__remove__{}", tag);
+                                                    ui.close();
+                                                }
+                                            }
+                                        }
+                                    });
+                                    // Show tag badges
+                                    if let Some(tags) = project.tags.get(&addr) {
+                                        for tag in tags {
+                                            ui.label(
+                                                egui::RichText::new(tag)
+                                                    .size(9.0)
+                                                    .color(egui::Color32::WHITE)
+                                                    .background_color(egui::Color32::from_rgb(
+                                                        80, 80, 160,
+                                                    )),
+                                            );
+                                        }
                                     }
                                     ui.monospace(
                                         egui::RichText::new(format!("{:X}", size))
@@ -1727,5 +1836,15 @@ fn truncate_str(s: &str, max_len: usize) -> String {
         format!("{}...", &s[..max_len])
     } else {
         s.to_string()
+    }
+}
+
+fn entropy_nav_color(normalized: f32) -> egui::Color32 {
+    if normalized < 0.35 {
+        egui::Color32::from_rgb(50, 80, 180)
+    } else if normalized < 0.7 {
+        egui::Color32::from_rgb(50, 180, 80)
+    } else {
+        egui::Color32::from_rgb(220, 60, 60)
     }
 }

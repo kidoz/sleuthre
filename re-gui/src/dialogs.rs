@@ -12,10 +12,13 @@ impl SleuthreApp {
         self.show_approval_queue(ctx);
         self.show_goto_dialog(ctx);
         self.show_bookmark_dialog(ctx);
+        self.show_tag_dialog(ctx);
+        self.handle_tag_removal();
         self.show_search_dialog(ctx);
         self.show_findings_window(ctx);
         self.show_create_struct_dialog(ctx);
         self.show_add_field_dialog(ctx);
+        self.show_reanalyze_dialog(ctx);
     }
 
     fn show_add_field_dialog(&mut self, ctx: &egui::Context) {
@@ -353,6 +356,74 @@ impl SleuthreApp {
             });
     }
 
+    fn show_tag_dialog(&mut self, ctx: &egui::Context) {
+        if !self.tag_active {
+            return;
+        }
+        let addr = self.focused_address.unwrap_or(self.current_address);
+        egui::Window::new("Add Tag")
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.label(format!("Address: {:08X}", addr));
+                // Show existing tags
+                if let Some(project) = &self.project
+                    && let Some(tags) = project.tags.get(&addr)
+                    && !tags.is_empty()
+                {
+                    ui.label(format!("Current: {}", tags.join(", ")));
+                }
+                // Suggest common tags
+                ui.horizontal(|ui| {
+                    for tag in &[
+                        "crypto",
+                        "network",
+                        "init",
+                        "suspicious",
+                        "interesting",
+                        "vuln",
+                    ] {
+                        if ui.small_button(*tag).clicked() {
+                            self.tag_input = tag.to_string();
+                        }
+                    }
+                });
+                ui.label("Tag:");
+                ui.text_edit_singleline(&mut self.tag_input);
+                ui.horizontal(|ui| {
+                    if ui.button("Add").clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        let tag = self.tag_input.trim().to_string();
+                        if !tag.is_empty() {
+                            if let Some(ref mut project) = self.project {
+                                project.execute(UndoCommand::AddTag { address: addr, tag });
+                            }
+                            self.cached_func_list_dirty = true;
+                        }
+                        self.tag_active = false;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.tag_active = false;
+                    }
+                });
+            });
+    }
+
+    fn handle_tag_removal(&mut self) {
+        if !self.tag_input.starts_with("__remove__") {
+            return;
+        }
+        let tag = self
+            .tag_input
+            .strip_prefix("__remove__")
+            .unwrap()
+            .to_string();
+        let addr = self.focused_address.unwrap_or(self.current_address);
+        if let Some(ref mut project) = self.project {
+            project.execute(UndoCommand::RemoveTag { address: addr, tag });
+        }
+        self.tag_input.clear();
+        self.cached_func_list_dirty = true;
+    }
+
     fn show_search_dialog(&mut self, ctx: &egui::Context) {
         if !self.search_active {
             return;
@@ -477,6 +548,85 @@ impl SleuthreApp {
                 if ui.button("Close").clicked() {
                     self.search_active = false;
                 }
+            });
+    }
+
+    fn show_reanalyze_dialog(&mut self, ctx: &egui::Context) {
+        if !self.reanalyze_active {
+            return;
+        }
+        egui::Window::new("Re-Analyze")
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.label("Select analysis stages to re-run:");
+                ui.separator();
+                ui.checkbox(
+                    &mut self.reanalyze_config.discover_functions,
+                    "Discover Functions",
+                );
+                ui.checkbox(
+                    &mut self.reanalyze_config.recursive_descent,
+                    "Recursive Descent",
+                );
+                ui.checkbox(&mut self.reanalyze_config.scan_strings, "Scan Strings");
+                ui.checkbox(
+                    &mut self.reanalyze_config.scan_xrefs,
+                    "Scan Cross-References",
+                );
+                ui.checkbox(&mut self.reanalyze_config.scan_constants, "Scan Constants");
+                ui.checkbox(
+                    &mut self.reanalyze_config.extract_debug_info,
+                    "Extract Debug Info",
+                );
+                ui.checkbox(
+                    &mut self.reanalyze_config.type_propagation,
+                    "Type Propagation",
+                );
+                ui.checkbox(
+                    &mut self.reanalyze_config.run_analysis_passes,
+                    "Run Analysis Passes",
+                );
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Select All").clicked() {
+                        self.reanalyze_config =
+                            re_core::analysis::pipeline::AnalysisConfig::default();
+                    }
+                    if ui.button("Select None").clicked() {
+                        self.reanalyze_config = re_core::analysis::pipeline::AnalysisConfig {
+                            discover_functions: false,
+                            recursive_descent: false,
+                            scan_strings: false,
+                            scan_xrefs: false,
+                            scan_constants: false,
+                            extract_debug_info: false,
+                            type_propagation: false,
+                            run_analysis_passes: false,
+                        };
+                    }
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Run").clicked() {
+                        if let Some(ref mut project) = self.project {
+                            let config = self.reanalyze_config.clone();
+                            let findings =
+                                re_core::analysis::pipeline::reanalyze(project, &config, |_| {});
+                            if !findings.is_empty() {
+                                self.plugin_findings = findings;
+                            }
+                            self.cached_func_list_dirty = true;
+                        }
+                        self.reanalyze_active = false;
+                        self.add_toast(
+                            crate::app::ToastKind::Success,
+                            "Re-analysis complete.".into(),
+                        );
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.reanalyze_active = false;
+                    }
+                });
             });
     }
 

@@ -1,5 +1,7 @@
 pub mod cfg;
 pub mod constants;
+pub mod diff;
+pub mod entropy;
 pub mod functions;
 pub mod passes;
 pub mod pipeline;

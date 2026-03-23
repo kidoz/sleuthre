@@ -56,6 +56,34 @@ impl SignatureDatabase {
         serde_json::to_string_pretty(self)
     }
 
+    /// Load signatures from a JSON file on disk.
+    pub fn load_from_file(path: &std::path::Path) -> Result<Self, String> {
+        let data = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        serde_json::from_str(&data).map_err(|e| e.to_string())
+    }
+
+    /// Save signatures to a JSON file on disk.
+    pub fn save_to_file(&self, path: &std::path::Path) -> Result<(), String> {
+        let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
+        std::fs::write(path, json).map_err(|e| e.to_string())
+    }
+
+    /// Merge another database into this one (deduplicates by name).
+    pub fn merge(&mut self, other: &SignatureDatabase) {
+        let existing: std::collections::HashSet<String> =
+            self.signatures.iter().map(|s| s.name.clone()).collect();
+        for sig in &other.signatures {
+            if !existing.contains(&sig.name) {
+                self.signatures.push(sig.clone());
+            }
+        }
+    }
+
+    /// Remove a signature by name.
+    pub fn remove_by_name(&mut self, name: &str) {
+        self.signatures.retain(|s| s.name != name);
+    }
+
     /// Add a signature from a hex pattern string.
     /// Pattern format: "55 48 89 E5 ?? ?? 48"  where ?? is a wildcard.
     pub fn add_pattern(&mut self, name: &str, pattern_str: &str, library: &str) {
