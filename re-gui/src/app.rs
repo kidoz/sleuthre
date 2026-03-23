@@ -293,7 +293,7 @@ impl Default for SleuthreApp {
             project: None,
             disasm: None,
             current_cfg: None,
-            output: "Sleuthre v0.1.0 started.\n\
+            output: "Sleuthre v0.2.0 started.\n\
                      Analysis subsystem has been initialized.\n\
                      Hotkeys: F5 decompile, Space graph, N rename, ; comment, X xrefs,\n\
                      Ctrl+G goto, Ctrl+D bookmark, Ctrl+F search, Alt+Left/Right navigate.\n"

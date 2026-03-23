@@ -1,6 +1,6 @@
 # sleuthre
 
-[![GitHub release](https://img.shields.io/github/v/release/kidoz/sleuthre?include_prereleases)](https://github.com/kidoz/sleuthre/releases/latest)
+[![GitHub release](https://img.shields.io/github/v/release/kidoz/sleuthre)](https://github.com/kidoz/sleuthre/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org/)
 
