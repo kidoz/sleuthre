@@ -135,7 +135,7 @@ impl SleuthreApp {
 
             if from_count == 0 {
                 // Also check all instructions within the function range
-                let mut all_outgoing = Vec::new();
+                let mut all_outgoing: Vec<&re_core::analysis::xrefs::Xref> = Vec::new();
                 if let Some(func) = project.functions.functions.get(&func_addr) {
                     let end = func.end_address.unwrap_or(func.start_address + 0x100);
                     for (&from_addr, xrefs) in &project.xrefs.from_address_xrefs {

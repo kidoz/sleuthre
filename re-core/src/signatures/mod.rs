@@ -70,8 +70,23 @@ impl SignatureDatabase {
     }
 
     /// Scan memory for all signature matches.
+    ///
+    /// Uses a first-byte index to avoid testing every signature at every
+    /// offset — only signatures whose first concrete byte matches `data[offset]`
+    /// are tested.
     pub fn scan(&self, memory: &MemoryMap) -> Vec<SignatureMatch> {
         let mut matches = Vec::new();
+
+        // Build first-byte index: byte value -> list of signature indices.
+        // Signatures starting with a wildcard go into a separate "any" bucket.
+        let mut by_first_byte: [Vec<usize>; 256] = std::array::from_fn(|_| Vec::new());
+        let mut wildcard_start: Vec<usize> = Vec::new();
+        for (i, sig) in self.signatures.iter().enumerate() {
+            match sig.pattern.first() {
+                Some(PatternByte::Exact(b)) => by_first_byte[*b as usize].push(i),
+                _ => wildcard_start.push(i),
+            }
+        }
 
         for segment in &memory.segments {
             if !segment
@@ -81,12 +96,19 @@ impl SignatureDatabase {
                 continue;
             }
 
-            for offset in 0..segment.data.len() {
-                for sig in &self.signatures {
-                    if sig.pattern.len() > segment.data.len() - offset {
+            let data = &segment.data;
+            for offset in 0..data.len() {
+                let byte = data[offset];
+                // Test signatures whose first byte matches, plus wildcard-starts
+                for &sig_idx in by_first_byte[byte as usize]
+                    .iter()
+                    .chain(wildcard_start.iter())
+                {
+                    let sig = &self.signatures[sig_idx];
+                    if sig.pattern.len() > data.len() - offset {
                         continue;
                     }
-                    if match_pattern(&segment.data[offset..], &sig.pattern) {
+                    if match_pattern(&data[offset..], &sig.pattern) {
                         matches.push(SignatureMatch {
                             address: segment.start + offset as u64,
                             signature_name: sig.name.clone(),

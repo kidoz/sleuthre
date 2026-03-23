@@ -65,22 +65,37 @@ impl MemoryMap {
         Ok(())
     }
 
+    /// Find the segment index containing `address` using binary search.
+    /// Segments are kept sorted by `start` via `add_segment`.
+    fn find_segment(&self, address: u64) -> Option<usize> {
+        self.segments
+            .binary_search_by(|s| {
+                if address < s.start {
+                    std::cmp::Ordering::Greater
+                } else if address >= s.start.saturating_add(s.size) {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .ok()
+    }
+
     pub fn get_data(&self, address: u64, size: usize) -> Option<&[u8]> {
         let end = address.checked_add(size as u64)?;
-        for segment in &self.segments {
-            let seg_end = segment.start.saturating_add(segment.size);
-            if address >= segment.start && end <= seg_end {
-                let offset = (address - segment.start) as usize;
-                return Some(&segment.data[offset..offset + size]);
-            }
+        let idx = self.find_segment(address)?;
+        let segment = &self.segments[idx];
+        let seg_end = segment.start.saturating_add(segment.size);
+        if end <= seg_end {
+            let offset = (address - segment.start) as usize;
+            Some(&segment.data[offset..offset + size])
+        } else {
+            None
         }
-        None
     }
 
     pub fn contains_address(&self, address: u64) -> bool {
-        self.segments
-            .iter()
-            .any(|s| address >= s.start && address < s.end())
+        self.find_segment(address).is_some()
     }
 
     /// Read a u16 value with endianness awareness
@@ -140,9 +155,10 @@ impl MemoryMap {
         let end = address
             .checked_add(data.len() as u64)
             .ok_or_else(|| Error::Analysis("write_data: address overflow".to_string()))?;
-        for segment in &mut self.segments {
+        if let Some(idx) = self.find_segment(address) {
+            let segment = &mut self.segments[idx];
             let seg_end = segment.start.saturating_add(segment.size);
-            if address >= segment.start && end <= seg_end {
+            if end <= seg_end {
                 let offset = (address - segment.start) as usize;
                 segment.data[offset..offset + data.len()].copy_from_slice(data);
                 return Ok(());

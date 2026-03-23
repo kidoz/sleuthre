@@ -85,11 +85,12 @@ pub fn analyze_binary(
     path: &Path,
     mut on_progress: impl FnMut(AnalysisStage),
 ) -> Result<AnalysisResult> {
-    // --- Load ---
+    // --- Load (read file once, reuse bytes for debug info later) ---
     on_progress(AnalysisStage::LoadingBinary);
-    let loaded = loader::load_binary(path)?;
+    let raw_bytes = std::fs::read(path).map_err(crate::error::Error::Io)?;
+    let loaded = loader::load_binary_from_bytes(&raw_bytes)?;
 
-    analyze_loaded(path, loaded, on_progress)
+    analyze_loaded_with_bytes(path, loaded, &raw_bytes, on_progress)
 }
 
 /// Run the full analysis pipeline on an already-loaded binary.
@@ -97,6 +98,16 @@ pub fn analyze_binary(
 pub fn analyze_loaded(
     path: &Path,
     loaded: LoadedBinary,
+    on_progress: impl FnMut(AnalysisStage),
+) -> Result<AnalysisResult> {
+    let raw_bytes = std::fs::read(path).unwrap_or_default();
+    analyze_loaded_with_bytes(path, loaded, &raw_bytes, on_progress)
+}
+
+fn analyze_loaded_with_bytes(
+    path: &Path,
+    loaded: LoadedBinary,
+    raw_bytes: &[u8],
     mut on_progress: impl FnMut(AnalysisStage),
 ) -> Result<AnalysisResult> {
     let mut project = Project::new(
@@ -132,20 +143,16 @@ pub fn analyze_loaded(
         let _ = project
             .functions
             .discover_functions_recursive(&project.memory_map, ds);
-
-        on_progress(AnalysisStage::ScanningXrefs);
-        let _ = project
-            .xrefs
-            .scan_xrefs(&project.memory_map, ds, &project.functions);
     }
 
-    // --- Strings ---
+    // --- Strings (scan before xrefs so we can do a single unified pass) ---
     on_progress(AnalysisStage::ScanningStrings);
     project.strings.scan_memory(&project.memory_map);
 
+    // --- Xrefs: single pass for code, data, and string xrefs ---
     if let Some(ref ds) = disasm {
-        on_progress(AnalysisStage::StringXrefs);
-        let _ = project.xrefs.scan_string_xrefs(
+        on_progress(AnalysisStage::ScanningXrefs);
+        let _ = project.xrefs.scan_all(
             &project.memory_map,
             ds,
             &project.functions,
@@ -159,8 +166,7 @@ pub fn analyze_loaded(
 
     // --- Debug info ---
     on_progress(AnalysisStage::ExtractingDebugInfo);
-    let bytes = std::fs::read(path).unwrap_or_default();
-    let debug_info = debuginfo::extract_debug_info(&bytes, loaded.arch).unwrap_or_default();
+    let debug_info = debuginfo::extract_debug_info(raw_bytes, loaded.arch).unwrap_or_default();
 
     let pdb_debug = if let Some(ref pdb_path) = loaded.debug_info_path {
         let pdb_candidate = path

@@ -13,7 +13,7 @@ pub enum XrefType {
     StringRef,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Xref {
     pub from_address: u64,
     pub to_address: u64,
@@ -43,7 +43,7 @@ impl XrefManager {
         self.to_address_xrefs
             .entry(xref.to_address)
             .or_default()
-            .push(xref.clone());
+            .push(xref);
         self.from_address_xrefs
             .entry(xref.from_address)
             .or_default()
@@ -56,14 +56,28 @@ impl XrefManager {
         disasm: &Disassembler,
         functions: &crate::analysis::functions::FunctionManager,
     ) -> Result<()> {
+        self.scan_all(memory, disasm, functions, &[])
+    }
+
+    /// Unified single-pass scan: collects code xrefs, data xrefs, and string
+    /// xrefs in one disassembly walk. Pass an empty slice for `strings` to
+    /// skip string-ref detection.
+    pub fn scan_all(
+        &mut self,
+        memory: &MemoryMap,
+        disasm: &Disassembler,
+        functions: &crate::analysis::functions::FunctionManager,
+        strings: &[crate::analysis::strings::DiscoveredString],
+    ) -> Result<()> {
         self.to_address_xrefs.clear();
         self.from_address_xrefs.clear();
 
-        // Build sorted function starts for boundary detection
+        let string_addrs: std::collections::HashSet<u64> =
+            strings.iter().map(|s| s.address).collect();
+
         let func_starts: Vec<u64> = functions.functions.keys().copied().collect();
 
         for (idx, &start_addr) in func_starts.iter().enumerate() {
-            // Use next function start as boundary, fallback to 0x10000 bytes
             let end_boundary = func_starts
                 .get(idx + 1)
                 .copied()
@@ -79,29 +93,20 @@ impl XrefManager {
                 let mnemonic = insn.mnemonic.to_lowercase();
 
                 // Code xrefs: call/jump targets
-                if (mnemonic == "call" || mnemonic.starts_with('j'))
-                    && let Some(target_addr) = parse_address(&insn.op_str)
-                {
-                    let xref_type = if mnemonic == "call" {
-                        XrefType::Call
-                    } else {
-                        XrefType::Jump
-                    };
-                    self.add_xref(Xref {
-                        from_address: insn.address,
-                        to_address: target_addr,
-                        xref_type,
-                    });
-                }
-
-                // Indirect call/jump resolution via import table
-                // Pattern: call qword ptr [0xADDRESS] where ADDRESS is in GOT/IAT
-                if (mnemonic == "call" || mnemonic.starts_with('j'))
-                    && insn.op_str.contains('[')
-                    && parse_address(&insn.op_str).is_none()
-                {
-                    // Try to extract the memory address from brackets
-                    if let Some(target_addr) = parse_hex_from_bracket(&insn.op_str)
+                if mnemonic == "call" || mnemonic.starts_with('j') {
+                    if let Some(target_addr) = parse_address(&insn.op_str) {
+                        let xref_type = if mnemonic == "call" {
+                            XrefType::Call
+                        } else {
+                            XrefType::Jump
+                        };
+                        self.add_xref(Xref {
+                            from_address: insn.address,
+                            to_address: target_addr,
+                            xref_type,
+                        });
+                    } else if insn.op_str.contains('[')
+                        && let Some(target_addr) = parse_hex_from_bracket(&insn.op_str)
                         && memory.contains_address(target_addr)
                     {
                         let xref_type = if mnemonic == "call" {
@@ -117,8 +122,32 @@ impl XrefManager {
                     }
                 }
 
-                // Data xrefs: memory access patterns like [0xHEX]
+                // Data xrefs
                 self.extract_data_xrefs(&insn.mnemonic, &insn.op_str, insn.address, memory);
+
+                // String xrefs (only when string addresses are provided)
+                if !string_addrs.is_empty() {
+                    if (mnemonic == "lea" || mnemonic == "adr" || mnemonic == "adrp")
+                        && let Some(target) = self.extract_effective_address(&insn, addr)
+                        && string_addrs.contains(&target)
+                    {
+                        self.add_xref(Xref {
+                            from_address: insn.address,
+                            to_address: target,
+                            xref_type: XrefType::StringRef,
+                        });
+                    }
+                    if (mnemonic == "mov" || mnemonic == "movabs")
+                        && let Some(target) = parse_address_from_operands(&insn.op_str)
+                        && string_addrs.contains(&target)
+                    {
+                        self.add_xref(Xref {
+                            from_address: insn.address,
+                            to_address: target,
+                            xref_type: XrefType::StringRef,
+                        });
+                    }
+                }
 
                 if mnemonic == "ret" || mnemonic == "retn" {
                     break;

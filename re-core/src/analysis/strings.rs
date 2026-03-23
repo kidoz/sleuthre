@@ -45,42 +45,47 @@ impl StringsManager {
     }
 
     fn scan_ascii(&mut self, segment: &crate::memory::MemorySegment) {
-        let mut current_string = Vec::new();
-        let mut start_addr = 0u64;
+        let mut run_start = 0usize;
+        let mut in_run = false;
 
-        for (offset, &byte) in segment.data.iter().enumerate() {
+        let data = &segment.data;
+        for (offset, &byte) in data.iter().enumerate() {
             if Self::is_printable_ascii(byte) {
-                if current_string.is_empty() {
-                    start_addr = segment.start + offset as u64;
+                if !in_run {
+                    run_start = offset;
+                    in_run = true;
                 }
-                current_string.push(byte);
-            } else {
-                if current_string.len() >= self.min_length
-                    && let Ok(value) = String::from_utf8(current_string.clone())
+            } else if in_run {
+                let run = &data[run_start..offset];
+                if run.len() >= self.min_length
+                    && let Ok(s) = std::str::from_utf8(run)
                 {
                     self.strings.push(DiscoveredString {
-                        address: start_addr,
-                        value,
-                        length: current_string.len(),
+                        address: segment.start + run_start as u64,
+                        value: s.to_string(),
+                        length: run.len(),
                         section_name: segment.name.clone(),
                         encoding: StringEncoding::Ascii,
                     });
                 }
-                current_string.clear();
+                in_run = false;
             }
         }
 
-        // Flush buffer at end of segment
-        if current_string.len() >= self.min_length
-            && let Ok(value) = String::from_utf8(current_string.clone())
-        {
-            self.strings.push(DiscoveredString {
-                address: start_addr,
-                value,
-                length: current_string.len(),
-                section_name: segment.name.clone(),
-                encoding: StringEncoding::Ascii,
-            });
+        // Flush at end of segment
+        if in_run {
+            let run = &data[run_start..];
+            if run.len() >= self.min_length
+                && let Ok(s) = std::str::from_utf8(run)
+            {
+                self.strings.push(DiscoveredString {
+                    address: segment.start + run_start as u64,
+                    value: s.to_string(),
+                    length: run.len(),
+                    section_name: segment.name.clone(),
+                    encoding: StringEncoding::Ascii,
+                });
+            }
         }
     }
 
