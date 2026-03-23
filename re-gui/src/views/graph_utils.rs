@@ -133,11 +133,19 @@ impl GenericGraph {
 
         // --- Compute sizes and positions ---
         let is_compact = options.layout_mode == crate::app::GraphLayoutMode::Compact;
-        let node_width = if is_compact { 240.0 } else { 300.0 };
+        let min_node_width: f32 = if is_compact { 140.0 } else { 180.0 };
+        let char_width: f32 = 7.0; // approximate monospace char width at base size
+        let node_padding: f32 = 16.0; // horizontal padding inside node
+
         let mut node_sizes: HashMap<NodeIndex, egui::Vec2> = HashMap::new();
         for node_idx in self.graph.node_indices() {
             let node = &self.graph[node_idx];
-            let w = node_width * zoom_val;
+            let max_chars = node
+                .title
+                .len()
+                .max(node.lines.iter().map(|l| l.len()).max().unwrap_or(0));
+            let content_w = max_chars as f32 * char_width + node_padding;
+            let w = content_w.max(min_node_width) * zoom_val;
             let h = (node.lines.len() as f32 * 16.0 * zoom_val) + 28.0 * zoom_val;
             node_sizes.insert(node_idx, egui::vec2(w, h));
         }
@@ -162,7 +170,8 @@ impl GenericGraph {
             layer_heights[i] = max_h;
         }
 
-        let canvas_width = layer_widths.iter().copied().fold(0.0f32, f32::max) + padding * 2.0;
+        let canvas_width = (layer_widths.iter().copied().fold(0.0f32, f32::max) + padding * 2.0)
+            .max(available_size.x);
         let mut node_pos: HashMap<NodeIndex, egui::Pos2> = HashMap::new();
         let mut current_y = padding;
 
