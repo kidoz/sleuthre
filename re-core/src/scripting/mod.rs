@@ -12,6 +12,54 @@ pub enum ScriptAction {
     Print(String),
 }
 
+#[derive(Clone)]
+pub struct BinaryFile {
+    data: Rc<Vec<u8>>,
+}
+
+impl BinaryFile {
+    pub fn read_u32_le(&mut self, offset: i64) -> Result<i64, Box<EvalAltResult>> {
+        if offset < 0 || offset as usize + 4 > self.data.len() {
+            return Err(Box::new(EvalAltResult::from("out of bounds")));
+        }
+        let val = u32::from_le_bytes(
+            self.data[offset as usize..offset as usize + 4]
+                .try_into()
+                .unwrap(),
+        );
+        Ok(val as i64)
+    }
+
+    pub fn read_u16_le(&mut self, offset: i64) -> Result<i64, Box<EvalAltResult>> {
+        if offset < 0 || offset as usize + 2 > self.data.len() {
+            return Err(Box::new(EvalAltResult::from("out of bounds")));
+        }
+        let val = u16::from_le_bytes(
+            self.data[offset as usize..offset as usize + 2]
+                .try_into()
+                .unwrap(),
+        );
+        Ok(val as i64)
+    }
+
+    pub fn read_string(&mut self, offset: i64, len: i64) -> Result<String, Box<EvalAltResult>> {
+        if offset < 0 || len < 0 || offset as usize + len as usize > self.data.len() {
+            return Err(Box::new(EvalAltResult::from("out of bounds")));
+        }
+        let slice = &self.data[offset as usize..offset as usize + len as usize];
+        let null_pos = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
+        Ok(String::from_utf8_lossy(&slice[..null_pos]).to_string())
+    }
+
+    pub fn len(&mut self) -> i64 {
+        self.data.len() as i64
+    }
+
+    pub fn is_empty(&mut self) -> bool {
+        self.data.is_empty()
+    }
+}
+
 pub struct ScriptEngine {
     engine: Engine,
 }
@@ -28,6 +76,21 @@ impl ScriptEngine {
 
         // Register hex formatting helper
         engine.register_fn("hex", |n: i64| format!("0x{:x}", n));
+
+        // Register BinaryFile type and methods
+        engine.register_type_with_name::<BinaryFile>("BinaryFile");
+        engine.register_fn(
+            "open_binary",
+            |path: rhai::ImmutableString| -> Result<BinaryFile, Box<EvalAltResult>> {
+                let data = std::fs::read(path.as_str())
+                    .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?;
+                Ok(BinaryFile { data: Rc::new(data) })
+            },
+        );
+        engine.register_fn("read_u32_le", BinaryFile::read_u32_le);
+        engine.register_fn("read_u16_le", BinaryFile::read_u16_le);
+        engine.register_fn("read_string", BinaryFile::read_string);
+        engine.register_fn("len", BinaryFile::len);
 
         Self { engine }
     }
@@ -224,5 +287,47 @@ mod tests {
             .unwrap();
         assert_eq!(result.actions.len(), 1);
         assert!(matches!(&result.actions[0], ScriptAction::Print(msg) if msg == "hello world"));
+    }
+
+    #[test]
+    fn eval_binary_file() {
+        use std::io::Write;
+        
+        let mut engine = ScriptEngine::new();
+        let mut project = Project::new("test".into(), PathBuf::from("/tmp/test"));
+        
+        // Create a temporary file
+        let temp_dir = std::env::temp_dir();
+        let file_path = temp_dir.join("test_bin_file.bin");
+        let mut file = std::fs::File::create(&file_path).unwrap();
+        
+        // Write data: [0x78, 0x56, 0x34, 0x12] = 0x12345678 u32
+        // Write data: [0xef, 0xbe] = 0xbeef u16
+        // Write data: "test\0"
+        file.write_all(&[0x78, 0x56, 0x34, 0x12, 0xef, 0xbe, b't', b'e', b's', b't', 0x00]).unwrap();
+        
+        let path_str = file_path.to_str().unwrap().replace("\\", "\\\\");
+        
+        let script = format!(r#"
+            let f = open_binary("{}");
+            let len = f.len();
+            let val32 = f.read_u32_le(0);
+            let val16 = f.read_u16_le(4);
+            let s = f.read_string(6, 4);
+            println(len.to_string());
+            println(val32.to_string());
+            println(val16.to_string());
+            println(s);
+        "#, path_str);
+        
+        let result = engine.eval(&script, &mut project).unwrap();
+        assert_eq!(result.actions.len(), 4);
+        
+        if let ScriptAction::Print(msg) = &result.actions[0] { assert_eq!(msg, "11"); } else { panic!("expected print"); }
+        if let ScriptAction::Print(msg) = &result.actions[1] { assert_eq!(msg, "305419896"); } else { panic!("expected print"); } // 0x12345678
+        if let ScriptAction::Print(msg) = &result.actions[2] { assert_eq!(msg, "48879"); } else { panic!("expected print"); } // 0xbeef
+        if let ScriptAction::Print(msg) = &result.actions[3] { assert_eq!(msg, "test"); } else { panic!("expected print"); }
+        
+        std::fs::remove_file(file_path).unwrap();
     }
 }
