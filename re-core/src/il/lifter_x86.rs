@@ -135,6 +135,14 @@ fn lift_instruction(func: &mut LlilFunction, insn: &Instruction) -> Vec<LlilStmt
         "call" => lift_call(func, &ops),
         "ret" | "retn" => vec![LlilStmt::Return],
 
+        // --- x87 FPU ---
+        "fld" | "fild" => lift_fpu_load(func, &ops),
+        "fst" | "fstp" | "fist" | "fistp" => lift_fpu_store(func, &ops),
+        "fadd" | "faddp" | "fiadd" => lift_fpu_binop(func, BinOp::FAdd, &ops),
+        "fsub" | "fsubp" | "fisub" => lift_fpu_binop(func, BinOp::FSub, &ops),
+        "fmul" | "fmulp" | "fimul" => lift_fpu_binop(func, BinOp::FMul, &ops),
+        "fdiv" | "fdivp" | "fidiv" => lift_fpu_binop(func, BinOp::FDiv, &ops),
+
         // --- SIMD / Vector ---
         _ => {
             if let Some(stmts) = lift_simd_instruction(func, &mn, &insn.op_str) {
@@ -539,6 +547,65 @@ fn lift_call(func: &mut LlilFunction, ops: &[&str]) -> Vec<LlilStmt> {
     }
     let target = parse_operand(func, ops[0]);
     vec![LlilStmt::Call { target }]
+}
+
+// ---------------------------------------------------------------------------
+// x87 FPU lifter helpers (heuristic approximations using st0)
+// ---------------------------------------------------------------------------
+
+fn lift_fpu_load(func: &mut LlilFunction, ops: &[&str]) -> Vec<LlilStmt> {
+    if ops.is_empty() {
+        return vec![LlilStmt::Nop];
+    }
+    let src = parse_operand(func, ops[0]);
+    vec![LlilStmt::SetReg {
+        dest: "st0".to_string(),
+        src,
+    }]
+}
+
+fn lift_fpu_store(func: &mut LlilFunction, ops: &[&str]) -> Vec<LlilStmt> {
+    if ops.is_empty() {
+        return vec![LlilStmt::Nop];
+    }
+    let val = func.reg("st0");
+    if dest_is_reg(ops[0]) {
+        vec![LlilStmt::SetReg {
+            dest: ops[0].trim().to_string(),
+            src: val,
+        }]
+    } else {
+        let addr_inner = extract_mem_operand(ops[0]).unwrap_or(ops[0]);
+        let addr = parse_address_expr(func, addr_inner);
+        let size = mem_size_prefix(ops[0]);
+        vec![LlilStmt::Store {
+            addr,
+            value: val,
+            size,
+        }]
+    }
+}
+
+fn lift_fpu_binop(func: &mut LlilFunction, op: BinOp, ops: &[&str]) -> Vec<LlilStmt> {
+    let (dest_reg, src_expr) = if ops.is_empty() {
+        // e.g. faddp -> implies st1, st0 but we simplify to st0 = st0 + st1
+        ("st0".to_string(), func.reg("st1"))
+    } else if ops.len() == 1 {
+        // fadd [addr] -> st0 = st0 + [addr]
+        ("st0".to_string(), parse_operand(func, ops[0]))
+    } else {
+        // fadd st0, st1 -> st0 = st0 + st1
+        let dest = ops[0].trim().to_string();
+        let src = parse_operand(func, ops[1]);
+        (dest, src)
+    };
+    
+    let dest_expr = func.reg(&dest_reg);
+    let binop = func.binop(op, dest_expr, src_expr);
+    vec![LlilStmt::SetReg {
+        dest: dest_reg,
+        src: binop,
+    }]
 }
 
 // ---------------------------------------------------------------------------
@@ -994,6 +1061,34 @@ mod tests {
             op_str: op.to_string(),
             groups: vec![],
         }
+    }
+
+    #[test]
+    fn lift_fpu_instructions() {
+        let insns = [
+            make_insn(0x1000, "fld", "dword ptr [rax]"),
+            make_insn(0x1004, "fadd", "st0, st1"),
+            make_insn(0x1008, "fstp", "dword ptr [rbx]"),
+        ];
+        let func = lift_function("test", 0x1000, &insns);
+        
+        // fld
+        assert!(matches!(
+            &func.instructions[0].stmts[0],
+            LlilStmt::SetReg { dest, .. } if dest == "st0"
+        ));
+        
+        // fadd
+        assert!(matches!(
+            &func.instructions[1].stmts[0],
+            LlilStmt::SetReg { dest, .. } if dest == "st0"
+        ));
+        
+        // fstp
+        assert!(matches!(
+            &func.instructions[2].stmts[0],
+            LlilStmt::Store { .. }
+        ));
     }
 
     #[test]

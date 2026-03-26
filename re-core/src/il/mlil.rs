@@ -244,12 +244,12 @@ pub fn fold_constants(expr: &MlilExpr) -> MlilExpr {
             }
             // Identity simplifications
             match op {
-                BinOp::Add if right == MlilExpr::Const(0) => return left,
-                BinOp::Add if left == MlilExpr::Const(0) => return right,
-                BinOp::Sub if right == MlilExpr::Const(0) => return left,
-                BinOp::Mul if right == MlilExpr::Const(1) => return left,
-                BinOp::Mul if left == MlilExpr::Const(1) => return right,
-                BinOp::Mul if right == MlilExpr::Const(0) || left == MlilExpr::Const(0) => {
+                BinOp::Add | BinOp::FAdd if right == MlilExpr::Const(0) => return left,
+                BinOp::Add | BinOp::FAdd if left == MlilExpr::Const(0) => return right,
+                BinOp::Sub | BinOp::FSub if right == MlilExpr::Const(0) => return left,
+                BinOp::Mul | BinOp::FMul if right == MlilExpr::Const(1) => return left,
+                BinOp::Mul | BinOp::FMul if left == MlilExpr::Const(1) => return right,
+                BinOp::Mul | BinOp::FMul if right == MlilExpr::Const(0) || left == MlilExpr::Const(0) => {
                     return MlilExpr::Const(0);
                 }
                 _ => {}
