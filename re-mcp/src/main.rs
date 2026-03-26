@@ -897,6 +897,79 @@ impl McpServer {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initialize_returns_protocol_version() {
+        let mut server = McpServer::new();
+        let req = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"});
+        let resp = server.handle_request(req);
+        let version = resp["result"]["protocolVersion"].as_str().unwrap();
+        assert_eq!(version, "2024-11-05");
+        assert_eq!(resp["result"]["serverInfo"]["name"], "sleuthre-core");
+    }
+
+    #[test]
+    fn tools_list_returns_tools() {
+        let mut server = McpServer::new();
+        let req = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+        let resp = server.handle_request(req);
+        let tools = resp["result"]["tools"].as_array().unwrap();
+        assert!(!tools.is_empty());
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(names.contains(&"open_binary"));
+        assert!(names.contains(&"get_disasm"));
+        assert!(names.contains(&"get_xrefs"));
+    }
+
+    #[test]
+    fn unknown_method_returns_error() {
+        let mut server = McpServer::new();
+        let req = json!({"jsonrpc": "2.0", "id": 1, "method": "nonexistent"});
+        let resp = server.handle_request(req);
+        assert!(resp["error"].is_object());
+        assert_eq!(resp["error"]["code"], -32601);
+    }
+
+    #[test]
+    fn tool_call_without_project_returns_error() {
+        let mut server = McpServer::new();
+        let req = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "tools/call",
+            "params": {"name": "get_disasm", "arguments": {"address": 0}}
+        });
+        let resp = server.handle_request(req);
+        assert!(resp["error"].is_object(), "Expected error response");
+        let msg = resp["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            msg.to_lowercase().contains("no project"),
+            "Expected 'no project' error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn helper_tool_text_result_format() {
+        let id = json!(42);
+        let resp = tool_text_result(&id, "hello");
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(resp["id"], 42);
+        assert_eq!(resp["result"]["content"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn helper_missing_param_error_format() {
+        let id = json!(1);
+        let resp = missing_param_error(&id, "path");
+        assert_eq!(resp["error"]["code"], -32602);
+        let msg = resp["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("path"));
+    }
+}
+
 fn main() -> Result<()> {
     let mut server = McpServer::new();
     let stdin = io::stdin();

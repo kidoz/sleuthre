@@ -1,6 +1,6 @@
 use eframe::egui;
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub(crate) enum ThemeMode {
     Light,
     Dark,
@@ -232,5 +232,39 @@ pub(crate) fn apply_theme(ctx: &egui::Context, mode: ThemeMode) {
             visuals.faint_bg_color = egui::Color32::from_rgb(7, 54, 66);
             ctx.set_visuals(visuals);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_themes_produce_distinct_colors() {
+        let dark = SyntaxColors::for_theme(ThemeMode::Dark);
+        let light = SyntaxColors::for_theme(ThemeMode::Light);
+        let solar = SyntaxColors::for_theme(ThemeMode::Solarized);
+        // Each theme should produce a different text color
+        assert_ne!(dark.text, light.text);
+        assert_ne!(dark.text, solar.text);
+    }
+
+    #[test]
+    fn dark_theme_has_light_text() {
+        let dark = SyntaxColors::for_theme(ThemeMode::Dark);
+        assert!(dark.text.r() > 150 && dark.text.g() > 150 && dark.text.b() > 150);
+    }
+
+    #[test]
+    fn light_theme_has_dark_text() {
+        let light = SyntaxColors::for_theme(ThemeMode::Light);
+        assert!(light.text.r() < 100 && light.text.g() < 100 && light.text.b() < 100);
+    }
+
+    #[test]
+    fn theme_mode_equality() {
+        assert_eq!(ThemeMode::Dark, ThemeMode::Dark);
+        assert_ne!(ThemeMode::Dark, ThemeMode::Light);
+        assert_ne!(ThemeMode::Light, ThemeMode::Solarized);
     }
 }
