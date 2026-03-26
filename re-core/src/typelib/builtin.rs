@@ -1,5 +1,5 @@
 use crate::typelib::TypeLibrary;
-use crate::types::{FunctionParameter, FunctionSignature, PrimitiveType, TypeRef};
+use crate::types::{CompoundType, FunctionParameter, FunctionSignature, PrimitiveType, StructField, TypeRef};
 use std::collections::BTreeMap;
 
 /// Helper to build a TypeRef for `const char*`
@@ -832,12 +832,12 @@ pub fn win32_library() -> TypeLibrary {
         ),
         sig(
             "MessageBoxW",
-            i32t,
+            i32t.clone(),
             vec![
-                ("hWnd", handle),
+                ("hWnd", handle.clone()),
                 ("lpText", const_wchar_ptr.clone()),
                 ("lpCaption", const_wchar_ptr),
-                ("uType", u32t),
+                ("uType", u32t.clone()),
             ],
             false,
         ),
@@ -847,10 +847,118 @@ pub fn win32_library() -> TypeLibrary {
         sigs.insert(name, s);
     }
 
+    let mut types = BTreeMap::new();
+
+    types.insert(
+        "POINT".to_string(),
+        CompoundType::Struct {
+            name: "POINT".to_string(),
+            fields: vec![
+                StructField { name: "x".to_string(), type_ref: i32t.clone(), offset: 0, bit_offset: None, bit_size: None },
+                StructField { name: "y".to_string(), type_ref: i32t.clone(), offset: 4, bit_offset: None, bit_size: None },
+            ],
+            size: 8,
+        },
+    );
+
+    types.insert(
+        "RECT".to_string(),
+        CompoundType::Struct {
+            name: "RECT".to_string(),
+            fields: vec![
+                StructField { name: "left".to_string(), type_ref: i32t.clone(), offset: 0, bit_offset: None, bit_size: None },
+                StructField { name: "top".to_string(), type_ref: i32t.clone(), offset: 4, bit_offset: None, bit_size: None },
+                StructField { name: "right".to_string(), type_ref: i32t.clone(), offset: 8, bit_offset: None, bit_size: None },
+                StructField { name: "bottom".to_string(), type_ref: i32t.clone(), offset: 12, bit_offset: None, bit_size: None },
+            ],
+            size: 16,
+        },
+    );
+
+    types.insert(
+        "MSG".to_string(),
+        CompoundType::Struct {
+            name: "MSG".to_string(),
+            fields: vec![
+                StructField { name: "hwnd".to_string(), type_ref: handle.clone(), offset: 0, bit_offset: None, bit_size: None },
+                StructField { name: "message".to_string(), type_ref: u32t.clone(), offset: 4, bit_offset: None, bit_size: None },
+                StructField { name: "wParam".to_string(), type_ref: sizet.clone(), offset: 8, bit_offset: None, bit_size: None },
+                StructField { name: "lParam".to_string(), type_ref: sizet.clone(), offset: 12, bit_offset: None, bit_size: None },
+                StructField { name: "time".to_string(), type_ref: u32t.clone(), offset: 16, bit_offset: None, bit_size: None },
+                StructField { name: "pt".to_string(), type_ref: TypeRef::Named("POINT".to_string()), offset: 20, bit_offset: None, bit_size: None },
+            ],
+            size: 28,
+        },
+    );
+
+    types.insert(
+        "IDirectDrawSurface7Vtbl".to_string(),
+        CompoundType::Struct {
+            name: "IDirectDrawSurface7Vtbl".to_string(),
+            fields: vec![
+                StructField {
+                    name: "QueryInterface".to_string(),
+                    type_ref: TypeRef::FunctionPointer {
+                        return_type: Box::new(i32t.clone()),
+                        params: vec![
+                            TypeRef::Pointer(Box::new(TypeRef::Named("IDirectDrawSurface7".to_string()))),
+                            void_ptr(),
+                            TypeRef::Pointer(Box::new(void_ptr())),
+                        ],
+                        is_variadic: false,
+                    },
+                    offset: 0,
+                    bit_offset: None,
+                    bit_size: None,
+                },
+                StructField {
+                    name: "AddRef".to_string(),
+                    type_ref: TypeRef::FunctionPointer {
+                        return_type: Box::new(u32t.clone()),
+                        params: vec![TypeRef::Pointer(Box::new(TypeRef::Named("IDirectDrawSurface7".to_string())))],
+                        is_variadic: false,
+                    },
+                    offset: 4,
+                    bit_offset: None,
+                    bit_size: None,
+                },
+                StructField {
+                    name: "Release".to_string(),
+                    type_ref: TypeRef::FunctionPointer {
+                        return_type: Box::new(u32t.clone()),
+                        params: vec![TypeRef::Pointer(Box::new(TypeRef::Named("IDirectDrawSurface7".to_string())))],
+                        is_variadic: false,
+                    },
+                    offset: 8,
+                    bit_offset: None,
+                    bit_size: None,
+                },
+            ],
+            size: 12,
+        },
+    );
+
+    types.insert(
+        "IDirectDrawSurface7".to_string(),
+        CompoundType::Struct {
+            name: "IDirectDrawSurface7".to_string(),
+            fields: vec![
+                StructField {
+                    name: "lpVtbl".to_string(),
+                    type_ref: TypeRef::Pointer(Box::new(TypeRef::Named("IDirectDrawSurface7Vtbl".to_string()))),
+                    offset: 0,
+                    bit_offset: None,
+                    bit_size: None,
+                }
+            ],
+            size: 4,
+        },
+    );
+
     TypeLibrary {
         name: "win32".to_string(),
         platform: "windows".to_string(),
-        types: BTreeMap::new(),
+        types,
         function_signatures: sigs,
     }
 }
