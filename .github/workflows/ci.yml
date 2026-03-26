@@ -38,6 +38,8 @@ jobs:
   release-macos:
     name: Release macOS ARM64
     runs-on: macos-15
+    permissions:
+      contents: write
     if: startsWith(github.ref, 'refs/tags/v')
     needs: check
     steps:
