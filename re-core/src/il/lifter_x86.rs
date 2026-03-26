@@ -599,7 +599,7 @@ fn lift_fpu_binop(func: &mut LlilFunction, op: BinOp, ops: &[&str]) -> Vec<LlilS
         let src = parse_operand(func, ops[1]);
         (dest, src)
     };
-    
+
     let dest_expr = func.reg(&dest_reg);
     let binop = func.binop(op, dest_expr, src_expr);
     vec![LlilStmt::SetReg {
@@ -1071,19 +1071,19 @@ mod tests {
             make_insn(0x1008, "fstp", "dword ptr [rbx]"),
         ];
         let func = lift_function("test", 0x1000, &insns);
-        
+
         // fld
         assert!(matches!(
             &func.instructions[0].stmts[0],
             LlilStmt::SetReg { dest, .. } if dest == "st0"
         ));
-        
+
         // fadd
         assert!(matches!(
             &func.instructions[1].stmts[0],
             LlilStmt::SetReg { dest, .. } if dest == "st0"
         ));
-        
+
         // fstp
         assert!(matches!(
             &func.instructions[2].stmts[0],

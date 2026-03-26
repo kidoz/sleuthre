@@ -86,7 +86,7 @@ mod tests {
         assert!(!mgr.libraries.is_empty());
         assert!(mgr.resolve_function("CreateFileW").is_some());
         assert!(mgr.resolve_function("VirtualAlloc").is_some());
-        
+
         // Check new Win32 & DirectX types
         assert!(mgr.resolve_type("POINT").is_some());
         assert!(mgr.resolve_type("RECT").is_some());

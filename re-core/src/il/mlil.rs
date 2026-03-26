@@ -249,7 +249,9 @@ pub fn fold_constants(expr: &MlilExpr) -> MlilExpr {
                 BinOp::Sub | BinOp::FSub if right == MlilExpr::Const(0) => return left,
                 BinOp::Mul | BinOp::FMul if right == MlilExpr::Const(1) => return left,
                 BinOp::Mul | BinOp::FMul if left == MlilExpr::Const(1) => return right,
-                BinOp::Mul | BinOp::FMul if right == MlilExpr::Const(0) || left == MlilExpr::Const(0) => {
+                BinOp::Mul | BinOp::FMul
+                    if right == MlilExpr::Const(0) || left == MlilExpr::Const(0) =>
+                {
                     return MlilExpr::Const(0);
                 }
                 _ => {}

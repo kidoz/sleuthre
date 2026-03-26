@@ -657,7 +657,13 @@ fn write_expr_prec(w: &mut SourceWriter, expr: &HlilExpr, parent_prec: u8) {
 /// Higher values bind more tightly.
 fn op_precedence(op: &BinOp) -> u8 {
     match op {
-        BinOp::Mul | BinOp::UDiv | BinOp::SDiv | BinOp::UMod | BinOp::SMod | BinOp::FMul | BinOp::FDiv => 10,
+        BinOp::Mul
+        | BinOp::UDiv
+        | BinOp::SDiv
+        | BinOp::UMod
+        | BinOp::SMod
+        | BinOp::FMul
+        | BinOp::FDiv => 10,
         BinOp::Add | BinOp::Sub | BinOp::FAdd | BinOp::FSub => 9,
         BinOp::Shl | BinOp::Shr | BinOp::Sar => 8,
         BinOp::CmpEq
