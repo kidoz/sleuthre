@@ -38,6 +38,9 @@ const ARM64_ARG_REGS: &[&str] = &["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"
 /// Registers that hold the return value on x86/x86_64.
 const X86_64_RETURN_REGS: &[&str] = &["rax", "eax"];
 
+/// ABI argument registers for x86 (thiscall/fastcall potential registers). Cdecl uses stack.
+const X86_ARG_REGS: &[&str] = &["ecx", "edx"];
+
 /// Registers that hold the return value on ARM64.
 const ARM64_RETURN_REGS: &[&str] = &["x0"];
 
@@ -149,6 +152,7 @@ fn detect_parameters(
     let abi_regs: &[&str] = match arch {
         crate::arch::Architecture::Arm64 => ARM64_ARG_REGS,
         crate::arch::Architecture::X86_64 => X86_64_ARG_REGS,
+        crate::arch::Architecture::X86 => X86_ARG_REGS,
         _ => return vec![],
     };
 

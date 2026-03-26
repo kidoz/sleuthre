@@ -14,6 +14,7 @@ pub enum CallingConvention {
     Cdecl,
     Stdcall,
     Fastcall,
+    Thiscall,
     SysVAmd64,
     Win64,
     ArmAapcs,
@@ -26,6 +27,7 @@ impl std::fmt::Display for CallingConvention {
             CallingConvention::Cdecl => "cdecl",
             CallingConvention::Stdcall => "stdcall",
             CallingConvention::Fastcall => "fastcall",
+            CallingConvention::Thiscall => "thiscall",
             CallingConvention::SysVAmd64 => "sysv_amd64",
             CallingConvention::Win64 => "win64",
             CallingConvention::ArmAapcs => "arm_aapcs",
@@ -479,7 +481,7 @@ fn detect_calling_convention(
     let mut frame_size: u64 = 0;
 
     // Default convention based on architecture
-    let default_cc = match arch {
+    let mut default_cc = match arch {
         Architecture::X86_64 => CallingConvention::SysVAmd64,
         Architecture::X86 => CallingConvention::Cdecl,
         Architecture::Arm | Architecture::Arm64 => CallingConvention::ArmAapcs,
@@ -491,9 +493,30 @@ fn detect_calling_convention(
         return (default_cc, 0);
     };
 
+    let mut ecx_written = false;
+    let mut edx_written = false;
+
     for insn in insns.iter().take(20) {
         let mn = insn.mnemonic.to_lowercase();
         let ops = &insn.op_str;
+
+        if arch == Architecture::X86 {
+            // Very basic heuristic for thiscall/fastcall on x86
+            if !ecx_written && ops.contains("ecx") {
+                if mn == "mov" && ops.starts_with("ecx,") {
+                    ecx_written = true;
+                } else if default_cc == CallingConvention::Cdecl {
+                    default_cc = CallingConvention::Thiscall; // Likely thiscall
+                }
+            }
+            if !edx_written && ops.contains("edx") {
+                if mn == "mov" && ops.starts_with("edx,") {
+                    edx_written = true;
+                } else if default_cc == CallingConvention::Thiscall {
+                    default_cc = CallingConvention::Fastcall; // Both ecx and edx used
+                }
+            }
+        }
 
         // Detect stack frame allocation: sub rsp/esp, N
         if mn == "sub" {
@@ -587,4 +610,21 @@ fn is_padding(mnemonic: &str, bytes: &[u8]) -> bool {
         return true;
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_calling_convention_display() {
+        assert_eq!(CallingConvention::Unknown.to_string(), "unknown");
+        assert_eq!(CallingConvention::Cdecl.to_string(), "cdecl");
+        assert_eq!(CallingConvention::Stdcall.to_string(), "stdcall");
+        assert_eq!(CallingConvention::Fastcall.to_string(), "fastcall");
+        assert_eq!(CallingConvention::Thiscall.to_string(), "thiscall");
+        assert_eq!(CallingConvention::SysVAmd64.to_string(), "sysv_amd64");
+        assert_eq!(CallingConvention::Win64.to_string(), "win64");
+        assert_eq!(CallingConvention::ArmAapcs.to_string(), "arm_aapcs");
+    }
 }
