@@ -343,95 +343,112 @@ impl Project {
         if needs_new_db {
             self.db = Some(Database::open(db_path)?);
         }
+
+        // Update project path so auto-save targets the same file.
+        self.path = db_path.with_extension("").to_path_buf();
+
         let db = self.db.as_ref().unwrap();
 
-        // Clear all tables before re-inserting to prevent stale rows.
-        db.clear_all()?;
+        // Wrap the entire clear + reinsert in a transaction so a mid-save
+        // error leaves the previous data intact instead of an empty database.
+        db.begin_transaction()?;
 
-        for seg in &self.memory_map.segments {
-            db.save_segment(seg)?;
-        }
-        for func in self.functions.functions.values() {
-            db.save_function(func)?;
-        }
-        for (&addr, text) in &self.comments {
-            db.set_comment(addr, text)?;
-        }
+        let result = (|| -> Result<()> {
+            db.clear_all()?;
 
-        // Persist xrefs
-        for xrefs in self.xrefs.to_address_xrefs.values() {
-            for xref in xrefs {
-                db.save_xref(xref)?;
+            for seg in &self.memory_map.segments {
+                db.save_segment(seg)?;
+            }
+            for func in self.functions.functions.values() {
+                db.save_function(func)?;
+            }
+            for (&addr, text) in &self.comments {
+                db.set_comment(addr, text)?;
+            }
+
+            // Persist xrefs
+            for xrefs in self.xrefs.to_address_xrefs.values() {
+                for xref in xrefs {
+                    db.save_xref(xref)?;
+                }
+            }
+
+            // Persist strings
+            for s in &self.strings.strings {
+                db.save_string(s)?;
+            }
+
+            // Persist constants
+            for c in &self.constants.constants {
+                db.save_constant(c)?;
+            }
+
+            // Persist imports/exports/symbols
+            for import in &self.imports {
+                db.save_import(import)?;
+            }
+            for export in &self.exports {
+                db.save_export(export)?;
+            }
+            for sym in &self.symbols {
+                db.save_symbol(sym)?;
+            }
+
+            // Persist types
+            for ty in self.types.types.values() {
+                db.save_type(ty)?;
+            }
+            for ann in self.types.annotations.values() {
+                db.save_type_annotation(ann)?;
+            }
+
+            // Persist bookmarks
+            for (&addr, note) in &self.bookmarks {
+                db.save_bookmark(addr, note)?;
+            }
+
+            // Persist tags
+            for (&addr, tags) in &self.tags {
+                for tag in tags {
+                    db.save_tag(addr, tag)?;
+                }
+            }
+
+            // Persist function signatures
+            for (&addr, sig) in &self.types.function_signatures {
+                db.save_function_signature(addr, sig)?;
+            }
+
+            // Persist global variables
+            for (&addr, var) in &self.types.global_variables {
+                db.save_global_variable(addr, var)?;
+            }
+
+            // Persist local variables
+            for (&addr, vars) in &self.types.local_variables {
+                db.save_local_variables(addr, vars)?;
+            }
+
+            // Persist source lines
+            for (&addr, info) in &self.types.source_lines {
+                db.save_source_line(addr, info)?;
+            }
+
+            // Persist decompilation cache
+            for (&addr, code) in &self.decompilation_cache {
+                db.save_decompiled_code(addr, code)?;
+            }
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => db.commit_transaction(),
+            Err(e) => {
+                let _ = db.rollback_transaction();
+                Err(e)
             }
         }
-
-        // Persist strings
-        for s in &self.strings.strings {
-            db.save_string(s)?;
-        }
-
-        // Persist constants
-        for c in &self.constants.constants {
-            db.save_constant(c)?;
-        }
-
-        // Persist imports/exports/symbols
-        for import in &self.imports {
-            db.save_import(import)?;
-        }
-        for export in &self.exports {
-            db.save_export(export)?;
-        }
-        for sym in &self.symbols {
-            db.save_symbol(sym)?;
-        }
-
-        // Persist types
-        for ty in self.types.types.values() {
-            db.save_type(ty)?;
-        }
-        for ann in self.types.annotations.values() {
-            db.save_type_annotation(ann)?;
-        }
-
-        // Persist bookmarks
-        for (&addr, note) in &self.bookmarks {
-            db.save_bookmark(addr, note)?;
-        }
-
-        // Persist tags
-        for (&addr, tags) in &self.tags {
-            for tag in tags {
-                db.save_tag(addr, tag)?;
-            }
-        }
-
-        // Persist function signatures
-        for (&addr, sig) in &self.types.function_signatures {
-            db.save_function_signature(addr, sig)?;
-        }
-
-        // Persist global variables
-        for (&addr, var) in &self.types.global_variables {
-            db.save_global_variable(addr, var)?;
-        }
-
-        // Persist local variables
-        for (&addr, vars) in &self.types.local_variables {
-            db.save_local_variables(addr, vars)?;
-        }
-
-        // Persist source lines
-        for (&addr, info) in &self.types.source_lines {
-            db.save_source_line(addr, info)?;
-        }
-
-        // Persist decompilation cache
-        for (&addr, code) in &self.decompilation_cache {
-            db.save_decompiled_code(addr, code)?;
-        }
-
-        Ok(())
     }
 
     pub fn load(db_path: &std::path::Path) -> Result<Self> {

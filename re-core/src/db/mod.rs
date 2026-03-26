@@ -323,6 +323,27 @@ impl Database {
         Ok(())
     }
 
+    pub fn begin_transaction(&self) -> Result<()> {
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn commit_transaction(&self) -> Result<()> {
+        self.conn
+            .execute_batch("COMMIT")
+            .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn rollback_transaction(&self) -> Result<()> {
+        self.conn
+            .execute_batch("ROLLBACK")
+            .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
+        Ok(())
+    }
+
     /// Delete all rows from every data table. Call before a full re-save to
     /// prevent stale rows from accumulating.
     pub fn clear_all(&self) -> Result<()> {
