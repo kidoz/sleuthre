@@ -1487,6 +1487,8 @@ impl SleuthreApp {
                 // Column headers
                 ui.horizontal(|ui| {
                     ui.style_mut().spacing.item_spacing.x = 4.0;
+                    // Badge column spacer (matches badge width in data rows)
+                    ui.add_sized(egui::vec2(20.0, 16.0), egui::Label::new(""));
                     let header = |ui: &mut egui::Ui,
                                   label: &str,
                                   col: FunctionSortColumn,
@@ -1677,19 +1679,29 @@ impl SleuthreApp {
 
                                 ui.horizontal(|ui| {
                                     ui.style_mut().spacing.item_spacing.x = 4.0;
-                                    ui.label(
-                                        egui::RichText::new(badge_text)
-                                            .size(10.0)
-                                            .background_color(badge_color),
+                                    ui.add_sized(
+                                        egui::vec2(20.0, row_height),
+                                        egui::Label::new(
+                                            egui::RichText::new(badge_text)
+                                                .size(10.0)
+                                                .background_color(badge_color),
+                                        ),
                                     );
-                                    ui.monospace(
-                                        egui::RichText::new(format!("{:08X}", addr))
-                                            .size(10.0)
-                                            .color(self.syntax.address),
+                                    ui.add_sized(
+                                        egui::vec2(70.0, row_height),
+                                        egui::Label::new(
+                                            egui::RichText::new(format!("{:08X}", addr))
+                                                .size(10.0)
+                                                .color(self.syntax.address)
+                                                .monospace(),
+                                        ),
                                     );
-                                    let name_resp = ui.selectable_label(
-                                        is_selected,
-                                        egui::RichText::new(&func.name).size(11.0),
+                                    let name_resp = ui.add_sized(
+                                        egui::vec2(120.0, row_height),
+                                        egui::SelectableLabel::new(
+                                            is_selected,
+                                            egui::RichText::new(&func.name).size(11.0),
+                                        ),
                                     );
                                     if name_resp.clicked() {
                                         jump = Some(addr);
@@ -1718,7 +1730,25 @@ impl SleuthreApp {
                                             }
                                         }
                                     });
-                                    // Show tag badges
+                                    ui.add_sized(
+                                        egui::vec2(50.0, row_height),
+                                        egui::Label::new(
+                                            egui::RichText::new(format!("{:X}", size))
+                                                .size(10.0)
+                                                .color(self.syntax.text_dim)
+                                                .monospace(),
+                                        ),
+                                    );
+                                    ui.add_sized(
+                                        egui::vec2(45.0, row_height),
+                                        egui::Label::new(
+                                            egui::RichText::new(format!("{}", xrefs))
+                                                .size(10.0)
+                                                .color(self.syntax.text_dim)
+                                                .monospace(),
+                                        ),
+                                    );
+                                    // Show tag badges after fixed columns
                                     if let Some(tags) = project.tags.get(&addr) {
                                         for tag in tags {
                                             ui.label(
@@ -1731,16 +1761,6 @@ impl SleuthreApp {
                                             );
                                         }
                                     }
-                                    ui.monospace(
-                                        egui::RichText::new(format!("{:X}", size))
-                                            .size(10.0)
-                                            .color(self.syntax.text_dim),
-                                    );
-                                    ui.monospace(
-                                        egui::RichText::new(format!("{}", xrefs))
-                                            .size(10.0)
-                                            .color(self.syntax.text_dim),
-                                    );
                                 });
                             }
                         });
