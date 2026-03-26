@@ -3,6 +3,7 @@ use std::path::Path;
 
 use crate::Result;
 use crate::analysis::passes::{HeuristicNamePass, SignaturePass, SuspiciousNamePass};
+use crate::analysis::struct_inference::StructInferencePass;
 use crate::analysis::type_propagation::TypePropagator;
 use crate::arch::Architecture;
 use crate::debuginfo;
@@ -273,6 +274,7 @@ fn analyze_loaded_with_bytes(
     let mut pm = PluginManager::default();
     pm.register_analysis_pass(Box::new(SuspiciousNamePass));
     pm.register_analysis_pass(Box::new(HeuristicNamePass));
+    pm.register_analysis_pass(Box::new(StructInferencePass::new(project.arch)));
 
     let sig_db = match loaded.arch {
         Architecture::X86_64 => SignatureDatabase::builtin_x86_64(),
@@ -434,6 +436,7 @@ pub fn reanalyze(
         let mut pm = PluginManager::default();
         pm.register_analysis_pass(Box::new(SuspiciousNamePass));
         pm.register_analysis_pass(Box::new(HeuristicNamePass));
+        pm.register_analysis_pass(Box::new(StructInferencePass::new(project.arch)));
 
         let sig_db = match project.arch {
             Architecture::X86_64 => SignatureDatabase::builtin_x86_64(),

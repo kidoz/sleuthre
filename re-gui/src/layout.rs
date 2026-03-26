@@ -1698,7 +1698,7 @@ impl SleuthreApp {
                                     );
                                     let name_resp = ui.add_sized(
                                         egui::vec2(120.0, row_height),
-                                        egui::SelectableLabel::new(
+                                        egui::Button::selectable(
                                             is_selected,
                                             egui::RichText::new(&func.name).size(11.0),
                                         ),

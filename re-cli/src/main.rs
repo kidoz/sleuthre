@@ -215,6 +215,7 @@ fn cmd_plugins(path: &Path, json: bool) -> Result<()> {
 
     let mut pm = re_core::plugin::PluginManager::default();
     pm.register_analysis_pass(Box::new(re_core::analysis::passes::SuspiciousNamePass));
+    pm.register_analysis_pass(Box::new(re_core::analysis::struct_inference::StructInferencePass::new(result.project.arch)));
 
     let findings = pm.run_all_analysis_passes(
         &result.project.memory_map,

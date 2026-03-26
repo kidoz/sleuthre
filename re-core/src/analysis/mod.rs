@@ -7,5 +7,6 @@ pub mod passes;
 pub mod pipeline;
 pub mod stack;
 pub mod strings;
+pub mod struct_inference;
 pub mod type_propagation;
 pub mod xrefs;
