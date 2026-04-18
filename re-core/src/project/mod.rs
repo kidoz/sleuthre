@@ -746,6 +746,213 @@ pub struct ImportStats {
     pub types: usize,
 }
 
+/// Outcome of a 3-way JSONL merge.
+#[derive(Debug, Clone, Default)]
+pub struct MergeResult {
+    /// Merged JSONL output (deterministic ordering, ready to `import_jsonl`).
+    pub merged: String,
+    /// Number of records where both sides changed the same key in different
+    /// ways. The merged output contains `kind: "conflict"` records describing
+    /// each collision; the caller is expected to resolve them.
+    pub conflict_count: usize,
+    /// Records taken from `left` that `right` did not modify.
+    pub left_adds: usize,
+    /// Records taken from `right` that `left` did not modify.
+    pub right_adds: usize,
+    /// Records that both sides agreed to change in the same way.
+    pub shared_changes: usize,
+}
+
+/// 3-way merge of three JSONL project exports — `base` is the common ancestor,
+/// `left` and `right` are the divergent branches.
+///
+/// Each record is keyed by a tuple `(kind, primary_id)`; two edits to the
+/// same key on opposite sides are a conflict unless the values match, in which
+/// case the change is taken once.
+///
+/// Conflicts are not silently dropped: the merged stream includes a line like
+/// `{ "kind": "conflict", "key": ..., "left": ..., "right": ... }` so the
+/// downstream tooling (GUI, CLI) can surface them. Importers ignore `conflict`
+/// kinds, matching the "ignore unknown kind" policy documented on
+/// [`Project::import_jsonl`].
+pub fn merge_jsonl_3way(base: &str, left: &str, right: &str) -> Result<MergeResult> {
+    use serde_json::Value;
+    use std::collections::BTreeMap;
+
+    fn load(content: &str) -> Result<BTreeMap<(String, String), Value>> {
+        let mut map = BTreeMap::new();
+        for (line_no, raw) in content.lines().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let record: Value = serde_json::from_str(line).map_err(|e| {
+                crate::Error::Database(format!("merge jsonl line {}: {}", line_no + 1, e))
+            })?;
+            let kind = record
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if kind == "meta" {
+                // Meta lines are not merged — they describe the source, not
+                // user edits.
+                continue;
+            }
+            // Composite key chosen per kind so two sides editing the same
+            // address produce the same key.
+            let id = match kind.as_str() {
+                "comment" | "rename" | "bookmark" | "overlay" => record
+                    .get("address")
+                    .and_then(|v| v.as_str())
+                    .map(|s| {
+                        if kind == "overlay" {
+                            format!(
+                                "{}::{}",
+                                s,
+                                record.get("label").and_then(|v| v.as_str()).unwrap_or("")
+                            )
+                        } else {
+                            s.to_string()
+                        }
+                    })
+                    .unwrap_or_default(),
+                "tag" => format!(
+                    "{}::{}",
+                    record.get("address").and_then(|v| v.as_str()).unwrap_or(""),
+                    record.get("tag").and_then(|v| v.as_str()).unwrap_or("")
+                ),
+                "type" => record
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                _ => continue,
+            };
+            if !id.is_empty() {
+                map.insert((kind, id), record);
+            }
+        }
+        Ok(map)
+    }
+
+    let base_map = load(base)?;
+    let left_map = load(left)?;
+    let right_map = load(right)?;
+
+    let mut stats = MergeResult::default();
+    let mut out_records: Vec<(String, Value)> = Vec::new();
+
+    let mut all_keys = std::collections::BTreeSet::new();
+    all_keys.extend(base_map.keys().cloned());
+    all_keys.extend(left_map.keys().cloned());
+    all_keys.extend(right_map.keys().cloned());
+
+    for key in all_keys {
+        let b = base_map.get(&key);
+        let l = left_map.get(&key);
+        let r = right_map.get(&key);
+        match (b, l, r) {
+            (_, Some(lv), Some(rv)) if lv == rv => {
+                // Count as a shared change if both sides modified an existing
+                // record or both added a new one identically.
+                match b {
+                    Some(bv) if bv != lv => stats.shared_changes += 1,
+                    None => stats.shared_changes += 1,
+                    _ => {}
+                }
+                out_records.push((format!("{}::{}", key.0, key.1), lv.clone()));
+            }
+            (Some(bv), Some(lv), Some(rv)) => {
+                if lv == bv {
+                    out_records.push((format!("{}::{}", key.0, key.1), rv.clone()));
+                    stats.right_adds += 1;
+                } else if rv == bv {
+                    out_records.push((format!("{}::{}", key.0, key.1), lv.clone()));
+                    stats.left_adds += 1;
+                } else {
+                    // Both sides changed — real conflict.
+                    let conflict = serde_json::json!({
+                        "kind": "conflict",
+                        "key": format!("{}::{}", key.0, key.1),
+                        "base": bv,
+                        "left": lv,
+                        "right": rv,
+                    });
+                    out_records.push((format!("conflict::{}::{}", key.0, key.1), conflict));
+                    stats.conflict_count += 1;
+                }
+            }
+            (None, Some(lv), None) => {
+                out_records.push((format!("{}::{}", key.0, key.1), lv.clone()));
+                stats.left_adds += 1;
+            }
+            (None, None, Some(rv)) => {
+                out_records.push((format!("{}::{}", key.0, key.1), rv.clone()));
+                stats.right_adds += 1;
+            }
+            (Some(bv), Some(lv), None) => {
+                if lv == bv {
+                    // Right deleted, left unchanged → accept the delete.
+                } else {
+                    // Left modified, right deleted — conflict.
+                    let conflict = serde_json::json!({
+                        "kind": "conflict",
+                        "key": format!("{}::{}", key.0, key.1),
+                        "base": bv,
+                        "left": lv,
+                        "right": Value::Null,
+                    });
+                    out_records.push((format!("conflict::{}::{}", key.0, key.1), conflict));
+                    stats.conflict_count += 1;
+                }
+            }
+            (Some(bv), None, Some(rv)) => {
+                if rv == bv {
+                    // Left deleted, right unchanged → accept the delete.
+                } else {
+                    let conflict = serde_json::json!({
+                        "kind": "conflict",
+                        "key": format!("{}::{}", key.0, key.1),
+                        "base": bv,
+                        "left": Value::Null,
+                        "right": rv,
+                    });
+                    out_records.push((format!("conflict::{}::{}", key.0, key.1), conflict));
+                    stats.conflict_count += 1;
+                }
+            }
+            (Some(_), None, None) => {
+                // Both sides deleted.
+            }
+            (None, Some(lv), Some(rv)) => {
+                // Both sides added the same key with different values — this is
+                // an independent-addition conflict.
+                let conflict = serde_json::json!({
+                    "kind": "conflict",
+                    "key": format!("{}::{}", key.0, key.1),
+                    "base": Value::Null,
+                    "left": lv,
+                    "right": rv,
+                });
+                out_records.push((format!("conflict::{}::{}", key.0, key.1), conflict));
+                stats.conflict_count += 1;
+            }
+            (None, None, None) => {}
+        }
+    }
+
+    // Deterministic output ordering.
+    out_records.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut merged = String::new();
+    for (_, record) in out_records {
+        merged.push_str(&record.to_string());
+        merged.push('\n');
+    }
+    stats.merged = merged;
+    Ok(stats)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -884,6 +1091,53 @@ mod tests {
         let mut p = test_project();
         assert!(p.undo().is_none());
         assert!(p.redo().is_none());
+    }
+
+    #[test]
+    fn jsonl_merge_detects_and_resolves_changes() {
+        // Base has a single comment; left renames a function; right adds a bookmark.
+        // No conflict — the merge should pick up both divergent edits.
+        let base = "\
+{\"kind\":\"comment\",\"address\":\"0x1000\",\"text\":\"entry\"}\n";
+        let left = "\
+{\"kind\":\"comment\",\"address\":\"0x1000\",\"text\":\"entry\"}\n\
+{\"kind\":\"rename\",\"address\":\"0x1000\",\"name\":\"main\"}\n";
+        let right = "\
+{\"kind\":\"comment\",\"address\":\"0x1000\",\"text\":\"entry\"}\n\
+{\"kind\":\"bookmark\",\"address\":\"0x1020\",\"note\":\"check\"}\n";
+        let result = merge_jsonl_3way(base, left, right).unwrap();
+        assert_eq!(result.conflict_count, 0);
+        assert_eq!(result.left_adds, 1);
+        assert_eq!(result.right_adds, 1);
+        assert!(result.merged.contains("\"name\":\"main\""));
+        assert!(result.merged.contains("\"note\":\"check\""));
+    }
+
+    #[test]
+    fn jsonl_merge_emits_conflict_on_divergent_edit() {
+        let base = "\
+{\"kind\":\"comment\",\"address\":\"0x1000\",\"text\":\"orig\"}\n";
+        let left = "\
+{\"kind\":\"comment\",\"address\":\"0x1000\",\"text\":\"from left\"}\n";
+        let right = "\
+{\"kind\":\"comment\",\"address\":\"0x1000\",\"text\":\"from right\"}\n";
+        let result = merge_jsonl_3way(base, left, right).unwrap();
+        assert_eq!(result.conflict_count, 1);
+        assert!(result.merged.contains("\"kind\":\"conflict\""));
+        assert!(result.merged.contains("from left"));
+        assert!(result.merged.contains("from right"));
+    }
+
+    #[test]
+    fn jsonl_merge_accepts_shared_change() {
+        let base = "\
+{\"kind\":\"comment\",\"address\":\"0x1000\",\"text\":\"orig\"}\n";
+        let same = "\
+{\"kind\":\"comment\",\"address\":\"0x1000\",\"text\":\"renamed\"}\n";
+        let result = merge_jsonl_3way(base, same, same).unwrap();
+        assert_eq!(result.conflict_count, 0);
+        assert_eq!(result.shared_changes, 1);
+        assert!(result.merged.contains("\"text\":\"renamed\""));
     }
 
     #[test]
