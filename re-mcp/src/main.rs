@@ -438,6 +438,43 @@ impl McpServer {
                                 },
                                 "required": ["function", "variable", "type"]
                             }
+                        },
+                        {
+                            "name": "get_variable_uses",
+                            "description": "Report every instruction address that reads or writes the named SSA variable in a function.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "address": { "type": "number" },
+                                    "variable": { "type": "string" },
+                                    "version": { "type": "number" }
+                                },
+                                "required": ["address", "variable"]
+                            }
+                        },
+                        {
+                            "name": "diff_against_source",
+                            "description": "Recompile the decompiled C for a function with the system C compiler and compare instruction-category histograms against the original.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "address": { "type": "number" }
+                                },
+                                "required": ["address"]
+                            }
+                        },
+                        {
+                            "name": "merge_jsonl_3way",
+                            "description": "Three-way merge of three JSONL project exports. Returns merged text plus conflict stats. Used for git-friendly async collab.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "base": { "type": "string" },
+                                    "left": { "type": "string" },
+                                    "right": { "type": "string" }
+                                },
+                                "required": ["base", "left", "right"]
+                            }
                         }
                     ]
                 }
@@ -1073,6 +1110,142 @@ impl McpServer {
                         type_str, var_name, func_addr
                     ),
                 )
+            }
+            "get_variable_uses" => {
+                let Some(addr) = args.get("address").and_then(|a| a.as_u64()) else {
+                    return missing_param_error(&id, "address");
+                };
+                let Some(var_name) = args.get("variable").and_then(|v| v.as_str()) else {
+                    return missing_param_error(&id, "variable");
+                };
+                let version = args
+                    .get("version")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32);
+                let (Some(project), Some(disasm)) = (&self.project, &self.disasm) else {
+                    return json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": "No project loaded" } });
+                };
+                let Some(func) = project.functions.get_function(addr) else {
+                    return json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32004, "message": format!("No function at 0x{:x}", addr) } });
+                };
+                let size = func
+                    .end_address
+                    .and_then(|end| end.checked_sub(func.start_address))
+                    .map(|s| s as usize)
+                    .unwrap_or(0x100);
+                let instructions = match disasm.disassemble_range(
+                    &project.memory_map,
+                    func.start_address,
+                    size,
+                ) {
+                    Ok(insns) => insns,
+                    Err(e) => {
+                        return json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32002, "message": e.to_string() } });
+                    }
+                };
+                let llil = re_core::il::lifter_x86::lift_function(
+                    &func.name,
+                    func.start_address,
+                    &instructions,
+                );
+                let mlil = re_core::il::mlil::lower_to_mlil(&llil);
+                let all = collect_ssa_vars(&mlil);
+                let filtered: Vec<_> = all
+                    .into_iter()
+                    .filter(|v| {
+                        let name_match = v
+                            .get("name")
+                            .and_then(|n| n.as_str())
+                            .map(|n| n == var_name)
+                            .unwrap_or(false);
+                        let ver_match = match version {
+                            Some(want) => v
+                                .get("version")
+                                .and_then(|n| n.as_u64())
+                                .map(|n| n as u32 == want)
+                                .unwrap_or(false),
+                            None => true,
+                        };
+                        name_match && ver_match
+                    })
+                    .collect();
+                tool_result(&id, &filtered)
+            }
+            "diff_against_source" => {
+                let Some(addr) = args.get("address").and_then(|a| a.as_u64()) else {
+                    return missing_param_error(&id, "address");
+                };
+                let (Some(project), Some(disasm)) = (&self.project, &self.disasm) else {
+                    return json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": "No project loaded" } });
+                };
+                let Some(func) = project.functions.get_function(addr) else {
+                    return json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32004, "message": format!("No function at 0x{:x}", addr) } });
+                };
+                let size = func
+                    .end_address
+                    .and_then(|end| end.checked_sub(func.start_address))
+                    .map(|s| s as usize)
+                    .unwrap_or(0x100);
+                let original = match disasm.disassemble_range(
+                    &project.memory_map,
+                    func.start_address,
+                    size,
+                ) {
+                    Ok(insns) => insns,
+                    Err(e) => {
+                        return json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32002, "message": e.to_string() } });
+                    }
+                };
+                let mut symbols = HashMap::new();
+                for f in project.functions.functions.values() {
+                    symbols.insert(f.start_address, f.name.clone());
+                }
+                let pseudocode = decompile(
+                    &func.name,
+                    &original,
+                    disasm.arch,
+                    &symbols,
+                    None,
+                    &project.types,
+                    &project.memory_map,
+                );
+                match re_core::analysis::recompile_diff::recompile_and_diff(
+                    &func.name,
+                    &pseudocode.text,
+                    &original,
+                    disasm.arch,
+                ) {
+                    Ok(result) => tool_result(&id, &result),
+                    Err(e) => {
+                        json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32003, "message": e.to_string() } })
+                    }
+                }
+            }
+            "merge_jsonl_3way" => {
+                let Some(base) = args.get("base").and_then(|v| v.as_str()) else {
+                    return missing_param_error(&id, "base");
+                };
+                let Some(left) = args.get("left").and_then(|v| v.as_str()) else {
+                    return missing_param_error(&id, "left");
+                };
+                let Some(right) = args.get("right").and_then(|v| v.as_str()) else {
+                    return missing_param_error(&id, "right");
+                };
+                match re_core::project::merge_jsonl_3way(base, left, right) {
+                    Ok(result) => tool_result(
+                        &id,
+                        &json!({
+                            "merged": result.merged,
+                            "conflicts": result.conflict_count,
+                            "left_adds": result.left_adds,
+                            "right_adds": result.right_adds,
+                            "shared_changes": result.shared_changes,
+                        }),
+                    ),
+                    Err(e) => {
+                        json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32603, "message": e.to_string() } })
+                    }
+                }
             }
             _ => {
                 json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": "Tool not found" } })
