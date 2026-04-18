@@ -44,6 +44,44 @@ const X86_ARG_REGS: &[&str] = &["ecx", "edx"];
 /// Registers that hold the return value on ARM64.
 const ARM64_RETURN_REGS: &[&str] = &["x0"];
 
+/// Return `true` if any expression in the MLIL function is a `VectorOp`.
+fn mlil_uses_vector_ops(mlil: &MlilFunction) -> bool {
+    fn expr_has_vector(expr: &crate::il::mlil::MlilExpr) -> bool {
+        use crate::il::mlil::MlilExpr;
+        match expr {
+            MlilExpr::VectorOp { .. } => true,
+            MlilExpr::BinOp { left, right, .. } => expr_has_vector(left) || expr_has_vector(right),
+            MlilExpr::UnaryOp { operand, .. } => expr_has_vector(operand),
+            MlilExpr::Load { addr, .. } => expr_has_vector(addr),
+            MlilExpr::Call { target, args } => {
+                expr_has_vector(target) || args.iter().any(expr_has_vector)
+            }
+            _ => false,
+        }
+    }
+    for inst in &mlil.instructions {
+        for stmt in &inst.stmts {
+            use crate::il::mlil::MlilStmt;
+            let hit = match stmt {
+                MlilStmt::Assign { src, .. } => expr_has_vector(src),
+                MlilStmt::Store { addr, value, .. } => {
+                    expr_has_vector(addr) || expr_has_vector(value)
+                }
+                MlilStmt::Jump { target } => expr_has_vector(target),
+                MlilStmt::BranchIf { cond, target } => {
+                    expr_has_vector(cond) || expr_has_vector(target)
+                }
+                MlilStmt::Call { target } => expr_has_vector(target),
+                _ => false,
+            };
+            if hit {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Analyze the MLIL to recover function signature information:
 /// which ABI registers are used as parameters, whether the function returns a
 /// value, and what stack locals exist.
@@ -63,6 +101,13 @@ fn analyze_function_signature(
     // Default includes
     includes.insert("stdint.h".to_string());
     includes.insert("stdbool.h".to_string());
+
+    // If the function uses SIMD ops, include Intel intrinsics so the emitted
+    // `_mm_*` calls resolve. We wrap the include in a preprocessor guard so
+    // non-x86 targets (ARM, MIPS, RISC-V) don't error on the missing header.
+    if mlil_uses_vector_ops(mlil) {
+        includes.insert("<GUARDED>immintrin.h".to_string());
+    }
 
     // Override with propagated type info if available
     if let Some(sig) = type_info.and_then(|ti| ti.signature.as_ref()) {
@@ -2323,7 +2368,8 @@ mod tests {
             &TypeManager::default(),
             &crate::memory::MemoryMap::default(),
         );
-        assert!(code.text.contains("0x2000()"));
+        // Raw-address calls emit through a function-pointer cast to parse as C.
+        assert!(code.text.contains("((void (*)(void))0x2000)()"));
     }
 
     #[test]

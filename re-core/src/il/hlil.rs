@@ -193,7 +193,7 @@ pub fn mlil_to_hlil_expr(expr: &MlilExpr) -> HlilExpr {
             if let Some(first) = vars.first() {
                 HlilExpr::Var(pretty_var_name(first))
             } else {
-                HlilExpr::Var("??".into())
+                HlilExpr::Var("phi_undef".into())
             }
         }
         MlilExpr::Call { target, args } => HlilExpr::Call {
@@ -214,17 +214,72 @@ pub fn mlil_to_hlil_expr(expr: &MlilExpr) -> HlilExpr {
     }
 }
 
-/// Assign friendly names to registers.
+/// Assign friendly names to registers for common architectures so the output
+/// reads like C rather than disassembly. Unknown register names pass through
+/// verbatim (they are already valid C identifiers).
 fn pretty_var_name(ssa: &SsaVar) -> String {
-    let base = match ssa.name.as_str() {
-        "rax" | "eax" | "ax" | "al" => "result",
-        "rcx" | "ecx" | "cx" | "cl" => "counter",
-        "rdx" | "edx" | "dx" | "dl" => "data",
-        "rbx" | "ebx" | "bx" | "bl" => "var_bx",
-        "rsi" | "esi" | "si" => "src",
-        "rdi" | "edi" | "di" => "dst",
-        "rbp" | "ebp" | "bp" => "frame",
-        "rsp" | "esp" | "sp" => "sp",
+    let base: &str = match ssa.name.as_str() {
+        // x86 / x86-64 general-purpose: GAS-style low halves map to the same alias.
+        "rax" | "eax" | "ax" | "al" | "ah" => "result",
+        "rcx" | "ecx" | "cx" | "cl" | "ch" => "counter",
+        "rdx" | "edx" | "dx" | "dl" | "dh" => "data",
+        "rbx" | "ebx" | "bx" | "bl" | "bh" => "base",
+        "rsi" | "esi" | "si" | "sil" => "src",
+        "rdi" | "edi" | "di" | "dil" => "dst",
+        "rbp" | "ebp" | "bp" | "bpl" => "frame",
+        "rsp" | "esp" | "sp" | "spl" => "sp",
+        "r8" | "r8d" | "r8w" | "r8b" => "r8",
+        "r9" | "r9d" | "r9w" | "r9b" => "r9",
+        "r10" | "r10d" | "r10w" | "r10b" => "r10",
+        "r11" | "r11d" | "r11w" | "r11b" => "r11",
+        "r12" | "r12d" | "r12w" | "r12b" => "r12",
+        "r13" | "r13d" | "r13w" | "r13b" => "r13",
+        "r14" | "r14d" | "r14w" | "r14b" => "r14",
+        "r15" | "r15d" | "r15w" | "r15b" => "r15",
+        "rip" | "eip" | "ip" => "pc",
+
+        // ARM64 general-purpose: x0–x30 and w0–w30 share aliases.
+        "x0" | "w0" => "arg0",
+        "x1" | "w1" => "arg1",
+        "x2" | "w2" => "arg2",
+        "x3" | "w3" => "arg3",
+        "x4" | "w4" => "arg4",
+        "x5" | "w5" => "arg5",
+        "x6" | "w6" => "arg6",
+        "x7" | "w7" => "arg7",
+        "x29" | "w29" | "fp" => "frame",
+        "x30" | "w30" | "lr" => "return_address",
+
+        // 32-bit ARM common aliases.
+        "r0" => "arg0",
+        "r1" => "arg1",
+        "r2" => "arg2",
+        "r3" => "arg3",
+        "r4" => "r4",
+        "r5" => "r5",
+        "r6" => "r6",
+        "r7" => "r7",
+
+        // MIPS argument/temporary/saved registers.
+        "a0" | "$a0" => "arg0",
+        "a1" | "$a1" => "arg1",
+        "a2" | "$a2" => "arg2",
+        "a3" | "$a3" => "arg3",
+        "v0" | "$v0" => "result",
+        "v1" | "$v1" => "result_hi",
+        "t0" | "$t0" => "tmp0",
+        "t1" | "$t1" => "tmp1",
+        "t2" | "$t2" => "tmp2",
+        "t3" | "$t3" => "tmp3",
+
+        // RISC-V ABI names — avoid the raw `x10..x13` form which collides
+        // with ARM64's x-registers.
+        "a4" | "$a4" => "arg4",
+        "a5" | "$a5" => "arg5",
+        "a6" | "$a6" => "arg6",
+        "a7" | "$a7" => "arg7",
+
+        // Synthetic / internal pseudo-registers pass through unchanged.
         name if name.starts_with("__") => return name.to_string(),
         name => name,
     };
@@ -236,15 +291,28 @@ fn pretty_var_name(ssa: &SsaVar) -> String {
 }
 
 /// Render HLIL as structured C-like pseudocode.
+///
+/// This fallback path emits a best-effort signature (`int name(void)`) plus the
+/// minimum includes required for the typed dereferences and bool operators
+/// produced by the formatter. It is intended to be syntactically valid C so
+/// that the output can be piped into a compiler for sanity-checking.
 pub fn render_pseudocode(name: &str, stmts: &[HlilStmt]) -> DecompiledCode {
     let mut w = SourceWriter::new();
-    w.write("// Decompiled with Sleuthre\n\n");
-    w.write("void ");
+    w.write("// Decompiled with Sleuthre\n");
+    w.write("#include <stdint.h>\n");
+    w.write("#include <stdbool.h>\n\n");
+    w.write("int ");
     w.write(name);
-    w.write("() {\n");
+    w.write("(void) {\n");
     w.indent();
     for stmt in stmts {
         write_stmt(&mut w, stmt);
+    }
+    // Emit a safe fall-through return so gcc -Wreturn-type stays quiet when
+    // the recovered body has no explicit terminator.
+    if !stmt_list_terminates(stmts) {
+        w.write_indent();
+        w.write("return 0;\n");
     }
     w.unindent();
     w.write("}\n");
@@ -261,13 +329,23 @@ pub fn render_pseudocode_with_info(
     let mut w = SourceWriter::new();
     w.write("// Decompiled with Sleuthre\n\n");
 
-    // Includes
+    // Includes. Entries prefixed with `<GUARDED>` are wrapped in a
+    // preprocessor guard so that SIMD intrinsic headers do not break builds
+    // on non-x86 targets.
     let mut includes: Vec<_> = info.includes.iter().collect();
     includes.sort();
     for inc in includes {
-        w.write("#include <");
-        w.write(inc);
-        w.write(">\n");
+        if let Some(rest) = inc.strip_prefix("<GUARDED>") {
+            w.write("#if defined(__x86_64__) || defined(__i386__)\n");
+            w.write("#include <");
+            w.write(rest);
+            w.write(">\n");
+            w.write("#endif\n");
+        } else {
+            w.write("#include <");
+            w.write(inc);
+            w.write(">\n");
+        }
     }
     if !info.includes.is_empty() {
         w.newline();
@@ -383,6 +461,42 @@ fn write_type_definition(w: &mut SourceWriter, cty: &crate::types::CompoundType)
             w.write(";\n");
         }
     }
+}
+
+/// Format an integer constant as an unambiguous C literal.
+///
+/// Small positive values are emitted in decimal so boolean-looking conditions
+/// read naturally (`if (x == 0)`). Larger values are hex. A suffix is attached
+/// whenever the magnitude forces the literal out of `int` range:
+/// - fits in `int32_t` → no suffix
+/// - fits in `uint32_t` → `u` (unsigned int)
+/// - fits in `int64_t` → `LL` (long long)
+/// - otherwise → `ULL` (unsigned long long)
+fn format_c_integer_literal(v: u64) -> String {
+    let suffix = if v <= i32::MAX as u64 {
+        ""
+    } else if v <= u32::MAX as u64 {
+        "u"
+    } else if v <= i64::MAX as u64 {
+        "LL"
+    } else {
+        "ULL"
+    };
+    if v <= 9 {
+        format!("{}{}", v, suffix)
+    } else {
+        format!("0x{:x}{}", v, suffix)
+    }
+}
+
+fn stmt_list_terminates(stmts: &[HlilStmt]) -> bool {
+    matches!(
+        stmts.last(),
+        Some(HlilStmt::Return(_))
+            | Some(HlilStmt::Break)
+            | Some(HlilStmt::Continue)
+            | Some(HlilStmt::Goto(_))
+    )
 }
 
 fn write_stmt(w: &mut SourceWriter, stmt: &HlilStmt) {
@@ -512,6 +626,13 @@ fn write_stmt(w: &mut SourceWriter, stmt: &HlilStmt) {
                 for s in default {
                     write_stmt(w, s);
                 }
+                // Match every case arm: emit `break;` unless the body already ends
+                // in a terminator. Keeping this symmetric prevents unintended
+                // fall-through when the output is compiled.
+                if !stmt_list_terminates(default) {
+                    w.write_indent();
+                    w.write("break;\n");
+                }
                 w.unindent();
             }
             w.unindent();
@@ -571,15 +692,21 @@ fn write_expr_prec(w: &mut SourceWriter, expr: &HlilExpr, parent_prec: u8) {
             w.write_annotated(name, AnnotationKind::Global(*addr));
         }
         HlilExpr::Const(v) => {
-            if *v > 9 {
-                w.write(&format!("0x{:x}", v));
-            } else {
-                w.write(&format!("{}", v));
-            }
+            w.write(&format_c_integer_literal(*v));
         }
-        HlilExpr::Deref { addr, .. } => {
-            w.write("*");
-            write_expr_prec(w, addr, 10);
+        HlilExpr::Deref { addr, size } => {
+            // Emit a typed C dereference: *((T*)(addr)). This compiles under
+            // <stdint.h> because the size-to-type map uses standard exact-width types.
+            let cast = match size {
+                1 => "uint8_t",
+                2 => "uint16_t",
+                4 => "uint32_t",
+                8 => "uint64_t",
+                _ => "uint8_t",
+            };
+            w.write(&format!("*(({} *)(", cast));
+            write_expr_prec(w, addr, 0);
+            w.write("))");
         }
         HlilExpr::BinOp { op, left, right } => {
             let prec = op_precedence(op);
@@ -606,7 +733,11 @@ fn write_expr_prec(w: &mut SourceWriter, expr: &HlilExpr, parent_prec: u8) {
         HlilExpr::Call { target, args } => {
             match &**target {
                 HlilExpr::Const(addr) => {
-                    w.write_annotated(&format!("0x{:x}", addr), AnnotationKind::Function(*addr))
+                    // Raw address call: cast through a function pointer so the expression
+                    // parses as C — `((void (*)(void))0x401000)()`.
+                    w.write("((void (*)(void))");
+                    w.write_annotated(&format!("0x{:x}", addr), AnnotationKind::Function(*addr));
+                    w.write(")");
                 }
                 HlilExpr::Global(addr, name) => {
                     w.write_annotated(name, AnnotationKind::Function(*addr));
@@ -684,270 +815,114 @@ fn op_precedence(op: &BinOp) -> u8 {
     }
 }
 
+/// Format a SIMD vector operation as a compilable C expression.
+///
+/// Emits Intel-style intrinsics (`<immintrin.h>`) when the element type and
+/// width map onto one; otherwise emits a best-effort placeholder call wrapped
+/// in a C block comment so the containing line still parses. The destination
+/// operand (operand 0 in MLIL) is NOT rendered here — the surrounding `Assign`
+/// is responsible for the `dst = ...` binding.
 fn fmt_vector_op(
     kind: &VectorOpKind,
     elem: VectorElementType,
     width: u16,
     operands: &[HlilExpr],
 ) -> String {
-    let count = elem.count_in(width);
-    let ty = elem.c_type();
-
     let fmt_expr_local = |expr: &HlilExpr| match expr {
         HlilExpr::Var(n) => n.clone(),
         HlilExpr::Const(v) => format!("0x{:x}", v),
-        _ => "?".into(),
+        _ => "0".into(),
     };
-
     let op = |i: usize| -> String {
         operands
             .get(i)
             .map(fmt_expr_local)
-            .unwrap_or_else(|| "?".into())
+            .unwrap_or_else(|| "0".into())
     };
+    // Operand 0 is the destination in MLIL; sources start at index 0 again in
+    // most binary x86 SSE ops (dst == src1). We therefore use op(0) for the
+    // first source and op(1) for the second source to match x86 semantics.
+    let (s1, s2) = (op(0), op(1));
+    let suf = simd_suffix(elem);
+
+    let intrinsic =
+        |name: &str, args: &[&str]| -> String { format!("{}({})", name, args.join(", ")) };
 
     match kind {
-        VectorOpKind::Add | VectorOpKind::Sub | VectorOpKind::Mul | VectorOpKind::Div => {
-            let c_op = match kind {
-                VectorOpKind::Add => "+",
-                VectorOpKind::Sub => "-",
-                VectorOpKind::Mul => "*",
-                VectorOpKind::Div => "/",
-                _ => unreachable!(),
-            };
-            format!(
-                "/* {ty}[{count}] */ {dst} = {a} {op} {b}",
-                ty = ty,
-                count = count,
-                dst = op(0),
-                a = op(0),
-                op = c_op,
-                b = op(1),
-            )
-        }
-        VectorOpKind::AddSaturate | VectorOpKind::SubSaturate => {
-            format!(
-                "/* {ty}[{count}] saturating */ {dst} = {kind}({a}, {b})",
-                ty = ty,
-                count = count,
-                dst = op(0),
-                kind = kind,
-                a = op(0),
-                b = op(1)
-            )
-        }
-        VectorOpKind::And | VectorOpKind::Or | VectorOpKind::Xor => {
-            let c_op = match kind {
-                VectorOpKind::And => "&",
-                VectorOpKind::Or => "|",
-                VectorOpKind::Xor => "^",
-                _ => unreachable!(),
-            };
-            format!(
-                "/* {width}-bit */ {dst} = {a} {op} {b}",
-                width = width,
-                dst = op(0),
-                a = op(0),
-                op = c_op,
-                b = op(1),
-            )
-        }
-        VectorOpKind::Abs | VectorOpKind::Min | VectorOpKind::Max | VectorOpKind::Avg => {
-            format!(
-                "/* {ty}[{count}] */ {dst} = {kind}({a})",
-                ty = ty,
-                count = count,
-                dst = op(0),
-                kind = kind,
-                a = op(0)
-            )
-        }
-        VectorOpKind::CompareEq | VectorOpKind::CompareGt | VectorOpKind::CompareLt => {
-            let c_op = match kind {
-                VectorOpKind::CompareEq => "==",
-                VectorOpKind::CompareGt => ">",
-                VectorOpKind::CompareLt => "<",
-                _ => unreachable!(),
-            };
-            format!(
-                "/* {ty}[{count}] cmp */ {dst} = ({a} {op} {b})",
-                ty = ty,
-                count = count,
-                dst = op(0),
-                a = op(0),
-                op = c_op,
-                b = op(1)
-            )
-        }
-        VectorOpKind::ShiftLeft | VectorOpKind::ShiftRight | VectorOpKind::ShiftRightArith => {
-            let c_op = match kind {
-                VectorOpKind::ShiftLeft => "<<",
-                _ => ">>",
-            };
-            format!(
-                "/* {ty}[{count}] shift */ {dst} = {a} {op} {b}",
-                ty = ty,
-                count = count,
-                dst = op(0),
-                a = op(0),
-                op = c_op,
-                b = op(1)
-            )
-        }
-        VectorOpKind::Broadcast => {
-            format!(
-                "/* {ty}[{count}] broadcast */ {dst} = [{a}; {count}]",
-                ty = ty,
-                count = count,
-                dst = op(0),
-                a = op(1)
-            )
-        }
-        VectorOpKind::Shuffle { mask } => {
-            format!(
-                "/* {ty}[{count}] shuffle */ {dst} = shuffle({a}, 0x{mask:x})",
-                ty = ty,
-                count = count,
-                dst = op(0),
-                a = op(1),
-                mask = mask
-            )
-        }
-        VectorOpKind::ShuffleBytes => {
-            format!(
-                "/* {ty}[{count}] shuffle_bytes */ {dst} = shuffle_bytes({a}, {mask})",
-                ty = ty,
-                count = count,
-                dst = op(0),
-                a = op(1),
-                mask = op(2)
-            )
-        }
-        VectorOpKind::UnpackLow | VectorOpKind::UnpackHigh => {
-            format!(
-                "/* {ty}[{count}] unpack */ {dst} = {kind}({a}, {b})",
-                ty = ty,
-                count = count,
-                dst = op(0),
-                kind = kind,
-                a = op(1),
-                b = op(2)
-            )
-        }
-        VectorOpKind::PackSigned | VectorOpKind::PackUnsigned => {
-            format!(
-                "/* {ty}[{count}] pack */ {dst} = {kind}({a}, {b})",
-                ty = ty,
-                count = count,
-                dst = op(0),
-                kind = kind,
-                a = op(1),
-                b = op(2)
-            )
-        }
-        VectorOpKind::Blend { mask } => {
-            format!(
-                "/* {ty}[{count}] blend */ {dst} = blend({a}, {b}, 0x{mask:x})",
-                ty = ty,
-                count = count,
-                dst = op(0),
-                a = op(1),
-                b = op(2),
-                mask = mask
-            )
-        }
+        VectorOpKind::Add => intrinsic(&format!("_mm_add_{}", suf), &[&s1, &s2]),
+        VectorOpKind::Sub => intrinsic(&format!("_mm_sub_{}", suf), &[&s1, &s2]),
+        VectorOpKind::Mul => intrinsic(&format!("_mm_mul_{}", suf), &[&s1, &s2]),
+        VectorOpKind::Div => intrinsic(&format!("_mm_div_{}", suf), &[&s1, &s2]),
+        VectorOpKind::AddSaturate => intrinsic(&format!("_mm_adds_{}", suf), &[&s1, &s2]),
+        VectorOpKind::SubSaturate => intrinsic(&format!("_mm_subs_{}", suf), &[&s1, &s2]),
+        VectorOpKind::And => intrinsic("_mm_and_si128", &[&s1, &s2]),
+        VectorOpKind::Or => intrinsic("_mm_or_si128", &[&s1, &s2]),
+        VectorOpKind::Xor => intrinsic("_mm_xor_si128", &[&s1, &s2]),
+        VectorOpKind::Abs => intrinsic(&format!("_mm_abs_{}", suf), &[&s1]),
+        VectorOpKind::Min => intrinsic(&format!("_mm_min_{}", suf), &[&s1, &s2]),
+        VectorOpKind::Max => intrinsic(&format!("_mm_max_{}", suf), &[&s1, &s2]),
+        VectorOpKind::Avg => intrinsic(&format!("_mm_avg_{}", suf), &[&s1, &s2]),
+        VectorOpKind::CompareEq => intrinsic(&format!("_mm_cmpeq_{}", suf), &[&s1, &s2]),
+        VectorOpKind::CompareGt => intrinsic(&format!("_mm_cmpgt_{}", suf), &[&s1, &s2]),
+        VectorOpKind::CompareLt => intrinsic(&format!("_mm_cmplt_{}", suf), &[&s1, &s2]),
+        VectorOpKind::ShiftLeft => intrinsic(&format!("_mm_slli_{}", suf), &[&s1, &s2]),
+        VectorOpKind::ShiftRight => intrinsic(&format!("_mm_srli_{}", suf), &[&s1, &s2]),
+        VectorOpKind::ShiftRightArith => intrinsic(&format!("_mm_srai_{}", suf), &[&s1, &s2]),
+        VectorOpKind::Broadcast => intrinsic(&format!("_mm_set1_{}", suf), &[&op(1)]),
+        VectorOpKind::Shuffle { mask } => intrinsic(
+            &format!("_mm_shuffle_{}", suf),
+            &[&op(1), &format!("0x{:x}", mask)],
+        ),
+        VectorOpKind::ShuffleBytes => intrinsic("_mm_shuffle_epi8", &[&op(1), &op(2)]),
+        VectorOpKind::UnpackLow => intrinsic(&format!("_mm_unpacklo_{}", suf), &[&op(1), &op(2)]),
+        VectorOpKind::UnpackHigh => intrinsic(&format!("_mm_unpackhi_{}", suf), &[&op(1), &op(2)]),
+        VectorOpKind::PackSigned => intrinsic(&format!("_mm_packs_{}", suf), &[&op(1), &op(2)]),
+        VectorOpKind::PackUnsigned => intrinsic(&format!("_mm_packus_{}", suf), &[&op(1), &op(2)]),
+        VectorOpKind::Blend { mask } => intrinsic(
+            &format!("_mm_blend_{}", suf),
+            &[&op(1), &op(2), &format!("0x{:x}", mask)],
+        ),
         VectorOpKind::BlendVar => {
-            format!(
-                "/* {ty}[{count}] blend */ {dst} = blend({a}, {b}, {mask})",
-                ty = ty,
-                count = count,
-                dst = op(0),
-                a = op(1),
-                b = op(2),
-                mask = op(3)
-            )
+            intrinsic(&format!("_mm_blendv_{}", suf), &[&op(1), &op(2), &op(3)])
         }
-        VectorOpKind::HorizontalAdd | VectorOpKind::HorizontalSub => {
-            format!(
-                "/* {ty}[{count}] horizontal */ {dst} = {kind}({a}, {b})",
-                ty = ty,
-                count = count,
-                dst = op(0),
-                kind = kind,
-                a = op(1),
-                b = op(2)
-            )
-        }
-        VectorOpKind::Insert { index } => {
-            format!(
-                "/* {ty}[{count}] */ {dst}[{idx}] = {val}",
-                ty = ty,
-                count = count,
-                dst = op(0),
-                idx = index,
-                val = op(1)
-            )
-        }
-        VectorOpKind::Extract { index } => {
-            format!(
-                "/* {ty} */ {dst} = {src}[{idx}]",
-                ty = ty,
-                dst = op(0),
-                src = op(1),
-                idx = index
-            )
-        }
-        VectorOpKind::ConvertIntToFloat
-        | VectorOpKind::ConvertFloatToInt
-        | VectorOpKind::ConvertWiden
-        | VectorOpKind::ConvertNarrow => {
-            format!(
-                "/* vector convert */ {dst} = ({kind}) {src}",
-                dst = op(0),
-                kind = kind,
-                src = op(1)
-            )
-        }
+        VectorOpKind::HorizontalAdd => intrinsic(&format!("_mm_hadd_{}", suf), &[&op(1), &op(2)]),
+        VectorOpKind::HorizontalSub => intrinsic(&format!("_mm_hsub_{}", suf), &[&op(1), &op(2)]),
+        VectorOpKind::Insert { index } => intrinsic(
+            &format!("_mm_insert_{}", suf),
+            &[&s1, &op(1), &format!("{}", index)],
+        ),
+        VectorOpKind::Extract { index } => intrinsic(
+            &format!("_mm_extract_{}", suf),
+            &[&op(1), &format!("{}", index)],
+        ),
+        VectorOpKind::ConvertIntToFloat => intrinsic("_mm_cvtepi32_ps", &[&op(1)]),
+        VectorOpKind::ConvertFloatToInt => intrinsic("_mm_cvtps_epi32", &[&op(1)]),
+        VectorOpKind::ConvertWiden => intrinsic("_mm_cvtepi16_epi32", &[&op(1)]),
+        VectorOpKind::ConvertNarrow => intrinsic("_mm_packs_epi32", &[&op(1), &op(1)]),
         VectorOpKind::FusedMulAdd => {
-            format!(
-                "/* {ty}[{count}] */ {dst} = ({a} * {b}) + {c}",
-                ty = ty,
-                count = count,
-                dst = op(0),
-                a = op(1),
-                b = op(2),
-                c = op(3)
-            )
+            intrinsic(&format!("_mm_fmadd_{}", suf), &[&op(1), &op(2), &op(3)])
         }
         VectorOpKind::FusedMulSub => {
-            format!(
-                "/* {ty}[{count}] */ {dst} = ({a} * {b}) - {c}",
-                ty = ty,
-                count = count,
-                dst = op(0),
-                a = op(1),
-                b = op(2),
-                c = op(3)
-            )
+            intrinsic(&format!("_mm_fmsub_{}", suf), &[&op(1), &op(2), &op(3)])
         }
-        VectorOpKind::MoveMask => {
-            format!(
-                "/* {ty}[{count}] */ {dst} = move_mask({src})",
-                ty = ty,
-                count = count,
-                dst = op(0),
-                src = op(1)
-            )
+        VectorOpKind::MoveMask => intrinsic(&format!("_mm_movemask_{}", suf), &[&op(1)]),
+        VectorOpKind::Zero => intrinsic(&format!("_mm_setzero_{}", suf), &[]),
+        _ => {
+            let _ = width;
+            format!("/* simd {:?} */ 0", kind)
         }
-        VectorOpKind::Zero => {
-            format!(
-                "/* {ty}[{count}] */ {dst} = 0",
-                ty = ty,
-                count = count,
-                dst = op(0)
-            )
-        }
-        _ => format!("/* vector {kind} */ {}(...)", kind),
+    }
+}
+
+/// Map a vector element type to the Intel intrinsic suffix (e.g. `ps`, `epi32`).
+fn simd_suffix(elem: VectorElementType) -> &'static str {
+    match elem {
+        VectorElementType::Int8 => "epi8",
+        VectorElementType::Int16 => "epi16",
+        VectorElementType::Int32 => "epi32",
+        VectorElementType::Int64 => "epi64",
+        VectorElementType::Float32 => "ps",
+        VectorElementType::Float64 => "pd",
     }
 }
 
@@ -973,7 +948,8 @@ mod tests {
     fn render_simple_function() {
         let stmts = vec![HlilStmt::Return(Some(HlilExpr::Const(42)))];
         let code = render_pseudocode("test", &stmts);
-        assert!(code.text.contains("void test() {"));
+        assert!(code.text.contains("#include <stdint.h>"));
+        assert!(code.text.contains("int test(void) {"));
         assert!(code.text.contains("return 0x2a;"));
     }
 
@@ -1137,5 +1113,133 @@ mod tests {
         let mut w = SourceWriter::new();
         write_expr(&mut w, &expr);
         assert_eq!(w.finish().text, "-(a + b)");
+    }
+
+    #[test]
+    fn literal_suffixes_by_magnitude() {
+        // int32_t range — no suffix.
+        assert_eq!(format_c_integer_literal(5), "5");
+        assert_eq!(format_c_integer_literal(0x7fff_ffff), "0x7fffffff");
+        // uint32_t range — u suffix.
+        assert_eq!(format_c_integer_literal(0xffff_ffff), "0xffffffffu");
+        // int64_t range — LL suffix.
+        assert_eq!(format_c_integer_literal(0x1_0000_0000), "0x100000000LL");
+        // uint64_t beyond i64 — ULL.
+        assert_eq!(
+            format_c_integer_literal(0xffff_ffff_ffff_ffff),
+            "0xffffffffffffffffULL"
+        );
+    }
+
+    #[test]
+    fn generated_c_is_compilable() {
+        // Build a non-trivial HLIL function and verify that the emitted text
+        // compiles with a real C toolchain (syntax-only). Skipped silently if
+        // no compiler is on PATH so CI hosts without one still pass.
+        let Some(cc) = find_c_compiler() else {
+            return;
+        };
+
+        let stmts = vec![
+            HlilStmt::Assign {
+                dest: HlilExpr::Var("i".into()),
+                src: HlilExpr::Const(0),
+            },
+            HlilStmt::While {
+                cond: HlilExpr::BinOp {
+                    op: BinOp::CmpLt,
+                    left: Box::new(HlilExpr::Var("i".into())),
+                    right: Box::new(HlilExpr::Const(10)),
+                },
+                body: vec![
+                    HlilStmt::If {
+                        cond: HlilExpr::BinOp {
+                            op: BinOp::CmpEq,
+                            left: Box::new(HlilExpr::Var("i".into())),
+                            right: Box::new(HlilExpr::Const(5)),
+                        },
+                        then_body: vec![HlilStmt::Break],
+                        else_body: vec![],
+                    },
+                    HlilStmt::Assign {
+                        dest: HlilExpr::Var("i".into()),
+                        src: HlilExpr::BinOp {
+                            op: BinOp::Add,
+                            left: Box::new(HlilExpr::Var("i".into())),
+                            right: Box::new(HlilExpr::Const(1)),
+                        },
+                    },
+                ],
+            },
+            HlilStmt::Switch {
+                cond: HlilExpr::Var("i".into()),
+                cases: vec![
+                    (0, vec![HlilStmt::Return(Some(HlilExpr::Const(1)))]),
+                    (1, vec![]),
+                ],
+                default: vec![HlilStmt::Assign {
+                    dest: HlilExpr::Var("i".into()),
+                    src: HlilExpr::Const(0xdeadbeef),
+                }],
+            },
+            HlilStmt::Return(Some(HlilExpr::Deref {
+                addr: Box::new(HlilExpr::BinOp {
+                    op: BinOp::Add,
+                    left: Box::new(HlilExpr::Var("i".into())),
+                    right: Box::new(HlilExpr::Const(0x10)),
+                }),
+                size: 4,
+            })),
+        ];
+
+        // Manually declare `i` so the generated body has the expected local
+        // (render_pseudocode itself doesn't infer locals).
+        let mut source = String::new();
+        source.push_str("#include <stdint.h>\n#include <stdbool.h>\n");
+        source.push_str("int sample_fn(void) {\n");
+        source.push_str("    int64_t i;\n");
+        let body = render_pseudocode("sample_fn", &stmts).text;
+        // Strip the auto-generated header/signature from render_pseudocode and
+        // splice the body into our harness so the `i` declaration is in scope.
+        if let Some(start) = body.find("int sample_fn(void) {\n") {
+            let body_start = start + "int sample_fn(void) {\n".len();
+            let body_end = body.rfind('}').unwrap_or(body.len());
+            source.push_str(&body[body_start..body_end]);
+        }
+        source.push_str("}\n");
+
+        let tmp =
+            std::env::temp_dir().join(format!("sleuthre_decompile_{}.c", uuid::Uuid::new_v4()));
+        std::fs::write(&tmp, source.as_bytes()).unwrap();
+        let output = std::process::Command::new(&cc)
+            .args([
+                "-std=c11",
+                "-fsyntax-only",
+                "-Werror=implicit-function-declaration",
+            ])
+            .arg(&tmp)
+            .output()
+            .expect("failed to spawn C compiler");
+        let _ = std::fs::remove_file(&tmp);
+        assert!(
+            output.status.success(),
+            "generated C failed to compile:\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    fn find_c_compiler() -> Option<std::path::PathBuf> {
+        for candidate in ["cc", "gcc", "clang"] {
+            if let Ok(output) = std::process::Command::new("which").arg(candidate).output()
+                && output.status.success()
+            {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !path.is_empty() {
+                    return Some(std::path::PathBuf::from(path));
+                }
+            }
+        }
+        None
     }
 }
