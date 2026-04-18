@@ -5,6 +5,7 @@ pub mod entropy;
 pub mod functions;
 pub mod passes;
 pub mod pipeline;
+pub mod recompile_diff;
 pub mod stack;
 pub mod strings;
 pub mod struct_inference;

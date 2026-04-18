@@ -159,6 +159,37 @@ impl Disassembler {
         }
         Ok(results)
     }
+
+    /// Disassemble a raw byte slice that is not part of any `MemoryMap`.
+    ///
+    /// Useful for one-off buffers — for example, the `.text` section of a
+    /// freshly-compiled object file during recompile-diff verification.
+    pub fn disassemble_bytes(&self, data: &[u8], base: u64) -> Result<Vec<Instruction>> {
+        let insns = self
+            .cs
+            .disasm_all(data, base)
+            .map_err(|e: capstone::Error| Error::Analysis(e.to_string()))?;
+        let mut results = Vec::new();
+        for insn in insns.iter() {
+            let detail = self
+                .cs
+                .insn_detail(insn)
+                .map_err(|e| Error::Analysis(e.to_string()))?;
+            let groups = detail
+                .groups()
+                .iter()
+                .map(|g| self.cs.group_name(*g).unwrap_or_default())
+                .collect();
+            results.push(Instruction {
+                address: insn.address(),
+                bytes: insn.bytes().to_vec(),
+                mnemonic: insn.mnemonic().unwrap_or("").to_string(),
+                op_str: insn.op_str().unwrap_or("").to_string(),
+                groups,
+            });
+        }
+        Ok(results)
+    }
 }
 
 #[cfg(test)]
