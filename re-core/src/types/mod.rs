@@ -300,6 +300,38 @@ impl TypeManager {
     }
 }
 
+/// Parse a user-supplied type string into a [`TypeRef`].
+///
+/// Supports stdint.h primitives (`uint32_t`, …), Win32 aliases
+/// (`BYTE`/`WORD`/`DWORD`/`QWORD`), pointer suffix (`int*`), and falls back to
+/// [`TypeRef::Named`] for unknown identifiers.
+pub fn parse_type_str(s: &str) -> TypeRef {
+    let s = s.trim();
+    if let Some(stripped) = s.strip_suffix('*') {
+        let inner = parse_type_str(stripped);
+        return TypeRef::Pointer(Box::new(inner));
+    }
+    match s {
+        "void" => TypeRef::Primitive(PrimitiveType::Void),
+        "bool" => TypeRef::Primitive(PrimitiveType::Bool),
+        "char" => TypeRef::Primitive(PrimitiveType::Char),
+        "uint8_t" | "u8" | "unsigned char" | "BYTE" => TypeRef::Primitive(PrimitiveType::U8),
+        "int8_t" | "i8" | "signed char" => TypeRef::Primitive(PrimitiveType::I8),
+        "uint16_t" | "u16" | "unsigned short" | "WORD" => TypeRef::Primitive(PrimitiveType::U16),
+        "int16_t" | "i16" | "short" => TypeRef::Primitive(PrimitiveType::I16),
+        "uint32_t" | "u32" | "unsigned int" | "DWORD" => TypeRef::Primitive(PrimitiveType::U32),
+        "int32_t" | "i32" | "int" => TypeRef::Primitive(PrimitiveType::I32),
+        "uint64_t" | "u64" | "unsigned long long" | "QWORD" => {
+            TypeRef::Primitive(PrimitiveType::U64)
+        }
+        "int64_t" | "i64" | "long long" => TypeRef::Primitive(PrimitiveType::I64),
+        "float" | "f32" => TypeRef::Primitive(PrimitiveType::F32),
+        "double" | "f64" => TypeRef::Primitive(PrimitiveType::F64),
+        "size_t" | "usize" => TypeRef::Primitive(PrimitiveType::USize),
+        _ => TypeRef::Named(s.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
