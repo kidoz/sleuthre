@@ -227,6 +227,17 @@ pub struct SourceLineInfo {
     pub column: Option<u32>,
 }
 
+/// Class-level metadata for a struct treated as a C++ class.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ClassInfo {
+    /// Name of the base class (must exist in `types` as a Struct).
+    pub base: Option<String>,
+    /// Human-readable label of the vtable this class uses (e.g., "vtable_Widget").
+    pub vtable_label: Option<String>,
+    /// Absolute address of the vtable, if known.
+    pub vtable_address: Option<u64>,
+}
+
 /// Manages all user-defined types and type annotations
 #[derive(Default)]
 pub struct TypeManager {
@@ -236,6 +247,8 @@ pub struct TypeManager {
     pub global_variables: BTreeMap<u64, VariableInfo>,
     pub local_variables: BTreeMap<u64, Vec<VariableInfo>>,
     pub source_lines: BTreeMap<u64, SourceLineInfo>,
+    /// Parallel map for types that should be treated as C++ classes.
+    pub classes: BTreeMap<String, ClassInfo>,
     pub arch: crate::arch::Architecture,
 }
 
