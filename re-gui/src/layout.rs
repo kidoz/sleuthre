@@ -38,6 +38,11 @@ impl TabViewer for SleuthreTabViewer<'_> {
             Tab::DataInspector => self.app.show_data_inspector(ui),
             Tab::SourceCompare => self.app.show_source_compare(ui),
             Tab::Tabular => self.app.show_tabular_data(ui),
+            Tab::ImagePreview => {
+                self.app.ensure_image_textures(ui.ctx());
+                self.app.show_image_preview(ui);
+            }
+            Tab::Bytecode => self.app.show_bytecode(ui),
         }
     }
 }
@@ -695,6 +700,13 @@ impl SleuthreApp {
                     ui.close();
                 }
                 ui.separator();
+                if ui.button("Import Symbols...").clicked() {
+                    self.import_symbols_active = true;
+                    self.import_symbols_preview = None;
+                    self.import_symbols_path = String::new();
+                    ui.close();
+                }
+                ui.separator();
                 if ui.button("Quit").clicked() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
@@ -871,6 +883,8 @@ impl SleuthreApp {
                     ("Data Inspector", Tab::DataInspector),
                     ("Source Compare", Tab::SourceCompare),
                     ("Tabular", Tab::Tabular),
+                    ("Images", Tab::ImagePreview),
+                    ("Bytecode", Tab::Bytecode),
                 ] {
                     if ui.button(name).clicked() {
                         self.focus_or_open_tab(tab);
@@ -1400,6 +1414,17 @@ impl SleuthreApp {
                                 self.output.push_str(msg);
                                 self.output.push('\n');
                             }
+                            re_core::scripting::ScriptAction::ImportSymbols { path } => {
+                                match import_symbols_from_path(project, path) {
+                                    Ok(n) => self.output.push_str(&format!(
+                                        "Imported {} symbols from {}\n",
+                                        n, path
+                                    )),
+                                    Err(e) => self
+                                        .output
+                                        .push_str(&format!("Import symbols failed: {}\n", e)),
+                                }
+                            }
                         }
                     }
                     if !result.output.is_empty() {
@@ -1875,4 +1900,56 @@ fn entropy_nav_color(normalized: f32) -> egui::Color32 {
     } else {
         egui::Color32::from_rgb(220, 60, 60)
     }
+}
+
+/// Import symbols from a file, applying renames and comments to the project.
+/// Returns the number of symbols applied.
+pub(crate) fn import_symbols_from_path(
+    project: &mut re_core::project::Project,
+    path: &str,
+) -> Result<usize, String> {
+    use re_core::import::symbols::{detect_format, parse_symbols};
+
+    let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let fmt = detect_format(&content);
+    let symbols = parse_symbols(&content, fmt)?;
+
+    let mut applied = 0usize;
+    for sym in &symbols {
+        let old_name = project
+            .functions
+            .functions
+            .get(&sym.address)
+            .map(|f| f.name.clone());
+        match old_name {
+            Some(old) if old != sym.name => {
+                project.execute(re_core::project::UndoCommand::Rename {
+                    address: sym.address,
+                    old_name: old,
+                    new_name: sym.name.clone(),
+                });
+                applied += 1;
+            }
+            None => {
+                // No function record yet; register rename via symbols list and comments map.
+                project.symbols.push(re_core::loader::Symbol {
+                    name: sym.name.clone(),
+                    address: sym.address,
+                    size: 0,
+                    kind: re_core::loader::SymbolKind::Function,
+                });
+                applied += 1;
+            }
+            _ => {}
+        }
+        if let Some(ref c) = sym.comment {
+            let old_comment = project.comments.get(&sym.address).cloned();
+            project.execute(re_core::project::UndoCommand::Comment {
+                address: sym.address,
+                old_comment,
+                new_comment: Some(c.clone()),
+            });
+        }
+    }
+    Ok(applied)
 }

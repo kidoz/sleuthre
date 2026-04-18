@@ -1,8 +1,61 @@
 use eframe::egui;
 use re_core::analysis::xrefs::XrefType;
-use re_core::project::{ActionKind, UndoCommand};
+use re_core::import::symbols::ImportedSymbol;
+use re_core::project::{ActionKind, Project, UndoCommand};
 
 use crate::app::{SearchMode, SleuthreApp};
+
+fn parse_hex_u64(s: &str) -> Option<u64> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if let Some(rest) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        u64::from_str_radix(rest, 16).ok()
+    } else {
+        t.parse().ok()
+    }
+}
+
+fn apply_symbol_renames(project: &mut Project, symbols: &[ImportedSymbol]) -> usize {
+    let mut applied = 0usize;
+    for sym in symbols {
+        let old_name = project
+            .functions
+            .functions
+            .get(&sym.address)
+            .map(|f| f.name.clone());
+        match old_name {
+            Some(old) if old != sym.name => {
+                project.execute(UndoCommand::Rename {
+                    address: sym.address,
+                    old_name: old,
+                    new_name: sym.name.clone(),
+                });
+                applied += 1;
+            }
+            None => {
+                project.symbols.push(re_core::loader::Symbol {
+                    name: sym.name.clone(),
+                    address: sym.address,
+                    size: 0,
+                    kind: re_core::loader::SymbolKind::Function,
+                });
+                applied += 1;
+            }
+            _ => {}
+        }
+        if let Some(ref c) = sym.comment {
+            let old_comment = project.comments.get(&sym.address).cloned();
+            project.execute(UndoCommand::Comment {
+                address: sym.address,
+                old_comment,
+                new_comment: Some(c.clone()),
+            });
+        }
+    }
+    applied
+}
 
 impl SleuthreApp {
     pub(crate) fn show_modals(&mut self, ctx: &egui::Context) {
@@ -19,6 +72,185 @@ impl SleuthreApp {
         self.show_create_struct_dialog(ctx);
         self.show_add_field_dialog(ctx);
         self.show_reanalyze_dialog(ctx);
+        self.show_import_symbols_dialog(ctx);
+        self.show_class_edit_dialog(ctx);
+    }
+
+    fn show_class_edit_dialog(&mut self, ctx: &egui::Context) {
+        if !self.class_edit_active {
+            return;
+        }
+        let type_name = self.class_edit_target.clone();
+        let candidate_types: Vec<String> = self
+            .project
+            .as_ref()
+            .map(|p| {
+                p.types
+                    .types
+                    .iter()
+                    .filter(|(n, t)| {
+                        matches!(t, re_core::types::CompoundType::Struct { .. })
+                            && n.as_str() != type_name
+                    })
+                    .map(|(n, _)| n.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        egui::Window::new(format!("Class: {}", type_name))
+            .collapsible(false)
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Base class:");
+                    ui.text_edit_singleline(&mut self.class_edit_base);
+                });
+                ui.horizontal_wrapped(|ui| {
+                    for name in &candidate_types {
+                        if ui.small_button(name).clicked() {
+                            self.class_edit_base = name.clone();
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("VTable label:");
+                    ui.text_edit_singleline(&mut self.class_edit_vtable_label);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("VTable address:");
+                    ui.text_edit_singleline(&mut self.class_edit_vtable_addr);
+                    ui.label(
+                        egui::RichText::new("(hex, e.g. 0x405000)")
+                            .size(10.0)
+                            .color(egui::Color32::GRAY),
+                    );
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        let addr = parse_hex_u64(&self.class_edit_vtable_addr);
+                        if let Some(ref mut project) = self.project {
+                            let info = re_core::types::ClassInfo {
+                                base: if self.class_edit_base.is_empty() {
+                                    None
+                                } else {
+                                    Some(self.class_edit_base.clone())
+                                },
+                                vtable_label: if self.class_edit_vtable_label.is_empty() {
+                                    None
+                                } else {
+                                    Some(self.class_edit_vtable_label.clone())
+                                },
+                                vtable_address: addr,
+                            };
+                            project.types.classes.insert(type_name.clone(), info);
+                            project.decompilation_cache.clear();
+                        }
+                        self.class_edit_active = false;
+                    }
+                    if ui.button("Remove Class Metadata").clicked() {
+                        if let Some(ref mut project) = self.project {
+                            project.types.classes.remove(&type_name);
+                        }
+                        self.class_edit_active = false;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.class_edit_active = false;
+                    }
+                });
+            });
+    }
+
+    fn show_import_symbols_dialog(&mut self, ctx: &egui::Context) {
+        if !self.import_symbols_active {
+            return;
+        }
+        egui::Window::new("Import Symbols")
+            .collapsible(false)
+            .default_width(480.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("File:");
+                    ui.text_edit_singleline(&mut self.import_symbols_path);
+                    if ui.button("Browse...").clicked()
+                        && let Some(p) = rfd::FileDialog::new()
+                            .add_filter("Symbol files", &["map", "idc", "csv", "txt"])
+                            .pick_file()
+                    {
+                        self.import_symbols_path = p.to_string_lossy().to_string();
+                        self.import_symbols_preview = None;
+                    }
+                });
+                ui.separator();
+
+                if ui.button("Preview").clicked() {
+                    match std::fs::read_to_string(&self.import_symbols_path) {
+                        Ok(content) => {
+                            let fmt = re_core::import::symbols::detect_format(&content);
+                            match re_core::import::symbols::parse_symbols(&content, fmt) {
+                                Ok(symbols) => {
+                                    self.import_symbols_preview = Some((fmt, symbols));
+                                }
+                                Err(e) => {
+                                    self.add_toast(
+                                        crate::app::ToastKind::Error,
+                                        format!("Parse error: {}", e),
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            self.add_toast(
+                                crate::app::ToastKind::Error,
+                                format!("Read error: {}", e),
+                            );
+                        }
+                    }
+                }
+
+                if let Some((fmt, syms)) = &self.import_symbols_preview {
+                    ui.label(format!("Detected format: {:?}", fmt));
+                    ui.label(format!("{} symbols parsed", syms.len()));
+                    egui::ScrollArea::vertical()
+                        .max_height(220.0)
+                        .id_salt("import_symbols_preview")
+                        .show(ui, |ui| {
+                            for sym in syms.iter().take(200) {
+                                ui.monospace(format!("0x{:08X}  {}", sym.address, sym.name));
+                            }
+                            if syms.len() > 200 {
+                                ui.label(format!("... {} more", syms.len() - 200));
+                            }
+                        });
+                }
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let can_apply = self.import_symbols_preview.is_some() && self.project.is_some();
+                    if ui
+                        .add_enabled(can_apply, egui::Button::new("Apply"))
+                        .clicked()
+                    {
+                        let symbols = self
+                            .import_symbols_preview
+                            .as_ref()
+                            .map(|(_, s)| s.clone())
+                            .unwrap_or_default();
+                        if let Some(ref mut project) = self.project {
+                            let applied = apply_symbol_renames(project, &symbols);
+                            self.add_toast(
+                                crate::app::ToastKind::Success,
+                                format!("Applied {} symbols", applied),
+                            );
+                        }
+                        self.import_symbols_active = false;
+                        self.import_symbols_preview = None;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.import_symbols_active = false;
+                        self.import_symbols_preview = None;
+                    }
+                });
+            });
     }
 
     fn show_add_field_dialog(&mut self, ctx: &egui::Context) {

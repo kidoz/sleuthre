@@ -1,3 +1,4 @@
+use eframe::egui;
 use re_core::analysis::cfg::ControlFlowGraph;
 use re_core::analysis::type_propagation::FunctionTypeInfo;
 use re_core::disasm::Disassembler;
@@ -7,7 +8,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::theme::{SyntaxColors, ThemeMode};
-use re_core::analysis::passes::SuspiciousNamePass;
+use re_core::analysis::passes::{MsvcPatternPass, SuspiciousNamePass};
 
 pub(crate) struct SleuthreApp {
     pub(crate) project: Option<Project>,
@@ -174,11 +175,13 @@ pub(crate) struct SleuthreApp {
 
     // Archive browser
     pub(crate) archive_registry: re_core::formats::archive::FormatRegistry,
+    pub(crate) archive_image_registry: re_core::formats::image::ImageDecoderRegistry,
     pub(crate) archive_data: Option<Vec<u8>>,
     pub(crate) archive_dir: Option<re_core::formats::archive::ArchiveDirectory>,
     pub(crate) archive_format: Option<String>,
     pub(crate) archive_selected: Option<usize>,
     pub(crate) archive_preview: Option<Vec<u8>>,
+    pub(crate) archive_image_texture: Option<(egui::TextureHandle, f32, f32)>,
     pub(crate) archive_filter: String,
 
     // Data inspector (struct overlays)
@@ -193,18 +196,48 @@ pub(crate) struct SleuthreApp {
     pub(crate) source_compare_files: Vec<(String, String)>,
     pub(crate) source_compare_mappings: Vec<SourceMapping>,
     pub(crate) source_compare_selected: Option<usize>,
+    pub(crate) source_compare_scroll_y: f32,
 
     // Tabular viewer
     pub(crate) tabular_data: Option<TabularData>,
     pub(crate) tabular_filter: String,
     pub(crate) tabular_sort_col: Option<usize>,
     pub(crate) tabular_sort_asc: bool,
+
+    // Import symbols dialog
+    pub(crate) import_symbols_active: bool,
+    pub(crate) import_symbols_path: String,
+    pub(crate) import_symbols_preview: Option<(
+        re_core::import::symbols::SymbolFormat,
+        Vec<re_core::import::symbols::ImportedSymbol>,
+    )>,
+
+    // Image preview pane
+    pub(crate) image_preview_slots: Vec<ImagePreviewSlot>,
+    pub(crate) image_preview_selected: Option<usize>,
+    pub(crate) image_zoom: f32,
+    pub(crate) image_pan: egui::Vec2,
+
+    // Bytecode view
+    pub(crate) bytecode_registry: re_core::formats::bytecode::BytecodeFormatRegistry,
+    pub(crate) bytecode_bytes: Option<Vec<u8>>,
+    pub(crate) bytecode_opcodes: Vec<re_core::formats::bytecode::OpcodeDefinition>,
+    pub(crate) bytecode_insns: Vec<re_core::formats::bytecode::BytecodeInstruction>,
+    pub(crate) bytecode_format_name: Option<String>,
+
+    // Class editor
+    pub(crate) class_edit_active: bool,
+    pub(crate) class_edit_target: String,
+    pub(crate) class_edit_base: String,
+    pub(crate) class_edit_vtable_label: String,
+    pub(crate) class_edit_vtable_addr: String,
 }
+
+pub(crate) use crate::views::image_preview::ImagePreviewSlot;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SourceMatchStatus {
     Matched,
-    #[allow(dead_code)]
     Divergent,
     Unmatched,
 }
@@ -258,6 +291,8 @@ pub(crate) enum Tab {
     DataInspector,
     SourceCompare,
     Tabular,
+    ImagePreview,
+    Bytecode,
 }
 
 impl std::fmt::Display for Tab {
@@ -280,6 +315,8 @@ impl std::fmt::Display for Tab {
             Tab::DataInspector => write!(f, "Data Inspector"),
             Tab::SourceCompare => write!(f, "Source Compare"),
             Tab::Tabular => write!(f, "Tabular"),
+            Tab::ImagePreview => write!(f, "Images"),
+            Tab::Bytecode => write!(f, "Bytecode"),
         }
     }
 }
@@ -401,6 +438,7 @@ impl Default for SleuthreApp {
             plugin_manager: {
                 let mut pm = PluginManager::default();
                 pm.register_analysis_pass(Box::new(SuspiciousNamePass));
+                pm.register_analysis_pass(Box::new(MsvcPatternPass));
                 pm
             },
             plugin_findings: Vec::new(),
@@ -470,11 +508,13 @@ impl Default for SleuthreApp {
             new_sig_pattern: String::new(),
             new_sig_library: "user".into(),
             archive_registry: re_core::formats::archive::default_registry(),
+            archive_image_registry: re_core::formats::image::default_image_registry(),
             archive_data: None,
             archive_dir: None,
             archive_format: None,
             archive_selected: None,
             archive_preview: None,
+            archive_image_texture: None,
             archive_filter: String::new(),
             overlay_add_active: false,
             overlay_add_address: String::new(),
@@ -485,10 +525,28 @@ impl Default for SleuthreApp {
             source_compare_files: Vec::new(),
             source_compare_mappings: Vec::new(),
             source_compare_selected: None,
+            source_compare_scroll_y: 0.0,
             tabular_data: None,
             tabular_filter: String::new(),
             tabular_sort_col: None,
             tabular_sort_asc: true,
+            import_symbols_active: false,
+            import_symbols_path: String::new(),
+            import_symbols_preview: None,
+            image_preview_slots: Vec::new(),
+            image_preview_selected: None,
+            image_zoom: 1.0,
+            image_pan: egui::Vec2::ZERO,
+            bytecode_registry: re_core::formats::bytecode::default_bytecode_registry(),
+            bytecode_bytes: None,
+            bytecode_opcodes: Vec::new(),
+            bytecode_insns: Vec::new(),
+            bytecode_format_name: None,
+            class_edit_active: false,
+            class_edit_target: String::new(),
+            class_edit_base: String::new(),
+            class_edit_vtable_label: String::new(),
+            class_edit_vtable_addr: String::new(),
         }
     }
 }

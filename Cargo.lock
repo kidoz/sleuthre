@@ -2899,6 +2899,7 @@ dependencies = [
  "rfd",
  "rhai",
  "serde",
+ "serde_json",
  "uuid",
 ]
 

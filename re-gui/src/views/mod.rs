@@ -1,4 +1,5 @@
 mod archives;
+mod bytecode;
 mod callgraph;
 mod data_inspector;
 mod decompiler;
@@ -9,6 +10,7 @@ mod exports;
 mod graph;
 pub(crate) mod graph_utils;
 mod hex;
+pub(crate) mod image_preview;
 mod imports;
 mod signatures;
 mod source_compare;

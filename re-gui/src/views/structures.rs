@@ -88,9 +88,94 @@ impl SleuthreApp {
                     });
                     ui.separator();
 
+                    // Class / inheritance row (struct only). Read-only here; editable via
+                    // the class editor dialog opened from the "Edit Class..." button.
+                    if matches!(ty, CompoundType::Struct { .. })
+                        && let Some(ref project) = self.project
+                        && let Some(info) = project.types.classes.get(type_name)
+                    {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("class:")
+                                    .color(egui::Color32::from_rgb(180, 220, 255))
+                                    .size(10.0),
+                            );
+                            if let Some(ref base) = info.base {
+                                ui.label(
+                                    egui::RichText::new(format!("extends {}", base))
+                                        .size(10.0)
+                                        .color(egui::Color32::LIGHT_BLUE),
+                                );
+                            }
+                            if let Some(ref vt) = info.vtable_label {
+                                ui.label(
+                                    egui::RichText::new(format!("vtable: {}", vt))
+                                        .size(10.0)
+                                        .color(egui::Color32::from_rgb(230, 200, 140)),
+                                );
+                            }
+                            if let Some(addr) = info.vtable_address {
+                                ui.label(
+                                    egui::RichText::new(format!("@ 0x{:X}", addr))
+                                        .size(10.0)
+                                        .monospace(),
+                                );
+                            }
+                        });
+                    }
+                    if matches!(ty, CompoundType::Struct { .. })
+                        && ui.small_button("Edit Class...").clicked()
+                    {
+                        self.class_edit_active = true;
+                        self.class_edit_target = type_name.clone();
+                        if let Some(ref project) = self.project
+                            && let Some(info) = project.types.classes.get(type_name)
+                        {
+                            self.class_edit_base = info.base.clone().unwrap_or_default();
+                            self.class_edit_vtable_label =
+                                info.vtable_label.clone().unwrap_or_default();
+                            self.class_edit_vtable_addr = info
+                                .vtable_address
+                                .map(|a| format!("0x{:X}", a))
+                                .unwrap_or_default();
+                        } else {
+                            self.class_edit_base.clear();
+                            self.class_edit_vtable_label.clear();
+                            self.class_edit_vtable_addr.clear();
+                        }
+                    }
+
                     match ty {
                         CompoundType::Struct { fields, name, .. }
                         | CompoundType::Union { fields, name, .. } => {
+                            // If class has a base, show inherited fields as read-only header.
+                            if let CompoundType::Struct { .. } = ty
+                                && let Some(ref project) = self.project
+                                && let Some(info) = project.types.classes.get(name)
+                                && let Some(ref base_name) = info.base
+                                && let Some(CompoundType::Struct {
+                                    fields: base_fields,
+                                    ..
+                                }) = project.types.types.get(base_name)
+                            {
+                                ui.label(
+                                    egui::RichText::new(format!("// inherited from {}", base_name))
+                                        .size(10.0)
+                                        .color(egui::Color32::DARK_GRAY),
+                                );
+                                for field in base_fields {
+                                    ui.monospace(
+                                        egui::RichText::new(format!(
+                                            "  +{:#04X}  {}  {}",
+                                            field.offset,
+                                            field.type_ref.display_name(),
+                                            field.name
+                                        ))
+                                        .color(egui::Color32::DARK_GRAY),
+                                    );
+                                }
+                                ui.separator();
+                            }
                             for (idx, field) in fields.iter().enumerate() {
                                 ui.horizontal(|ui| {
                                     ui.monospace(format!(

@@ -3,6 +3,74 @@ use re_core::formats::archive::ArchiveEntryType;
 
 use crate::app::{SleuthreApp, ToastKind};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PreviewKind {
+    Image,
+    Table,
+    Text,
+    Hex,
+}
+
+fn classify_preview(name: &str, data: &[u8]) -> PreviewKind {
+    let lower = name.to_lowercase();
+    if lower.ends_with(".bmp")
+        || lower.ends_with(".tga")
+        || lower.ends_with(".pcx")
+        || (data.len() >= 2 && &data[..2] == b"BM")
+        || (data.len() >= 4 && data[0] == 0x0A && data[3] == 8)
+    {
+        return PreviewKind::Image;
+    }
+    if lower.ends_with(".csv") || lower.ends_with(".tsv") || lower.ends_with(".tab") {
+        return PreviewKind::Table;
+    }
+    let sample_len = data.len().min(256);
+    let printable = data[..sample_len]
+        .iter()
+        .filter(|&&b| b == b'\n' || b == b'\r' || b == b'\t' || (0x20..=0x7E).contains(&b))
+        .count();
+    if sample_len > 0 && printable * 10 >= sample_len * 9 {
+        PreviewKind::Text
+    } else {
+        PreviewKind::Hex
+    }
+}
+
+/// Parse CSV/TSV content into a TabularData preview (first 100 rows).
+fn parse_tabular_preview(content: &str) -> Option<crate::app::TabularData> {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let first = lines[0];
+    let delim = if first.contains('\t') {
+        '\t'
+    } else if first.contains(',') {
+        ','
+    } else if first.contains(';') {
+        ';'
+    } else {
+        return None;
+    };
+    let split =
+        |line: &str| -> Vec<String> { line.split(delim).map(|s| s.trim().to_string()).collect() };
+    let headers = split(lines[0]);
+    if headers.is_empty() {
+        return None;
+    }
+    let rows = lines[1..]
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .take(500)
+        .map(|l| split(l))
+        .collect();
+    Some(crate::app::TabularData {
+        headers,
+        rows,
+        source_name: String::new(),
+    })
+}
+
 impl SleuthreApp {
     pub(crate) fn show_archives(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
@@ -206,34 +274,119 @@ impl SleuthreApp {
 
                         // Preview pane
                         if let Some(ref preview) = self.archive_preview {
-                            let is_text = preview.iter().take(256).all(|&b| {
-                                b == b'\n' || b == b'\r' || b == b'\t' || (0x20..=0x7E).contains(&b)
-                            });
-
-                            if is_text {
-                                ui.label(
-                                    egui::RichText::new("Text Preview")
-                                        .size(10.0)
-                                        .color(egui::Color32::GRAY),
-                                );
-                                egui::ScrollArea::vertical()
-                                    .id_salt("archive_text_preview")
-                                    .show(ui, |ui| {
-                                        let text = String::from_utf8_lossy(preview);
-                                        ui.monospace(egui::RichText::new(text.as_ref()).size(11.0));
-                                    });
-                            } else {
-                                ui.label(
-                                    egui::RichText::new("Hex Preview")
-                                        .size(10.0)
-                                        .color(egui::Color32::GRAY),
-                                );
-                                egui::ScrollArea::vertical()
-                                    .id_salt("archive_hex_preview")
-                                    .show(ui, |ui| {
-                                        let hex = format_hex_preview(preview, 256);
-                                        ui.monospace(egui::RichText::new(&hex).size(11.0));
-                                    });
+                            let kind = classify_preview(&entry.name, preview);
+                            match kind {
+                                PreviewKind::Image => {
+                                    ui.label(
+                                        egui::RichText::new("Image Preview")
+                                            .size(10.0)
+                                            .color(egui::Color32::GRAY),
+                                    );
+                                    if self.archive_image_texture.is_none()
+                                        && let Some(img) =
+                                            self.archive_image_registry.decode(preview, &entry.name)
+                                    {
+                                        let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                                            [img.width as usize, img.height as usize],
+                                            &img.pixels,
+                                        );
+                                        let texture = ui.ctx().load_texture(
+                                            "archive_preview_image",
+                                            color_image,
+                                            egui::TextureOptions::NEAREST,
+                                        );
+                                        self.archive_image_texture =
+                                            Some((texture, img.width as f32, img.height as f32));
+                                    }
+                                    if let Some((tex, w, h)) = &self.archive_image_texture {
+                                        let avail = ui.available_size();
+                                        let scale = (avail.x / w).min(avail.y / h).clamp(0.1, 2.0);
+                                        ui.add(
+                                            egui::Image::new(tex).fit_to_exact_size(egui::vec2(
+                                                w * scale,
+                                                h * scale,
+                                            )),
+                                        );
+                                    } else {
+                                        ui.label("Cannot decode image.");
+                                    }
+                                }
+                                PreviewKind::Table => {
+                                    ui.label(
+                                        egui::RichText::new("Table Preview")
+                                            .size(10.0)
+                                            .color(egui::Color32::GRAY),
+                                    );
+                                    let text = String::from_utf8_lossy(preview);
+                                    if let Some(data) = parse_tabular_preview(&text) {
+                                        egui::ScrollArea::both()
+                                            .id_salt("archive_table_preview")
+                                            .show(ui, |ui| {
+                                                egui::Grid::new("archive_table_grid")
+                                                    .striped(true)
+                                                    .show(ui, |ui| {
+                                                        for h in &data.headers {
+                                                            ui.label(
+                                                                egui::RichText::new(h)
+                                                                    .strong()
+                                                                    .size(11.0),
+                                                            );
+                                                        }
+                                                        ui.end_row();
+                                                        for row in data.rows.iter().take(100) {
+                                                            for cell in row {
+                                                                ui.label(
+                                                                    egui::RichText::new(cell)
+                                                                        .monospace()
+                                                                        .size(11.0),
+                                                                );
+                                                            }
+                                                            ui.end_row();
+                                                        }
+                                                    });
+                                                if data.rows.len() > 100 {
+                                                    ui.label(
+                                                        egui::RichText::new(format!(
+                                                            "... {} more rows",
+                                                            data.rows.len() - 100
+                                                        ))
+                                                        .size(10.0)
+                                                        .color(egui::Color32::GRAY),
+                                                    );
+                                                }
+                                            });
+                                    } else {
+                                        ui.label("Could not parse tabular data.");
+                                    }
+                                }
+                                PreviewKind::Text => {
+                                    ui.label(
+                                        egui::RichText::new("Text Preview")
+                                            .size(10.0)
+                                            .color(egui::Color32::GRAY),
+                                    );
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("archive_text_preview")
+                                        .show(ui, |ui| {
+                                            let text = String::from_utf8_lossy(preview);
+                                            ui.monospace(
+                                                egui::RichText::new(text.as_ref()).size(11.0),
+                                            );
+                                        });
+                                }
+                                PreviewKind::Hex => {
+                                    ui.label(
+                                        egui::RichText::new("Hex Preview")
+                                            .size(10.0)
+                                            .color(egui::Color32::GRAY),
+                                    );
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("archive_hex_preview")
+                                        .show(ui, |ui| {
+                                            let hex = format_hex_preview(preview, 256);
+                                            ui.monospace(egui::RichText::new(&hex).size(11.0));
+                                        });
+                                }
                             }
                         } else {
                             ui.label("Loading preview...");
@@ -301,6 +454,9 @@ impl SleuthreApp {
     }
 
     fn load_archive_preview(&mut self, entry_idx: usize) {
+        // Drop any cached image texture from a prior entry.
+        self.archive_image_texture = None;
+
         let (Some(data), Some(dir)) = (&self.archive_data, &self.archive_dir) else {
             return;
         };
@@ -308,16 +464,18 @@ impl SleuthreApp {
             return;
         };
 
+        const PREVIEW_CAP: usize = 4 * 1024 * 1024; // 4 MB cap for images/tables
+
         // Use the registry to extract
         if let Some(format) = self.archive_registry.detect(data, "") {
             match format.extract(data, entry) {
-                Ok(extracted) => {
-                    // Keep at most 4KB for preview
-                    let preview_len = extracted.len().min(4096);
-                    self.archive_preview = Some(extracted[..preview_len].to_vec());
+                Ok(mut extracted) => {
+                    if extracted.len() > PREVIEW_CAP {
+                        extracted.truncate(PREVIEW_CAP);
+                    }
+                    self.archive_preview = Some(extracted);
                 }
                 Err(_) => {
-                    // Fallback: raw bytes from offset
                     let start = entry.offset as usize;
                     let end = (start + 256).min(data.len());
                     if start < data.len() {
