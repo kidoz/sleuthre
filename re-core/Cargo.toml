@@ -20,3 +20,4 @@ gimli = { workspace = true }
 object = { workspace = true }
 pdb = { workspace = true }
 rhai = { workspace = true }
+flate2 = "1.0"
