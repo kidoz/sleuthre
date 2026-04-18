@@ -1,3 +1,6 @@
+use crate::formats::archive::default_registry as default_archive_registry;
+use crate::formats::bytecode::{OpcodeDefinition, OperandType, disassemble_with_table};
+use crate::import::symbols::{detect_format, parse_symbols};
 use crate::project::Project;
 use rhai::{Dynamic, Engine, EvalAltResult, Scope};
 use std::cell::RefCell;
@@ -10,6 +13,7 @@ pub enum ScriptAction {
     Comment { address: u64, text: String },
     Goto(u64),
     Print(String),
+    ImportSymbols { path: String },
 }
 
 #[derive(Clone)]
@@ -93,6 +97,167 @@ impl ScriptEngine {
         engine.register_fn("read_u16_le", BinaryFile::read_u16_le);
         engine.register_fn("read_string", BinaryFile::read_string);
         engine.register_fn("len", BinaryFile::len);
+
+        // Archive APIs (read-only; auto-detects format by magic/extension).
+        engine.register_fn(
+            "open_archive",
+            |path: rhai::ImmutableString| -> Result<rhai::Map, Box<EvalAltResult>> {
+                let data = std::fs::read(path.as_str())
+                    .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?;
+                let ext = std::path::Path::new(path.as_str())
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                let registry = default_archive_registry();
+                let (dir, format) = registry
+                    .open(&data, &ext)
+                    .map_err(|e| Box::new(EvalAltResult::from(e)))?;
+                let mut out = rhai::Map::new();
+                out.insert("path".into(), Dynamic::from(path.to_string()));
+                out.insert("format".into(), Dynamic::from(format.name().to_string()));
+                out.insert("count".into(), Dynamic::from(dir.entries.len() as i64));
+                Ok(out)
+            },
+        );
+        engine.register_fn(
+            "archive_entries",
+            |path: rhai::ImmutableString| -> Result<rhai::Array, Box<EvalAltResult>> {
+                let data = std::fs::read(path.as_str())
+                    .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?;
+                let ext = std::path::Path::new(path.as_str())
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                let registry = default_archive_registry();
+                let (dir, _fmt) = registry
+                    .open(&data, &ext)
+                    .map_err(|e| Box::new(EvalAltResult::from(e)))?;
+                let arr: rhai::Array = dir
+                    .entries
+                    .iter()
+                    .map(|e| {
+                        let mut m = rhai::Map::new();
+                        m.insert("name".into(), Dynamic::from(e.name.clone()));
+                        m.insert("offset".into(), Dynamic::from(e.offset as i64));
+                        m.insert("size".into(), Dynamic::from(e.decompressed_size as i64));
+                        m.insert(
+                            "compressed_size".into(),
+                            Dynamic::from(e.compressed_size as i64),
+                        );
+                        m.insert("is_compressed".into(), Dynamic::from(e.is_compressed));
+                        Dynamic::from(m)
+                    })
+                    .collect();
+                Ok(arr)
+            },
+        );
+        engine.register_fn(
+            "archive_extract",
+            |path: rhai::ImmutableString,
+             entry_name: rhai::ImmutableString|
+             -> Result<rhai::Blob, Box<EvalAltResult>> {
+                let data = std::fs::read(path.as_str())
+                    .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?;
+                let ext = std::path::Path::new(path.as_str())
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                let registry = default_archive_registry();
+                let (dir, format) = registry
+                    .open(&data, &ext)
+                    .map_err(|e| Box::new(EvalAltResult::from(e)))?;
+                let entry = dir
+                    .entries
+                    .iter()
+                    .find(|e| e.name == entry_name.as_str())
+                    .ok_or_else(|| {
+                        Box::new(EvalAltResult::from(format!(
+                            "entry '{}' not found",
+                            entry_name
+                        )))
+                    })?;
+                let bytes = format
+                    .extract(&data, entry)
+                    .map_err(|e| Box::new(EvalAltResult::from(e)))?;
+                Ok(bytes)
+            },
+        );
+
+        // Bytecode disassembly: run a user-supplied opcode table over a blob.
+        // Each entry in `opcodes` must be a map with keys: opcode (i64), mnemonic (string),
+        // operands (array of strings: "u8"|"u16"|"u32"|"i8"|"i16"|"i32"|"str:N"|"cstr").
+        engine.register_fn(
+            "disassemble_bytecode",
+            |data: rhai::Blob, opcodes: rhai::Array| -> Result<rhai::Array, Box<EvalAltResult>> {
+                let mut defs = Vec::with_capacity(opcodes.len());
+                for item in opcodes {
+                    let map = item.try_cast::<rhai::Map>().ok_or_else(|| {
+                        Box::new(EvalAltResult::from("opcode entry must be a map"))
+                    })?;
+                    let opcode = map
+                        .get("opcode")
+                        .and_then(|v| v.clone().try_cast::<i64>())
+                        .ok_or_else(|| {
+                            Box::new(EvalAltResult::from("opcode.opcode missing/invalid"))
+                        })? as u8;
+                    let mnemonic = map
+                        .get("mnemonic")
+                        .and_then(|v| v.clone().try_cast::<rhai::ImmutableString>())
+                        .map(|s| s.to_string())
+                        .unwrap_or_default();
+                    let operands_arr = map
+                        .get("operands")
+                        .and_then(|v| v.clone().try_cast::<rhai::Array>())
+                        .unwrap_or_default();
+                    let mut op_types = Vec::with_capacity(operands_arr.len());
+                    for o in operands_arr {
+                        let s = o.try_cast::<rhai::ImmutableString>().ok_or_else(|| {
+                            Box::new(EvalAltResult::from("operand entry must be a string"))
+                        })?;
+                        op_types.push(parse_operand_type(s.as_str())?);
+                    }
+                    defs.push(OpcodeDefinition {
+                        opcode,
+                        mnemonic,
+                        operand_types: op_types,
+                        description: String::new(),
+                    });
+                }
+                let insns = disassemble_with_table(&data, &defs, 0)
+                    .map_err(|e| Box::new(EvalAltResult::from(e)))?;
+                let arr: rhai::Array = insns
+                    .into_iter()
+                    .map(|ins| {
+                        let mut m = rhai::Map::new();
+                        m.insert("offset".into(), Dynamic::from(ins.offset as i64));
+                        m.insert("opcode".into(), Dynamic::from(ins.opcode as i64));
+                        m.insert("mnemonic".into(), Dynamic::from(ins.mnemonic));
+                        m.insert("length".into(), Dynamic::from(ins.length as i64));
+                        let ops: rhai::Array =
+                            ins.operands.into_iter().map(Dynamic::from).collect();
+                        m.insert("operands".into(), Dynamic::from(ops));
+                        Dynamic::from(m)
+                    })
+                    .collect();
+                Ok(arr)
+            },
+        );
+
+        // Parse a symbol file and return the count of parsed entries (pure query).
+        engine.register_fn(
+            "parse_symbol_file",
+            |path: rhai::ImmutableString| -> Result<i64, Box<EvalAltResult>> {
+                let content = std::fs::read_to_string(path.as_str())
+                    .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?;
+                let fmt = detect_format(&content);
+                let syms =
+                    parse_symbols(&content, fmt).map_err(|e| Box::new(EvalAltResult::from(e)))?;
+                Ok(syms.len() as i64)
+            },
+        );
 
         Self { engine }
     }
@@ -203,6 +368,16 @@ impl ScriptEngine {
             actions_print.borrow_mut().push(ScriptAction::Print(msg));
         });
 
+        let actions_import = actions.clone();
+        self.engine
+            .register_fn("import_symbols", move |path: rhai::ImmutableString| {
+                actions_import
+                    .borrow_mut()
+                    .push(ScriptAction::ImportSymbols {
+                        path: path.to_string(),
+                    });
+            });
+
         let result = self.engine.eval_with_scope::<Dynamic>(&mut scope, script)?;
 
         let collected_actions = actions.borrow().clone();
@@ -235,6 +410,29 @@ impl ScriptEngine {
 pub struct ScriptResult {
     pub output: String,
     pub actions: Vec<ScriptAction>,
+}
+
+fn parse_operand_type(s: &str) -> Result<OperandType, Box<EvalAltResult>> {
+    match s {
+        "u8" => Ok(OperandType::Uint8),
+        "u16" => Ok(OperandType::Uint16),
+        "u32" => Ok(OperandType::Uint32),
+        "i8" => Ok(OperandType::Int8),
+        "i16" => Ok(OperandType::Int16),
+        "i32" => Ok(OperandType::Int32),
+        "cstr" => Ok(OperandType::NullTermString),
+        other => {
+            if let Some(rest) = other.strip_prefix("str:")
+                && let Ok(n) = rest.parse::<usize>()
+            {
+                return Ok(OperandType::FixedString(n));
+            }
+            Err(Box::new(EvalAltResult::from(format!(
+                "unknown operand type '{}'",
+                s
+            ))))
+        }
+    }
 }
 
 #[cfg(test)]
