@@ -742,6 +742,19 @@ fn write_expr_prec(w: &mut SourceWriter, expr: &HlilExpr, parent_prec: u8) {
                 HlilExpr::Global(addr, name) => {
                     w.write_annotated(name, AnnotationKind::Function(*addr));
                 }
+                // Virtual call: `obj->method()` where `method` is a field pointing
+                // to a function. Render as-is (FieldAccess already prints member
+                // syntax) so the result reads like a C++ method call.
+                HlilExpr::FieldAccess { .. } => {
+                    write_expr_prec(w, target, 11);
+                }
+                // Indirect call through a dereferenced pointer: wrap the target
+                // in a function-pointer cast so the expression parses as C.
+                HlilExpr::Deref { addr, .. } => {
+                    w.write("(*(void (**)(void))(");
+                    write_expr_prec(w, addr, 0);
+                    w.write("))");
+                }
                 _ => write_expr_prec(w, target, 11),
             }
             w.write("(");
