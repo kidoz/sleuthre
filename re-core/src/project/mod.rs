@@ -96,6 +96,16 @@ pub struct Project {
     pub type_libs: TypeLibraryManager,
     pub arch: Architecture,
     pub binary_format: BinaryFormat,
+    pub struct_overlays: Vec<StructOverlay>,
+}
+
+/// A named struct/type applied to a memory address, optionally as an array.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StructOverlay {
+    pub address: u64,
+    pub type_name: String,
+    pub count: usize,
+    pub label: String,
 }
 
 impl Project {
@@ -126,6 +136,7 @@ impl Project {
             type_libs: TypeLibraryManager::default(),
             arch: Architecture::X86_64,
             binary_format: BinaryFormat::Raw,
+            struct_overlays: Vec::new(),
         }
     }
 
@@ -439,6 +450,11 @@ impl Project {
                 db.save_decompiled_code(addr, code)?;
             }
 
+            // Persist struct overlays
+            for overlay in &self.struct_overlays {
+                db.save_struct_overlay(overlay)?;
+            }
+
             Ok(())
         })();
 
@@ -512,6 +528,9 @@ impl Project {
 
         // Restore decompilation cache
         project.decompilation_cache = db.load_decompilation_cache()?;
+
+        // Restore struct overlays
+        project.struct_overlays = db.load_struct_overlays()?;
 
         project.db = Some(db);
         Ok(project)

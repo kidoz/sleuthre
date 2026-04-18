@@ -139,6 +139,13 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS idx_tags_address ON tags(address);
             CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(tag);
+            CREATE TABLE IF NOT EXISTS struct_overlays (
+                address INTEGER NOT NULL,
+                label TEXT NOT NULL,
+                type_name TEXT NOT NULL,
+                count INTEGER NOT NULL,
+                PRIMARY KEY (address, label)
+            );
             COMMIT;",
             )
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
@@ -366,7 +373,8 @@ impl Database {
                  DELETE FROM local_variables;
                  DELETE FROM source_lines;
                  DELETE FROM decompilation_cache;
-                 DELETE FROM tags;",
+                 DELETE FROM tags;
+                 DELETE FROM struct_overlays;",
             )
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
         Ok(())
@@ -658,6 +666,47 @@ impl Database {
             tags.entry(addr).or_default().push(tag);
         }
         Ok(tags)
+    }
+
+    // --- Struct overlay persistence ---
+
+    pub fn save_struct_overlay(&self, overlay: &crate::project::StructOverlay) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO struct_overlays (address, label, type_name, count) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    overlay.address,
+                    overlay.label,
+                    overlay.type_name,
+                    overlay.count as u64,
+                ],
+            )
+            .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn load_struct_overlays(&self) -> Result<Vec<crate::project::StructOverlay>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT address, label, type_name, count FROM struct_overlays ORDER BY address, label")
+            .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(crate::project::StructOverlay {
+                    address: row.get::<_, u64>(0)?,
+                    label: row.get::<_, String>(1)?,
+                    type_name: row.get::<_, String>(2)?,
+                    count: row.get::<_, u64>(3)? as usize,
+                })
+            })
+            .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
+
+        let mut overlays = Vec::new();
+        for row in rows {
+            overlays.push(row.map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?);
+        }
+        Ok(overlays)
     }
 
     // --- Function signature persistence ---
@@ -1086,6 +1135,37 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].name, "main");
         assert_eq!(loaded[0].kind, SymbolKind::Function);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn round_trip_struct_overlays() {
+        let (db, path) = temp_db();
+        let overlays = [
+            crate::project::StructOverlay {
+                address: 0x500000,
+                type_name: "Player".into(),
+                count: 1,
+                label: "player".into(),
+            },
+            crate::project::StructOverlay {
+                address: 0x600000,
+                type_name: "Monster".into(),
+                count: 32,
+                label: "monster_table".into(),
+            },
+        ];
+        for o in &overlays {
+            db.save_struct_overlay(o).unwrap();
+        }
+        let loaded = db.load_struct_overlays().unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].address, 0x500000);
+        assert_eq!(loaded[0].type_name, "Player");
+        assert_eq!(loaded[0].count, 1);
+        assert_eq!(loaded[0].label, "player");
+        assert_eq!(loaded[1].address, 0x600000);
+        assert_eq!(loaded[1].count, 32);
         let _ = std::fs::remove_file(path);
     }
 }
