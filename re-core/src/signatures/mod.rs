@@ -33,6 +33,62 @@ pub struct SignatureDatabase {
     pub signatures: Vec<Signature>,
 }
 
+/// Intermediate result of parsing a PAT line.
+struct PatEntry {
+    pattern: Vec<PatternByte>,
+    pattern_len: usize,
+    name: String,
+}
+
+/// Parse a single Hex-Rays PAT line.
+///
+/// The leading token is 32 hex characters (or `..` wildcards) representing
+/// the first 32 bytes. Remaining tokens are discarded until the trailing
+/// identifier, which is the recovered symbol name.
+fn parse_pat_line(line: &str) -> Option<PatEntry> {
+    let pat_token = line.split_whitespace().next()?;
+    if pat_token.len() < 2 || pat_token.len() % 2 != 0 {
+        return None;
+    }
+    let mut pattern = Vec::with_capacity(pat_token.len() / 2);
+    let bytes = pat_token.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        let hi = bytes[i];
+        let lo = bytes[i + 1];
+        if hi == b'.' && lo == b'.' {
+            pattern.push(PatternByte::Wildcard);
+        } else {
+            let hi = from_hex(hi)?;
+            let lo = from_hex(lo)?;
+            pattern.push(PatternByte::Exact(hi * 16 + lo));
+        }
+        i += 2;
+    }
+
+    // Name is the last whitespace-separated token on the line.
+    let name = line.split_whitespace().last()?.to_string();
+    // Guard against the name being the same token as the pattern (empty line case).
+    if name == pat_token {
+        return None;
+    }
+    let pattern_len = pattern.len();
+    Some(PatEntry {
+        pattern,
+        pattern_len,
+        name,
+    })
+}
+
+fn from_hex(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// A match result.
 #[derive(Debug, Clone)]
 pub struct SignatureMatch {
@@ -66,6 +122,43 @@ impl SignatureDatabase {
     pub fn save_to_file(&self, path: &std::path::Path) -> Result<(), String> {
         let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
         std::fs::write(path, json).map_err(|e| e.to_string())
+    }
+
+    /// Load signatures from a Hex-Rays FLIRT PAT file.
+    ///
+    /// The PAT format is the text-based intermediate emitted by FLAIR's `pcf`
+    /// tool before it is packed into the binary `.sig` container. Each line is:
+    ///
+    /// ```text
+    /// <first-32-bytes-hex-with-..-wildcards> <crc16_len:02X> <crc16:04X> <total_len:04X> <refs...> <name>
+    /// ```
+    ///
+    /// Only the leading pattern and the trailing name are used here; CRC and
+    /// length fields are accepted but ignored. Lines starting with `---` mark
+    /// the end of the module and are skipped.
+    pub fn load_from_pat_file(path: &std::path::Path, library: &str) -> Result<Self, String> {
+        let data = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        Self::load_from_pat_str(&data, library)
+    }
+
+    /// Parse PAT text content into a SignatureDatabase.
+    pub fn load_from_pat_str(content: &str, library: &str) -> Result<Self, String> {
+        let mut db = SignatureDatabase::default();
+        for (line_no, raw) in content.lines().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with("---") || line.starts_with(';') {
+                continue;
+            }
+            let sig = parse_pat_line(line)
+                .ok_or_else(|| format!("line {}: malformed PAT entry: {}", line_no + 1, raw))?;
+            db.signatures.push(Signature {
+                name: sig.name,
+                pattern: sig.pattern,
+                library: library.to_string(),
+                min_match_length: sig.pattern_len.max(8),
+            });
+        }
+        Ok(db)
     }
 
     /// Merge another database into this one (deduplicates by name).
@@ -413,5 +506,33 @@ mod tests {
         assert!(libraries.contains("plt"), "Missing 'plt' library");
         assert!(libraries.contains("compiler"), "Missing 'compiler' library");
         assert!(libraries.contains("crypto"), "Missing 'crypto' library");
+    }
+
+    #[test]
+    fn parse_pat_line_with_wildcards() {
+        // Synthetic PAT entry: 4 pattern bytes followed by required trailing fields.
+        let entry = parse_pat_line("554889E5 00 0000 0004 :0000 _start").unwrap();
+        assert_eq!(entry.pattern.len(), 4);
+        assert_eq!(entry.pattern[0], PatternByte::Exact(0x55));
+        assert_eq!(entry.pattern[3], PatternByte::Exact(0xE5));
+        assert_eq!(entry.name, "_start");
+
+        let wildcarded = parse_pat_line("55....E5 00 0000 0004 :0000 maybe_main").unwrap();
+        assert_eq!(wildcarded.pattern[1], PatternByte::Wildcard);
+        assert_eq!(wildcarded.pattern[2], PatternByte::Wildcard);
+        assert_eq!(wildcarded.name, "maybe_main");
+    }
+
+    #[test]
+    fn load_from_pat_str_roundtrip() {
+        let content = "\
+554889E5 00 0000 0004 :0000 _start\n\
+---\n\
+90909090 00 0000 0004 :0000 nop_pad\n";
+        let db = SignatureDatabase::load_from_pat_str(content, "testlib").unwrap();
+        assert_eq!(db.signatures.len(), 2);
+        assert_eq!(db.signatures[0].name, "_start");
+        assert_eq!(db.signatures[0].library, "testlib");
+        assert_eq!(db.signatures[1].name, "nop_pad");
     }
 }
