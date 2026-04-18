@@ -1,4 +1,6 @@
+mod archives;
 mod callgraph;
+mod data_inspector;
 mod decompiler;
 mod diff;
 mod disassembly;
@@ -9,6 +11,8 @@ pub(crate) mod graph_utils;
 mod hex;
 mod imports;
 mod signatures;
+mod source_compare;
 mod strings;
 mod structures;
+mod tabular;
 mod xrefs;

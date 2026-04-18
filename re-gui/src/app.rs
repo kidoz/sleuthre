@@ -171,6 +171,58 @@ pub(crate) struct SleuthreApp {
     pub(crate) new_sig_name: String,
     pub(crate) new_sig_pattern: String,
     pub(crate) new_sig_library: String,
+
+    // Archive browser
+    pub(crate) archive_registry: re_core::formats::archive::FormatRegistry,
+    pub(crate) archive_data: Option<Vec<u8>>,
+    pub(crate) archive_dir: Option<re_core::formats::archive::ArchiveDirectory>,
+    pub(crate) archive_format: Option<String>,
+    pub(crate) archive_selected: Option<usize>,
+    pub(crate) archive_preview: Option<Vec<u8>>,
+    pub(crate) archive_filter: String,
+
+    // Data inspector (struct overlays)
+    pub(crate) overlay_add_active: bool,
+    pub(crate) overlay_add_address: String,
+    pub(crate) overlay_add_type: String,
+    pub(crate) overlay_add_count: String,
+    pub(crate) overlay_add_label: String,
+
+    // Source compare
+    pub(crate) source_compare_dir: Option<std::path::PathBuf>,
+    pub(crate) source_compare_files: Vec<(String, String)>,
+    pub(crate) source_compare_mappings: Vec<SourceMapping>,
+    pub(crate) source_compare_selected: Option<usize>,
+
+    // Tabular viewer
+    pub(crate) tabular_data: Option<TabularData>,
+    pub(crate) tabular_filter: String,
+    pub(crate) tabular_sort_col: Option<usize>,
+    pub(crate) tabular_sort_asc: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceMatchStatus {
+    Matched,
+    #[allow(dead_code)]
+    Divergent,
+    Unmatched,
+}
+
+#[derive(Clone)]
+pub(crate) struct SourceMapping {
+    pub(crate) address: u64,
+    pub(crate) binary_name: String,
+    pub(crate) source_function: Option<String>,
+    pub(crate) source_file: Option<String>,
+    pub(crate) status: SourceMatchStatus,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct TabularData {
+    pub(crate) headers: Vec<String>,
+    pub(crate) rows: Vec<Vec<String>>,
+    pub(crate) source_name: String,
 }
 
 pub(crate) struct Toast {
@@ -202,6 +254,10 @@ pub(crate) enum Tab {
     Entropy,
     Signatures,
     Diff,
+    Archives,
+    DataInspector,
+    SourceCompare,
+    Tabular,
 }
 
 impl std::fmt::Display for Tab {
@@ -220,6 +276,10 @@ impl std::fmt::Display for Tab {
             Tab::Entropy => write!(f, "Entropy"),
             Tab::Signatures => write!(f, "Signatures"),
             Tab::Diff => write!(f, "Binary Diff"),
+            Tab::Archives => write!(f, "Archives"),
+            Tab::DataInspector => write!(f, "Data Inspector"),
+            Tab::SourceCompare => write!(f, "Source Compare"),
+            Tab::Tabular => write!(f, "Tabular"),
         }
     }
 }
@@ -409,6 +469,26 @@ impl Default for SleuthreApp {
             new_sig_name: String::new(),
             new_sig_pattern: String::new(),
             new_sig_library: "user".into(),
+            archive_registry: re_core::formats::archive::default_registry(),
+            archive_data: None,
+            archive_dir: None,
+            archive_format: None,
+            archive_selected: None,
+            archive_preview: None,
+            archive_filter: String::new(),
+            overlay_add_active: false,
+            overlay_add_address: String::new(),
+            overlay_add_type: String::new(),
+            overlay_add_count: "1".into(),
+            overlay_add_label: String::new(),
+            source_compare_dir: None,
+            source_compare_files: Vec::new(),
+            source_compare_mappings: Vec::new(),
+            source_compare_selected: None,
+            tabular_data: None,
+            tabular_filter: String::new(),
+            tabular_sort_col: None,
+            tabular_sort_asc: true,
         }
     }
 }

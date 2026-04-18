@@ -34,6 +34,10 @@ impl TabViewer for SleuthreTabViewer<'_> {
             Tab::Entropy => self.app.show_entropy(ui),
             Tab::Signatures => self.app.show_signatures(ui),
             Tab::Diff => self.app.show_diff(ui),
+            Tab::Archives => self.app.show_archives(ui),
+            Tab::DataInspector => self.app.show_data_inspector(ui),
+            Tab::SourceCompare => self.app.show_source_compare(ui),
+            Tab::Tabular => self.app.show_tabular_data(ui),
         }
     }
 }
@@ -863,6 +867,10 @@ impl SleuthreApp {
                     ("Entropy", Tab::Entropy),
                     ("Signatures", Tab::Signatures),
                     ("Binary Diff", Tab::Diff),
+                    ("Archives", Tab::Archives),
+                    ("Data Inspector", Tab::DataInspector),
+                    ("Source Compare", Tab::SourceCompare),
+                    ("Tabular", Tab::Tabular),
                 ] {
                     if ui.button(name).clicked() {
                         self.focus_or_open_tab(tab);
