@@ -65,6 +65,108 @@ fn resource_result(id: &Value, uri: &str, data: &impl serde::Serialize) -> Value
     }
 }
 
+/// Format an LLIL function as a human-readable listing — one instruction per
+/// line with its source address. Debug-format is used because LLIL does not
+/// yet have a dedicated textual printer.
+fn format_llil(func: &re_core::il::llil::LlilFunction) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("; llil function @ 0x{:x}\n", func.entry));
+    for inst in &func.instructions {
+        for stmt in &inst.stmts {
+            out.push_str(&format!("{:08x}: {:?}\n", inst.address, stmt));
+        }
+    }
+    out
+}
+
+/// Format an MLIL function (SSA form) as a listing.
+fn format_mlil(func: &re_core::il::mlil::MlilFunction) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("; mlil function @ 0x{:x}\n", func.entry));
+    for inst in &func.instructions {
+        for stmt in &inst.stmts {
+            out.push_str(&format!("{:08x}: {:?}\n", inst.address, stmt));
+        }
+    }
+    out
+}
+
+/// Walk an MLIL function and return a sorted list of SSA variables together
+/// with the addresses at which they appear.
+fn collect_ssa_vars(func: &re_core::il::mlil::MlilFunction) -> Vec<serde_json::Value> {
+    use re_core::il::mlil::{MlilExpr, MlilStmt};
+    use std::collections::BTreeMap;
+
+    fn walk_expr(expr: &MlilExpr, addr: u64, map: &mut BTreeMap<(String, u32), Vec<u64>>) {
+        match expr {
+            MlilExpr::Var(ssa) => {
+                map.entry((ssa.name.clone(), ssa.version))
+                    .or_default()
+                    .push(addr);
+            }
+            MlilExpr::Load { addr: a, .. } => walk_expr(a, addr, map),
+            MlilExpr::BinOp { left, right, .. } => {
+                walk_expr(left, addr, map);
+                walk_expr(right, addr, map);
+            }
+            MlilExpr::UnaryOp { operand, .. } => walk_expr(operand, addr, map),
+            MlilExpr::Phi(vars) => {
+                for v in vars {
+                    map.entry((v.name.clone(), v.version))
+                        .or_default()
+                        .push(addr);
+                }
+            }
+            MlilExpr::Call { target, args } => {
+                walk_expr(target, addr, map);
+                for a in args {
+                    walk_expr(a, addr, map);
+                }
+            }
+            MlilExpr::VectorOp { operands, .. } => {
+                for op in operands {
+                    walk_expr(op, addr, map);
+                }
+            }
+            MlilExpr::Const(_) => {}
+        }
+    }
+
+    let mut map: BTreeMap<(String, u32), Vec<u64>> = BTreeMap::new();
+    for inst in &func.instructions {
+        for stmt in &inst.stmts {
+            match stmt {
+                MlilStmt::Assign { dest, src } => {
+                    map.entry((dest.name.clone(), dest.version))
+                        .or_default()
+                        .push(inst.address);
+                    walk_expr(src, inst.address, &mut map);
+                }
+                MlilStmt::Store { addr, value, .. } => {
+                    walk_expr(addr, inst.address, &mut map);
+                    walk_expr(value, inst.address, &mut map);
+                }
+                MlilStmt::Jump { target } => walk_expr(target, inst.address, &mut map),
+                MlilStmt::BranchIf { cond, target } => {
+                    walk_expr(cond, inst.address, &mut map);
+                    walk_expr(target, inst.address, &mut map);
+                }
+                MlilStmt::Call { target } => walk_expr(target, inst.address, &mut map),
+                MlilStmt::Return | MlilStmt::Nop => {}
+            }
+        }
+    }
+    map.into_iter()
+        .map(|((name, version), sites)| {
+            json!({
+                "name": name,
+                "version": version,
+                "sites": sites.into_iter().map(|a| format!("0x{:x}", a)).collect::<Vec<_>>(),
+            })
+        })
+        .collect()
+}
+
 impl McpServer {
     fn new() -> Self {
         Self {
@@ -299,6 +401,42 @@ impl McpServer {
                                     "address": { "type": "number" }
                                 },
                                 "required": ["address"]
+                            }
+                        },
+                        {
+                            "name": "get_microcode",
+                            "description": "Return the LLIL/MLIL textual microcode for the function containing the given address.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "address": { "type": "number" },
+                                    "tier": { "type": "string", "enum": ["llil", "mlil"], "default": "mlil" }
+                                },
+                                "required": ["address"]
+                            }
+                        },
+                        {
+                            "name": "get_ssa_form",
+                            "description": "Enumerate SSA variables (name and version) used in the function at the given address.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "address": { "type": "number" }
+                                },
+                                "required": ["address"]
+                            }
+                        },
+                        {
+                            "name": "rewrite_il",
+                            "description": "Assert a type for a local variable so the decompiler lifts it with that type (IL-level rewrite).",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "function": { "type": "number" },
+                                    "variable": { "type": "string" },
+                                    "type": { "type": "string" }
+                                },
+                                "required": ["function", "variable", "type"]
                             }
                         }
                     ]
@@ -822,6 +960,119 @@ impl McpServer {
                 } else {
                     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": "No project loaded" } })
                 }
+            }
+            "get_microcode" => {
+                let Some(addr) = args.get("address").and_then(|a| a.as_u64()) else {
+                    return missing_param_error(&id, "address");
+                };
+                let tier = args
+                    .get("tier")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("mlil")
+                    .to_ascii_lowercase();
+                let (Some(project), Some(disasm)) = (&self.project, &self.disasm) else {
+                    return json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": "No project loaded" } });
+                };
+                let Some(func) = project.functions.get_function(addr) else {
+                    return json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32004, "message": format!("No function at 0x{:x}", addr) } });
+                };
+                let size = func
+                    .end_address
+                    .and_then(|end| end.checked_sub(func.start_address))
+                    .map(|s| s as usize)
+                    .unwrap_or(0x100);
+                let instructions = match disasm.disassemble_range(
+                    &project.memory_map,
+                    func.start_address,
+                    size,
+                ) {
+                    Ok(insns) => insns,
+                    Err(e) => {
+                        return json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32002, "message": e.to_string() } });
+                    }
+                };
+                let llil = re_core::il::lifter_x86::lift_function(
+                    &func.name,
+                    func.start_address,
+                    &instructions,
+                );
+                let text = if tier == "llil" {
+                    format_llil(&llil)
+                } else {
+                    let mlil = re_core::il::mlil::lower_to_mlil(&llil);
+                    format_mlil(&mlil)
+                };
+                tool_text_result(&id, &text)
+            }
+            "get_ssa_form" => {
+                let Some(addr) = args.get("address").and_then(|a| a.as_u64()) else {
+                    return missing_param_error(&id, "address");
+                };
+                let (Some(project), Some(disasm)) = (&self.project, &self.disasm) else {
+                    return json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": "No project loaded" } });
+                };
+                let Some(func) = project.functions.get_function(addr) else {
+                    return json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32004, "message": format!("No function at 0x{:x}", addr) } });
+                };
+                let size = func
+                    .end_address
+                    .and_then(|end| end.checked_sub(func.start_address))
+                    .map(|s| s as usize)
+                    .unwrap_or(0x100);
+                let instructions = match disasm.disassemble_range(
+                    &project.memory_map,
+                    func.start_address,
+                    size,
+                ) {
+                    Ok(insns) => insns,
+                    Err(e) => {
+                        return json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32002, "message": e.to_string() } });
+                    }
+                };
+                let llil = re_core::il::lifter_x86::lift_function(
+                    &func.name,
+                    func.start_address,
+                    &instructions,
+                );
+                let mlil = re_core::il::mlil::lower_to_mlil(&llil);
+                let ssa_vars = collect_ssa_vars(&mlil);
+                tool_result(&id, &ssa_vars)
+            }
+            "rewrite_il" => {
+                let Some(func_addr) = args.get("function").and_then(|a| a.as_u64()) else {
+                    return missing_param_error(&id, "function");
+                };
+                let Some(var_name) = args.get("variable").and_then(|v| v.as_str()) else {
+                    return missing_param_error(&id, "variable");
+                };
+                let Some(type_str) = args.get("type").and_then(|t| t.as_str()) else {
+                    return missing_param_error(&id, "type");
+                };
+                let Some(project) = &mut self.project else {
+                    return json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": "No project loaded" } });
+                };
+                let type_ref = re_core::types::parse_type_str(type_str);
+                let var_info = re_core::types::VariableInfo {
+                    name: var_name.to_string(),
+                    type_ref,
+                    location: re_core::types::VariableLocation::Register(var_name.to_string()),
+                };
+                project
+                    .types
+                    .local_variables
+                    .entry(func_addr)
+                    .or_default()
+                    .push(var_info);
+                // Invalidate any cached decompilation for this function so the
+                // next request picks up the new variable type.
+                project.decompilation_cache.remove(&func_addr);
+                tool_text_result(
+                    &id,
+                    &format!(
+                        "Applied type `{}` to `{}` in function 0x{:x}",
+                        type_str, var_name, func_addr
+                    ),
+                )
             }
             _ => {
                 json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": "Tool not found" } })
