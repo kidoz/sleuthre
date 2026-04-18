@@ -535,6 +535,215 @@ impl Project {
         project.db = Some(db);
         Ok(project)
     }
+
+    /// Export the project's analyst-authored state as deterministic JSON Lines
+    /// so that changes can be diffed and merged via git.
+    ///
+    /// Each line is an independent JSON document tagged with a `kind`. Lines
+    /// are emitted in a stable order (addresses ascending, names alphabetical)
+    /// so that semantically identical projects produce byte-identical output.
+    /// Only human-editable data is exported — reproducible analysis artifacts
+    /// (functions, xrefs, strings) are intentionally omitted so the export
+    /// stays small and focused on user intent.
+    pub fn export_jsonl(&self) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+
+        // 1. Metadata header (stable first line).
+        let meta = serde_json::json!({
+            "kind": "meta",
+            "name": self.name,
+            "arch": self.arch.display_name(),
+            "format": format!("{:?}", self.binary_format),
+            "version": 1,
+        });
+        let _ = writeln!(out, "{}", meta);
+
+        // 2. Comments, ordered by address.
+        let mut comments: Vec<_> = self.comments.iter().collect();
+        comments.sort_by_key(|(a, _)| **a);
+        for (&address, text) in comments {
+            let rec = serde_json::json!({
+                "kind": "comment",
+                "address": format!("0x{:x}", address),
+                "text": text,
+            });
+            let _ = writeln!(out, "{}", rec);
+        }
+
+        // 3. Function renames (only those diverging from auto-generated names).
+        let mut funcs: Vec<_> = self.functions.functions.values().collect();
+        funcs.sort_by_key(|f| f.start_address);
+        for func in funcs {
+            let auto = format!("sub_{:x}", func.start_address);
+            if func.name != auto {
+                let rec = serde_json::json!({
+                    "kind": "rename",
+                    "address": format!("0x{:x}", func.start_address),
+                    "name": func.name,
+                });
+                let _ = writeln!(out, "{}", rec);
+            }
+        }
+
+        // 4. Bookmarks.
+        for (&address, note) in self.bookmarks.iter() {
+            let rec = serde_json::json!({
+                "kind": "bookmark",
+                "address": format!("0x{:x}", address),
+                "note": note,
+            });
+            let _ = writeln!(out, "{}", rec);
+        }
+
+        // 5. Tags.
+        for (&address, tags) in self.tags.iter() {
+            let mut sorted = tags.clone();
+            sorted.sort();
+            for tag in sorted {
+                let rec = serde_json::json!({
+                    "kind": "tag",
+                    "address": format!("0x{:x}", address),
+                    "tag": tag,
+                });
+                let _ = writeln!(out, "{}", rec);
+            }
+        }
+
+        // 6. Struct overlays.
+        let mut overlays = self.struct_overlays.clone();
+        overlays.sort_by(|a, b| a.address.cmp(&b.address).then(a.label.cmp(&b.label)));
+        for overlay in &overlays {
+            let rec = serde_json::json!({
+                "kind": "overlay",
+                "address": format!("0x{:x}", overlay.address),
+                "type_name": overlay.type_name,
+                "count": overlay.count,
+                "label": overlay.label,
+            });
+            let _ = writeln!(out, "{}", rec);
+        }
+
+        // 7. User-defined types, alphabetical.
+        let mut type_names: Vec<&String> = self.types.types.keys().collect();
+        type_names.sort();
+        for name in type_names {
+            if let Some(ty) = self.types.types.get(name) {
+                let rec = serde_json::json!({
+                    "kind": "type",
+                    "name": name,
+                    "definition": ty,
+                });
+                let _ = writeln!(out, "{}", rec);
+            }
+        }
+
+        out
+    }
+
+    /// Import analyst-authored state from the JSON Lines format produced by
+    /// [`export_jsonl`]. Unknown `kind` values are silently skipped so the
+    /// format can grow forward-compatibly.
+    pub fn import_jsonl(&mut self, content: &str) -> Result<ImportStats> {
+        let mut stats = ImportStats::default();
+        for (line_no, raw) in content.lines().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let record: serde_json::Value = serde_json::from_str(line).map_err(|e| {
+                crate::Error::Database(format!("jsonl line {}: {}", line_no + 1, e))
+            })?;
+            let kind = record.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            let parse_addr = |value: Option<&serde_json::Value>| {
+                value.and_then(|v| v.as_str()).and_then(|s| {
+                    if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                        u64::from_str_radix(rest, 16).ok()
+                    } else {
+                        s.parse().ok()
+                    }
+                })
+            };
+            match kind {
+                "meta" => {}
+                "comment" => {
+                    if let (Some(address), Some(text)) = (
+                        parse_addr(record.get("address")),
+                        record.get("text").and_then(|v| v.as_str()),
+                    ) {
+                        self.comments.insert(address, text.to_string());
+                        stats.comments += 1;
+                    }
+                }
+                "rename" => {
+                    if let (Some(address), Some(name)) = (
+                        parse_addr(record.get("address")),
+                        record.get("name").and_then(|v| v.as_str()),
+                    ) && let Some(func) = self.functions.functions.get_mut(&address)
+                    {
+                        func.name = name.to_string();
+                        stats.renames += 1;
+                    }
+                }
+                "bookmark" => {
+                    if let (Some(address), Some(note)) = (
+                        parse_addr(record.get("address")),
+                        record.get("note").and_then(|v| v.as_str()),
+                    ) {
+                        self.bookmarks.insert(address, note.to_string());
+                        stats.bookmarks += 1;
+                    }
+                }
+                "tag" => {
+                    if let (Some(address), Some(tag)) = (
+                        parse_addr(record.get("address")),
+                        record.get("tag").and_then(|v| v.as_str()),
+                    ) {
+                        self.tags.entry(address).or_default().push(tag.to_string());
+                        stats.tags += 1;
+                    }
+                }
+                "overlay" => {
+                    if let (Some(address), Some(type_name), Some(count), Some(label)) = (
+                        parse_addr(record.get("address")),
+                        record.get("type_name").and_then(|v| v.as_str()),
+                        record.get("count").and_then(|v| v.as_u64()),
+                        record.get("label").and_then(|v| v.as_str()),
+                    ) {
+                        self.struct_overlays.push(StructOverlay {
+                            address,
+                            type_name: type_name.to_string(),
+                            count: count as usize,
+                            label: label.to_string(),
+                        });
+                        stats.overlays += 1;
+                    }
+                }
+                "type" => {
+                    if let Some(def) = record.get("definition")
+                        && let Ok(ty) =
+                            serde_json::from_value::<crate::types::CompoundType>(def.clone())
+                    {
+                        self.types.add_type(ty);
+                        stats.types += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(stats)
+    }
+}
+
+/// Summary of an [`import_jsonl`] run. Useful for surfacing progress in UI.
+#[derive(Debug, Clone, Default)]
+pub struct ImportStats {
+    pub comments: usize,
+    pub renames: usize,
+    pub bookmarks: usize,
+    pub tags: usize,
+    pub overlays: usize,
+    pub types: usize,
 }
 
 #[cfg(test)]
@@ -675,6 +884,45 @@ mod tests {
         let mut p = test_project();
         assert!(p.undo().is_none());
         assert!(p.redo().is_none());
+    }
+
+    #[test]
+    fn jsonl_export_import_roundtrip() {
+        let mut src = test_project();
+        src.comments.insert(0x1000, "entry point".into());
+        src.bookmarks.insert(0x1020, "check me".into());
+        src.tags.insert(0x1000, vec!["hot".into(), "crypto".into()]);
+        src.struct_overlays.push(StructOverlay {
+            address: 0x2000,
+            type_name: "Player".into(),
+            count: 4,
+            label: "player_table".into(),
+        });
+        src.execute(UndoCommand::Rename {
+            address: 0x1000,
+            old_name: "sub_1000".into(),
+            new_name: "main".into(),
+        });
+        let jsonl = src.export_jsonl();
+
+        // Deterministic ordering: exporting the same project twice yields
+        // byte-identical output.
+        assert_eq!(jsonl, src.export_jsonl());
+
+        // Reimport into a fresh project and verify every field round-trips.
+        let mut dest = test_project();
+        let stats = dest.import_jsonl(&jsonl).unwrap();
+        assert_eq!(stats.comments, 1);
+        assert_eq!(stats.renames, 1);
+        assert_eq!(stats.bookmarks, 1);
+        assert_eq!(stats.tags, 2);
+        assert_eq!(stats.overlays, 1);
+
+        assert_eq!(dest.comments.get(&0x1000), Some(&"entry point".to_string()));
+        assert_eq!(dest.bookmarks.get(&0x1020), Some(&"check me".to_string()));
+        assert_eq!(dest.functions.functions[&0x1000].name, "main");
+        assert_eq!(dest.struct_overlays.len(), 1);
+        assert_eq!(dest.struct_overlays[0].label, "player_table");
     }
 
     #[test]
