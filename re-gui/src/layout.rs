@@ -864,6 +864,64 @@ impl SleuthreApp {
                     ui.close();
                 }
             });
+            ui.menu_button("Tools", |ui| {
+                ui.menu_button("Plugins", |ui| {
+                    if ui.button("Reload from disk").clicked() {
+                        let report = self.plugins.reload_changed();
+                        if report.is_empty() {
+                            self.add_toast(
+                                crate::app::ToastKind::Info,
+                                "No plugin changes detected.".into(),
+                            );
+                        } else {
+                            self.add_toast(
+                                crate::app::ToastKind::Success,
+                                format!(
+                                    "Plugins: +{} ~{} -{}",
+                                    report.added.len(),
+                                    report.updated.len(),
+                                    report.removed.len(),
+                                ),
+                            );
+                        }
+                        ui.close();
+                    }
+                    ui.separator();
+                    let scripts: Vec<(String, String)> = self
+                        .plugins
+                        .scripts()
+                        .iter()
+                        .map(|s| (s.name.clone(), s.source.clone()))
+                        .collect();
+                    if scripts.is_empty() {
+                        ui.label(
+                            egui::RichText::new("No plugins discovered.")
+                                .color(egui::Color32::GRAY)
+                                .size(11.0),
+                        );
+                    }
+                    for (name, source) in scripts {
+                        if ui.button(format!("Run: {}", name)).clicked() {
+                            self.run_script(&source);
+                            ui.close();
+                        }
+                    }
+                });
+                ui.separator();
+                if ui.button("Start Collab Server...").clicked() {
+                    self.collab_dialog_active = true;
+                    if self.collab_port_input.is_empty() {
+                        self.collab_port_input = "0".into();
+                    }
+                    ui.close();
+                }
+                if self.collab_broadcaster.is_some() && ui.button("Stop Collab Server").clicked() {
+                    self.collab_broadcaster = None;
+                    self.collab_status = None;
+                    self.add_toast(crate::app::ToastKind::Info, "Collab server stopped.".into());
+                    ui.close();
+                }
+            });
             ui.menu_button("Windows", |ui| {
                 for (name, tab) in [
                     ("Disassembly", Tab::Disassembly),

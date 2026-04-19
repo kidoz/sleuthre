@@ -74,6 +74,61 @@ impl SleuthreApp {
         self.show_reanalyze_dialog(ctx);
         self.show_import_symbols_dialog(ctx);
         self.show_class_edit_dialog(ctx);
+        self.show_collab_dialog(ctx);
+    }
+
+    fn show_collab_dialog(&mut self, ctx: &egui::Context) {
+        if !self.collab_dialog_active {
+            return;
+        }
+        egui::Window::new("Start Collab Server")
+            .collapsible(false)
+            .default_width(360.0)
+            .show(ctx, |ui| {
+                ui.label("Bind address: 127.0.0.1");
+                ui.horizontal(|ui| {
+                    ui.label("Port:");
+                    ui.text_edit_singleline(&mut self.collab_port_input);
+                    ui.label(
+                        egui::RichText::new("(0 = auto-assign)")
+                            .size(10.0)
+                            .color(egui::Color32::GRAY),
+                    );
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Start").clicked() {
+                        let port: u16 = self.collab_port_input.trim().parse().unwrap_or(0);
+                        match re_core::collab::CollabBroadcaster::bind(("127.0.0.1", port)) {
+                            Ok(b) => {
+                                self.collab_status =
+                                    Some(format!("listening on {}", b.local_addr()));
+                                self.add_toast(
+                                    crate::app::ToastKind::Success,
+                                    format!("Collab server listening on {}", b.local_addr()),
+                                );
+                                self.collab_broadcaster = Some(b);
+                            }
+                            Err(e) => self.add_toast(
+                                crate::app::ToastKind::Error,
+                                format!("Bind failed: {}", e),
+                            ),
+                        }
+                        self.collab_dialog_active = false;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.collab_dialog_active = false;
+                    }
+                });
+                if let Some(ref status) = self.collab_status {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(status)
+                            .size(10.0)
+                            .color(egui::Color32::GRAY),
+                    );
+                }
+            });
     }
 
     fn show_class_edit_dialog(&mut self, ctx: &egui::Context) {
@@ -383,6 +438,7 @@ impl SleuthreApp {
         if !self.rename_active {
             return;
         }
+        let mut published_event: Option<re_core::collab::CollabEvent> = None;
         egui::Window::new("Rename").show(ctx, |ui| {
             ui.text_edit_singleline(&mut self.rename_input);
             ui.horizontal(|ui| {
@@ -394,10 +450,21 @@ impl SleuthreApp {
                             .get(&addr)
                             .map(|f| f.name.clone())
                             .unwrap_or_default();
+                        let new_name = self.rename_input.clone();
                         p.execute(UndoCommand::Rename {
                             address: addr,
-                            old_name,
-                            new_name: self.rename_input.clone(),
+                            old_name: old_name.clone(),
+                            new_name: new_name.clone(),
+                        });
+                        published_event = Some(re_core::collab::CollabEvent {
+                            kind: "rename".into(),
+                            author: "local".into(),
+                            seq: 0,
+                            payload: serde_json::json!({
+                                "address": format!("0x{:x}", addr),
+                                "old_name": old_name,
+                                "new_name": new_name,
+                            }),
                         });
                     }
                     self.rename_active = false;
@@ -407,6 +474,9 @@ impl SleuthreApp {
                 }
             });
         });
+        if let (Some(event), Some(b)) = (published_event, &self.collab_broadcaster) {
+            let _ = b.publish(event);
+        }
     }
 
     fn show_comment_dialog(&mut self, ctx: &egui::Context) {
