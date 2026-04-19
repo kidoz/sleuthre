@@ -194,6 +194,12 @@ fn analyze_loaded_with_bytes(
     on_progress(AnalysisStage::ScanningConstants);
     project.constants.scan(&project.memory_map);
 
+    // --- VTables: scan for arrays of code pointers and link them to known
+    //     COM/C++ class definitions so virtual call resolution works without
+    //     manual class-editor input.
+    let vt_result = crate::analysis::vtable::analyze_vtables(&project.memory_map, loaded.arch);
+    crate::analysis::vtable::auto_link_vtables_to_classes(&vt_result, &mut project.types);
+
     // --- Debug info ---
     on_progress(AnalysisStage::ExtractingDebugInfo);
     let debug_info = debuginfo::extract_debug_info(raw_bytes, loaded.arch).unwrap_or_default();

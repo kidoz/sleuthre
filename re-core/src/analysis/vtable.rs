@@ -416,6 +416,32 @@ pub fn analyze_vtables(memory: &MemoryMap, arch: Architecture) -> VTableAnalysis
     }
 }
 
+/// For every discovered vtable that matched a known interface (e.g.
+/// `IDirectDraw7`) populate the corresponding `ClassInfo` entry's
+/// `vtable_address` if it is not already set. Creates a fresh `ClassInfo` if
+/// no class with that name is declared yet — analysts often discover the
+/// vtable before they get around to declaring the class manually.
+///
+/// Returns the number of classes that were either linked or freshly created.
+pub fn auto_link_vtables_to_classes(
+    result: &VTableAnalysisResult,
+    types: &mut crate::types::TypeManager,
+) -> usize {
+    let mut linked = 0usize;
+    for vt in &result.vtables {
+        let Some(ref iface) = vt.interface_name else {
+            continue;
+        };
+        let entry = types.classes.entry(iface.clone()).or_default();
+        if entry.vtable_address.is_none() {
+            entry.vtable_address = Some(vt.address);
+            entry.vtable_label = Some(format!("vtable_{}", iface));
+            linked += 1;
+        }
+    }
+    linked
+}
+
 fn read_ptr(memory: &MemoryMap, addr: u64, ptr_size: u64, endian: Endianness) -> Option<u64> {
     if ptr_size == 8 {
         memory.read_u64(addr, endian)
@@ -518,5 +544,60 @@ mod tests {
 
         // Out of bounds
         assert!(resolve_indirect_call(&vtable, 12, 4).is_none());
+    }
+
+    #[test]
+    fn auto_link_creates_or_updates_class_info() {
+        let result = VTableAnalysisResult {
+            vtables: vec![
+                VTable {
+                    address: 0x404010,
+                    entries: vec![0x401000, 0x401010, 0x401020],
+                    interface_name: Some("IUnknown".into()),
+                    method_names: vec![None; 3],
+                    confidence: 1.0,
+                },
+                VTable {
+                    address: 0x404100,
+                    entries: vec![],
+                    interface_name: None, // unknown — should be skipped
+                    method_names: vec![],
+                    confidence: 0.5,
+                },
+            ],
+            resolved_calls: Vec::new(),
+        };
+        let mut types = crate::types::TypeManager::default();
+        let n = auto_link_vtables_to_classes(&result, &mut types);
+        assert_eq!(n, 1, "only the matched vtable should produce a link");
+        let cls = types.classes.get("IUnknown").unwrap();
+        assert_eq!(cls.vtable_address, Some(0x404010));
+        assert_eq!(cls.vtable_label.as_deref(), Some("vtable_IUnknown"));
+    }
+
+    #[test]
+    fn auto_link_does_not_overwrite_existing_address() {
+        let result = VTableAnalysisResult {
+            vtables: vec![VTable {
+                address: 0x500000,
+                entries: vec![],
+                interface_name: Some("IUnknown".into()),
+                method_names: vec![],
+                confidence: 1.0,
+            }],
+            resolved_calls: Vec::new(),
+        };
+        let mut types = crate::types::TypeManager::default();
+        types.classes.insert(
+            "IUnknown".into(),
+            crate::types::ClassInfo {
+                base: None,
+                vtable_label: Some("user_label".into()),
+                vtable_address: Some(0x123),
+            },
+        );
+        let n = auto_link_vtables_to_classes(&result, &mut types);
+        assert_eq!(n, 0, "user-supplied address must not be clobbered");
+        assert_eq!(types.classes["IUnknown"].vtable_address, Some(0x123));
     }
 }
