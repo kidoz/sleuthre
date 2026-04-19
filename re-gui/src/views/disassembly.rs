@@ -140,8 +140,29 @@ impl SleuthreApp {
                         self.trigger_decompile = true;
                         ui.close();
                     }
+                    // Debugger integrations only appear when a remote is
+                    // connected — keeps the menu uncluttered for static-only
+                    // sessions. We can't borrow `self` mutably here (the
+                    // outer scroll closure already holds it), so we defer the
+                    // intent into a flag the post-closure handler reads.
+                    if self.debugger_remote.is_some() {
+                        ui.separator();
+                        if ui.button("Set Breakpoint Here").clicked() {
+                            self.pending_bp_set = Some((addr, false));
+                            ui.close();
+                        }
+                        if ui.button("Set Hardware BP Here").clicked() {
+                            self.pending_bp_set = Some((addr, true));
+                            ui.close();
+                        }
+                    }
                 });
             }
         });
+
+        if let Some((addr, hardware)) = self.pending_bp_set.take() {
+            self.debugger_bp_input = format!("0x{:x}", addr);
+            self.debugger_set_breakpoint(hardware);
+        }
     }
 }

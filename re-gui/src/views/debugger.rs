@@ -8,7 +8,13 @@
 use eframe::egui;
 use re_core::{BreakpointKind, Debugger, StopReason};
 
-use crate::app::{SleuthreApp, ToastKind};
+use crate::app::{PendingDebuggerOp, SleuthreApp, ToastKind};
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum DebuggerOp {
+    Step,
+    Continue,
+}
 
 impl SleuthreApp {
     pub(crate) fn show_debugger(&mut self, ui: &mut egui::Ui) {
@@ -54,20 +60,33 @@ impl SleuthreApp {
             return;
         }
 
-        // Control bar.
+        // Control bar. Disable Step/Continue while a previous async op is
+        // still in flight so we don't double-issue RSP commands on the same
+        // socket.
         let mut step_clicked = false;
         let mut continue_clicked = false;
+        let busy = self.debugger_pending.is_some();
         ui.horizontal(|ui| {
-            if ui.button("Step").clicked() {
+            if ui.add_enabled(!busy, egui::Button::new("Step")).clicked() {
                 step_clicked = true;
             }
-            if ui.button("Continue").clicked() {
+            if ui
+                .add_enabled(!busy, egui::Button::new("Continue"))
+                .clicked()
+            {
                 continue_clicked = true;
             }
             if ui.button("Refresh").clicked() {
                 self.debugger_refresh();
             }
-            if let Some(ref reason) = self.debugger_last_stop {
+            if busy {
+                ui.add_space(16.0);
+                ui.label(
+                    egui::RichText::new("running...")
+                        .color(egui::Color32::from_rgb(255, 200, 80))
+                        .size(11.0),
+                );
+            } else if let Some(ref reason) = self.debugger_last_stop {
                 ui.add_space(16.0);
                 let (label, color) = stop_reason_summary(reason);
                 ui.label(egui::RichText::new(label).color(color).size(11.0));
@@ -118,6 +137,9 @@ impl SleuthreApp {
                     let kind_str = match kind {
                         BreakpointKind::Software => "sw",
                         BreakpointKind::Hardware => "hw",
+                        BreakpointKind::WriteWatch => "wp-w",
+                        BreakpointKind::ReadWatch => "wp-r",
+                        BreakpointKind::AccessWatch => "wp-rw",
                     };
                     ui.monospace(
                         egui::RichText::new(format!("  [{}] 0x{:x}", kind_str, addr)).size(11.0),
@@ -227,32 +249,64 @@ impl SleuthreApp {
     }
 
     fn debugger_step(&mut self) {
-        let Some(d) = self.debugger_remote.as_mut() else {
-            return;
-        };
-        match d.step() {
-            Ok(reason) => {
-                self.debugger_last_stop = Some(reason);
-                self.debugger_refresh();
-            }
-            Err(e) => self.add_toast(ToastKind::Error, format!("Step error: {}", e)),
-        }
+        self.spawn_debugger_op(DebuggerOp::Step);
     }
 
     fn debugger_continue(&mut self) {
-        let Some(d) = self.debugger_remote.as_mut() else {
+        self.spawn_debugger_op(DebuggerOp::Continue);
+    }
+
+    /// Move the debugger handle into a worker thread, run the blocking RSP
+    /// exchange there, and ship the (debugger, result) pair back so the main
+    /// thread can resume ownership next frame. Prevents the UI from freezing
+    /// on a long-running inferior.
+    fn spawn_debugger_op(&mut self, op: DebuggerOp) {
+        if self.debugger_pending.is_some() {
+            self.add_toast(ToastKind::Warning, "Debugger is already busy.".into());
+            return;
+        }
+        let Some(mut dbg) = self.debugger_remote.take() else {
             return;
         };
-        match d.continue_exec() {
-            Ok(reason) => {
-                self.debugger_last_stop = Some(reason);
-                self.debugger_refresh();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = match op {
+                DebuggerOp::Step => dbg.step(),
+                DebuggerOp::Continue => dbg.continue_exec(),
+            };
+            let _ = tx.send((dbg, result));
+        });
+        self.debugger_pending = Some(PendingDebuggerOp { op, rx });
+    }
+
+    /// Per-frame poll. Reattaches the debugger handle once the worker thread
+    /// finishes the blocking call and surfaces the stop reason.
+    pub(crate) fn poll_debugger_op(&mut self) {
+        let Some(pending) = self.debugger_pending.as_ref() else {
+            return;
+        };
+        match pending.rx.try_recv() {
+            Ok((dbg, result)) => {
+                self.debugger_remote = Some(dbg);
+                let op = pending.op;
+                self.debugger_pending = None;
+                match result {
+                    Ok(reason) => {
+                        self.debugger_last_stop = Some(reason);
+                        self.debugger_refresh();
+                    }
+                    Err(e) => self.add_toast(ToastKind::Error, format!("{:?} error: {}", op, e)),
+                }
             }
-            Err(e) => self.add_toast(ToastKind::Error, format!("Continue error: {}", e)),
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.debugger_pending = None;
+                self.add_toast(ToastKind::Error, "Debugger worker disconnected.".into());
+            }
         }
     }
 
-    fn debugger_set_breakpoint(&mut self, hardware: bool) {
+    pub(crate) fn debugger_set_breakpoint(&mut self, hardware: bool) {
         let Some(addr) = parse_hex_or_dec(&self.debugger_bp_input) else {
             self.add_toast(
                 ToastKind::Error,

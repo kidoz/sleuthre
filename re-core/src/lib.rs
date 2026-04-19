@@ -47,12 +47,23 @@ pub enum StopReason {
     Other(String),
 }
 
-/// Type of breakpoint to set. Maps directly to the GDB Remote Serial
-/// Protocol `Z<type>` codes (0=software, 1=hardware-execute).
+/// Type of breakpoint or watchpoint to set. Maps directly to the GDB Remote
+/// Serial Protocol `Z<type>` codes:
+///
+/// | Variant         | RSP code | Description |
+/// |-----------------|----------|-------------|
+/// | `Software`      | `Z0`     | Software (INT3-style) execute breakpoint |
+/// | `Hardware`      | `Z1`     | Hardware execute breakpoint |
+/// | `WriteWatch`    | `Z2`     | Watchpoint that fires on memory write |
+/// | `ReadWatch`     | `Z3`     | Watchpoint that fires on memory read |
+/// | `AccessWatch`   | `Z4`     | Watchpoint that fires on either |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BreakpointKind {
     Software,
     Hardware,
+    WriteWatch,
+    ReadWatch,
+    AccessWatch,
 }
 
 pub trait Debugger {

@@ -232,6 +232,21 @@ fn bp_kind_byte(kind: BreakpointKind) -> u8 {
     match kind {
         BreakpointKind::Software => 0,
         BreakpointKind::Hardware => 1,
+        BreakpointKind::WriteWatch => 2,
+        BreakpointKind::ReadWatch => 3,
+        BreakpointKind::AccessWatch => 4,
+    }
+}
+
+/// Length argument supplied with `Z2..Z4`. Watchpoints need a meaningful
+/// region size; for execute breakpoints the stub silently corrects 1.
+fn bp_kind_length(kind: BreakpointKind) -> u32 {
+    match kind {
+        BreakpointKind::Software | BreakpointKind::Hardware => 1,
+        // Default to a 4-byte watch region — the most common case for ints
+        // and pointer-low halves on 32-bit targets. Users can customize via
+        // a future API; for now this matches `gdb`'s default.
+        _ => 4,
     }
 }
 
@@ -362,10 +377,8 @@ impl Debugger for GdbRemoteDebugger {
 
     fn set_breakpoint(&mut self, address: u64, kind: BreakpointKind) -> Result<()> {
         let z = bp_kind_byte(kind);
-        // `Z<type>,<addr>,<kind>` — `<kind>` is the breakpoint length in bytes,
-        // 1 is the safest portable default (x86 uses 1, ARM uses 4 but the
-        // stub auto-corrects when handed 1).
-        let pkt = format!("Z{},{:x},1", z, address);
+        let len = bp_kind_length(kind);
+        let pkt = format!("Z{},{:x},{}", z, address, len);
         let reply = self.send_recv(&pkt)?;
         if reply == "OK" || reply.is_empty() {
             self.breakpoints.push((address, kind));
@@ -382,7 +395,8 @@ impl Debugger for GdbRemoteDebugger {
 
     fn remove_breakpoint(&mut self, address: u64, kind: BreakpointKind) -> Result<()> {
         let z = bp_kind_byte(kind);
-        let pkt = format!("z{},{:x},1", z, address);
+        let len = bp_kind_length(kind);
+        let pkt = format!("z{},{:x},{}", z, address, len);
         let reply = self.send_recv(&pkt)?;
         if reply == "OK" || reply.is_empty() {
             self.breakpoints.retain(|bp| bp != &(address, kind));
@@ -502,5 +516,14 @@ mod tests {
     fn bp_kind_byte_matches_protocol_codes() {
         assert_eq!(bp_kind_byte(BreakpointKind::Software), 0);
         assert_eq!(bp_kind_byte(BreakpointKind::Hardware), 1);
+        assert_eq!(bp_kind_byte(BreakpointKind::WriteWatch), 2);
+        assert_eq!(bp_kind_byte(BreakpointKind::ReadWatch), 3);
+        assert_eq!(bp_kind_byte(BreakpointKind::AccessWatch), 4);
+    }
+
+    #[test]
+    fn watchpoints_use_4_byte_region() {
+        assert_eq!(bp_kind_length(BreakpointKind::WriteWatch), 4);
+        assert_eq!(bp_kind_length(BreakpointKind::Hardware), 1);
     }
 }

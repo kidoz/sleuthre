@@ -255,6 +255,23 @@ pub(crate) struct SleuthreApp {
     pub(crate) debugger_bp_input: String,
     pub(crate) debugger_bp_kind_hw: bool,
     pub(crate) debugger_last_stop: Option<re_core::StopReason>,
+    /// Async operation currently in flight on the debugger; the handle is
+    /// borrowed to a worker thread and returned via the channel when the
+    /// blocking RSP exchange completes.
+    pub(crate) debugger_pending: Option<PendingDebuggerOp>,
+    /// Deferred breakpoint set from a disassembly context-menu click — the
+    /// scroll-area closure can't call `&mut self` methods directly so the
+    /// click stashes intent here for the post-closure handler.
+    pub(crate) pending_bp_set: Option<(u64, bool)>,
+}
+
+/// Async operation in flight on the debugger.
+pub(crate) struct PendingDebuggerOp {
+    pub(crate) op: crate::views::debugger::DebuggerOp,
+    pub(crate) rx: std::sync::mpsc::Receiver<(
+        re_core::debuggers::GdbRemoteDebugger,
+        re_core::Result<re_core::StopReason>,
+    )>,
 }
 
 pub(crate) use crate::views::image_preview::ImagePreviewSlot;
@@ -596,6 +613,8 @@ impl Default for SleuthreApp {
             debugger_bp_input: "0x0".into(),
             debugger_bp_kind_hw: false,
             debugger_last_stop: None,
+            debugger_pending: None,
+            pending_bp_set: None,
         }
     }
 }

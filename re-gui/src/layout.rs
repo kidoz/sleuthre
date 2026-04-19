@@ -182,6 +182,7 @@ impl eframe::App for SleuthreApp {
         self.broadcast_pending_undo_events();
         self.poll_plugin_results();
         self.apply_inbound_collab_events();
+        self.poll_debugger_op();
     }
 }
 
