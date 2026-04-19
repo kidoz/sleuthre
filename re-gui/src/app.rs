@@ -252,6 +252,9 @@ pub(crate) struct SleuthreApp {
     pub(crate) debugger_mem_addr: String,
     pub(crate) debugger_mem_size: u32,
     pub(crate) debugger_mem_data: Option<Vec<u8>>,
+    pub(crate) debugger_bp_input: String,
+    pub(crate) debugger_bp_kind_hw: bool,
+    pub(crate) debugger_last_stop: Option<re_core::StopReason>,
 }
 
 pub(crate) use crate::views::image_preview::ImagePreviewSlot;
@@ -590,6 +593,9 @@ impl Default for SleuthreApp {
             debugger_mem_addr: "0x0".into(),
             debugger_mem_size: 64,
             debugger_mem_data: None,
+            debugger_bp_input: "0x0".into(),
+            debugger_bp_kind_hw: false,
+            debugger_last_stop: None,
         }
     }
 }

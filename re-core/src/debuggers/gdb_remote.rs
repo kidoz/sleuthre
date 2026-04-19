@@ -1,23 +1,24 @@
 //! GDB Remote Serial Protocol (RSP) debugger backend.
 //!
-//! Implements just enough of the [RSP](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Remote-Protocol.html)
+//! Implements enough of the [RSP](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Remote-Protocol.html)
 //! to satisfy the [`Debugger`](crate::Debugger) trait over a TCP connection:
 //!
 //! - `attach(pid)` via `vAttach;<pid>`
 //! - `detach()` via `D`
-//! - `step()` via `s`
-//! - `continue_exec()` via `c` (fire-and-forget — does not block for stop reply)
+//! - `step()` via `s` — waits for stop reply and returns a structured [`StopReason`]
+//! - `continue_exec()` via `c` — same; blocks until the stub reports a stop
 //! - `registers()` via `g` plus architecture-specific register layouts
 //! - `read_memory()` via `m<addr>,<length>`
+//! - `set_breakpoint` / `remove_breakpoint` via `Z<type>,<addr>,<kind>` and the
+//!   matching `z` packet, both software (Z0) and hardware (Z1)
 //!
-//! Packet framing is RSP-standard: `$<body>#<cksum>` with `+`/`-` acknowledgment.
+//! Packet framing is RSP-standard: `$<body>#<cksum>` with `+`/`-` ack.
 //!
-//! This is an MVP: no breakpoint management, no multi-thread awareness, no
-//! extended-remote support. The intent is to prove the RSP stack works so
-//! richer features (hw breakpoints, non-stop mode, tracing) can be layered
-//! on top without rewriting the transport.
+//! Still missing: multi-thread awareness, watchpoints (Z2/Z3/Z4), non-stop
+//! mode, extended-remote launch. The transport is stable so those layer in
+//! without protocol changes.
 
-use crate::{Debugger, DebuggerState, Error, Result};
+use crate::{BreakpointKind, Debugger, DebuggerState, Error, Result, StopReason};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -123,6 +124,9 @@ pub struct GdbRemoteDebugger {
     stream: Mutex<TcpStream>,
     state: DebuggerState,
     arch: crate::arch::Architecture,
+    /// Currently active breakpoints, mirrored client-side so the GUI can
+    /// enumerate them without an extra protocol round-trip.
+    breakpoints: Vec<(u64, BreakpointKind)>,
 }
 
 impl GdbRemoteDebugger {
@@ -142,6 +146,7 @@ impl GdbRemoteDebugger {
             stream: Mutex::new(stream),
             state: DebuggerState::Paused,
             arch,
+            breakpoints: Vec::new(),
         };
         dbg.handshake()?;
         Ok(dbg)
@@ -223,6 +228,83 @@ fn from_hex_nibble(b: u8) -> Option<u8> {
     }
 }
 
+fn bp_kind_byte(kind: BreakpointKind) -> u8 {
+    match kind {
+        BreakpointKind::Software => 0,
+        BreakpointKind::Hardware => 1,
+    }
+}
+
+/// Parse a GDB Remote stop-reply packet into a structured [`StopReason`].
+///
+/// Recognized shapes:
+/// - `S<sig>` — stopped on signal `sig`.
+/// - `T<sig>[<key:val>;…]` — same, with extra key/value pairs. We extract
+///   `swbreak`/`hwbreak` to label breakpoint hits, and `<reg>:<value>` pairs
+///   so we can recover the program counter.
+/// - `W<status>` — exited normally.
+/// - `X<sig>` — terminated by signal `sig`.
+fn parse_stop_reply(reply: &str) -> StopReason {
+    if reply.is_empty() {
+        return StopReason::Other("empty".into());
+    }
+    let bytes = reply.as_bytes();
+    match bytes[0] {
+        b'W' => {
+            let code = u32::from_str_radix(&reply[1..reply.len().min(3)], 16).unwrap_or(0);
+            StopReason::Exited(code as i32)
+        }
+        b'X' => {
+            let sig = u32::from_str_radix(&reply[1..reply.len().min(3)], 16).unwrap_or(0);
+            StopReason::Terminated(sig)
+        }
+        b'S' => {
+            let sig = u32::from_str_radix(&reply[1..reply.len().min(3)], 16).unwrap_or(0);
+            StopReason::Signal(sig)
+        }
+        b'T' => {
+            // `T<sig><key>:<val>;<key>:<val>;…`
+            let sig = u32::from_str_radix(reply.get(1..3).unwrap_or("00"), 16).unwrap_or(0);
+            let body = reply.get(3..).unwrap_or("");
+            let mut pc: Option<u64> = None;
+            let mut sw_break = false;
+            let mut hw_break = false;
+            for kv in body.split(';') {
+                if kv.is_empty() {
+                    continue;
+                }
+                let (key, value) = kv.split_once(':').unwrap_or((kv, ""));
+                if key == "swbreak" {
+                    sw_break = true;
+                } else if key == "hwbreak" {
+                    hw_break = true;
+                }
+                // Numeric keys are register dumps; the lowest-numbered one is
+                // typically PC for x86 (rip is at the end of the layout
+                // though, so this is best-effort).
+                if let Ok(_reg_idx) = u32::from_str_radix(key, 16)
+                    && !value.is_empty()
+                    && let Some(reg_bytes) = hex_to_bytes(value)
+                {
+                    let mut v: u64 = 0;
+                    for (i, &b) in reg_bytes.iter().take(8).enumerate() {
+                        v |= (b as u64) << (i * 8);
+                    }
+                    pc = Some(v);
+                }
+            }
+            if hw_break {
+                StopReason::HardwareBreakpoint(pc.unwrap_or(0))
+            } else if sw_break {
+                StopReason::SoftwareBreakpoint(pc.unwrap_or(0))
+            } else {
+                StopReason::Signal(sig)
+            }
+        }
+        _ => StopReason::Other(reply.to_string()),
+    }
+}
+
 fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
     let bytes = s.as_bytes();
     if !bytes.len().is_multiple_of(2) {
@@ -255,28 +337,68 @@ impl Debugger for GdbRemoteDebugger {
         Ok(())
     }
 
-    fn step(&mut self) -> Result<()> {
-        // `s` returns a stop reply once stepping completes; we swallow it so
-        // the caller can issue another command synchronously.
-        let _ = self.send_recv("s");
-        self.state = DebuggerState::Paused;
-        Ok(())
+    fn step(&mut self) -> Result<StopReason> {
+        let reply = self.send_recv("s")?;
+        let reason = parse_stop_reply(&reply);
+        self.state = match reason {
+            StopReason::Exited(_) | StopReason::Terminated(_) => DebuggerState::Detached,
+            _ => DebuggerState::Paused,
+        };
+        Ok(reason)
     }
 
-    fn continue_exec(&mut self) -> Result<()> {
-        // `c` is followed by a stop reply when the inferior next pauses. For
-        // MVP we mark the target as running and leave the reply unread; the
-        // caller should issue an interrupt (Ctrl+C / `\x03`) or query later.
-        let packet = format_packet("c");
-        let mut stream = self
-            .stream
-            .lock()
-            .map_err(|_| Error::Debugger("gdb mutex poisoned".into()))?;
-        stream
-            .write_all(packet.as_bytes())
-            .map_err(|e| Error::Debugger(format!("gdb write: {}", e)))?;
-        self.state = DebuggerState::Running;
-        Ok(())
+    fn continue_exec(&mut self) -> Result<StopReason> {
+        // `c` blocks the stub until it next stops. We wait for the stop reply
+        // synchronously so the caller knows whether a breakpoint hit, the
+        // inferior exited, or a signal arrived.
+        let reply = self.send_recv("c")?;
+        let reason = parse_stop_reply(&reply);
+        self.state = match reason {
+            StopReason::Exited(_) | StopReason::Terminated(_) => DebuggerState::Detached,
+            _ => DebuggerState::Paused,
+        };
+        Ok(reason)
+    }
+
+    fn set_breakpoint(&mut self, address: u64, kind: BreakpointKind) -> Result<()> {
+        let z = bp_kind_byte(kind);
+        // `Z<type>,<addr>,<kind>` — `<kind>` is the breakpoint length in bytes,
+        // 1 is the safest portable default (x86 uses 1, ARM uses 4 but the
+        // stub auto-corrects when handed 1).
+        let pkt = format!("Z{},{:x},1", z, address);
+        let reply = self.send_recv(&pkt)?;
+        if reply == "OK" || reply.is_empty() {
+            self.breakpoints.push((address, kind));
+            Ok(())
+        } else if let Some(code) = reply.strip_prefix('E') {
+            Err(Error::Debugger(format!("set bp E{}", code)))
+        } else {
+            Err(Error::Debugger(format!(
+                "set bp unexpected reply: {}",
+                reply
+            )))
+        }
+    }
+
+    fn remove_breakpoint(&mut self, address: u64, kind: BreakpointKind) -> Result<()> {
+        let z = bp_kind_byte(kind);
+        let pkt = format!("z{},{:x},1", z, address);
+        let reply = self.send_recv(&pkt)?;
+        if reply == "OK" || reply.is_empty() {
+            self.breakpoints.retain(|bp| bp != &(address, kind));
+            Ok(())
+        } else if let Some(code) = reply.strip_prefix('E') {
+            Err(Error::Debugger(format!("clear bp E{}", code)))
+        } else {
+            Err(Error::Debugger(format!(
+                "clear bp unexpected reply: {}",
+                reply
+            )))
+        }
+    }
+
+    fn breakpoints(&self) -> Vec<(u64, BreakpointKind)> {
+        self.breakpoints.clone()
     }
 
     fn registers(&self) -> HashMap<String, u64> {
@@ -343,5 +465,42 @@ mod tests {
         let l = register_layout(crate::arch::Architecture::X86_64);
         assert!(l.iter().any(|(n, _)| *n == "rip"));
         assert!(l.iter().any(|(n, _)| *n == "rsp"));
+    }
+
+    #[test]
+    fn stop_reply_recognises_exit_signal_and_breakpoints() {
+        // Plain signal (SIGTRAP).
+        assert_eq!(parse_stop_reply("S05"), StopReason::Signal(5));
+
+        // Exited cleanly with status 0.
+        assert_eq!(parse_stop_reply("W00"), StopReason::Exited(0));
+
+        // Software breakpoint hit; PC encoded as register `06` (rbp slot is
+        // inconsequential — the parser just records the most recent value).
+        let reply = "T05swbreak:;06:7856341200000000;";
+        assert!(matches!(
+            parse_stop_reply(reply),
+            StopReason::SoftwareBreakpoint(0x12345678)
+        ));
+
+        // Hardware breakpoint takes precedence over software when both flags
+        // appear (defensive against unusual stub behaviour).
+        let hw = "T05hwbreak:;swbreak:;";
+        assert!(matches!(
+            parse_stop_reply(hw),
+            StopReason::HardwareBreakpoint(0)
+        ));
+
+        // Unknown reply rounds-trips through `Other`.
+        assert_eq!(
+            parse_stop_reply("?weird"),
+            StopReason::Other("?weird".to_string())
+        );
+    }
+
+    #[test]
+    fn bp_kind_byte_matches_protocol_codes() {
+        assert_eq!(bp_kind_byte(BreakpointKind::Software), 0);
+        assert_eq!(bp_kind_byte(BreakpointKind::Hardware), 1);
     }
 }

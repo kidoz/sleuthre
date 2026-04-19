@@ -6,7 +6,7 @@
 //! address. The actual transport lives in `re_core::debuggers::GdbRemoteDebugger`.
 
 use eframe::egui;
-use re_core::Debugger;
+use re_core::{BreakpointKind, Debugger, StopReason};
 
 use crate::app::{SleuthreApp, ToastKind};
 
@@ -55,23 +55,82 @@ impl SleuthreApp {
         }
 
         // Control bar.
+        let mut step_clicked = false;
+        let mut continue_clicked = false;
         ui.horizontal(|ui| {
-            if ui.button("Step").clicked()
-                && let Some(d) = self.debugger_remote.as_mut()
-                && let Err(e) = d.step()
-            {
-                self.add_toast(ToastKind::Error, format!("Step error: {}", e));
+            if ui.button("Step").clicked() {
+                step_clicked = true;
             }
-            if ui.button("Continue").clicked()
-                && let Some(d) = self.debugger_remote.as_mut()
-                && let Err(e) = d.continue_exec()
-            {
-                self.add_toast(ToastKind::Error, format!("Continue error: {}", e));
+            if ui.button("Continue").clicked() {
+                continue_clicked = true;
             }
             if ui.button("Refresh").clicked() {
                 self.debugger_refresh();
             }
+            if let Some(ref reason) = self.debugger_last_stop {
+                ui.add_space(16.0);
+                let (label, color) = stop_reason_summary(reason);
+                ui.label(egui::RichText::new(label).color(color).size(11.0));
+            }
         });
+        if step_clicked {
+            self.debugger_step();
+        }
+        if continue_clicked {
+            self.debugger_continue();
+        }
+
+        ui.separator();
+
+        // Breakpoint controls.
+        let mut add_clicked = false;
+        let mut clear_addr: Option<u64> = None;
+        ui.horizontal(|ui| {
+            ui.label("BP @");
+            ui.text_edit_singleline(&mut self.debugger_bp_input);
+            if ui.button("+ Set").clicked() {
+                add_clicked = true;
+            }
+            if ui.button("+ Set HW").clicked() {
+                add_clicked = true;
+                self.debugger_bp_kind_hw = true;
+            }
+        });
+        if add_clicked {
+            let hw = self.debugger_bp_kind_hw;
+            self.debugger_bp_kind_hw = false;
+            self.debugger_set_breakpoint(hw);
+        }
+        // Active breakpoints list.
+        let bps: Vec<(u64, BreakpointKind)> = self
+            .debugger_remote
+            .as_ref()
+            .map(|d| d.breakpoints())
+            .unwrap_or_default();
+        if !bps.is_empty() {
+            ui.label(
+                egui::RichText::new("Active breakpoints:")
+                    .size(10.0)
+                    .color(egui::Color32::GRAY),
+            );
+            for (addr, kind) in bps {
+                ui.horizontal(|ui| {
+                    let kind_str = match kind {
+                        BreakpointKind::Software => "sw",
+                        BreakpointKind::Hardware => "hw",
+                    };
+                    ui.monospace(
+                        egui::RichText::new(format!("  [{}] 0x{:x}", kind_str, addr)).size(11.0),
+                    );
+                    if ui.small_button("x").clicked() {
+                        clear_addr = Some(addr);
+                    }
+                });
+            }
+        }
+        if let Some(addr) = clear_addr {
+            self.debugger_remove_breakpoint(addr);
+        }
 
         ui.separator();
 
@@ -167,6 +226,66 @@ impl SleuthreApp {
         self.debugger_regs = d.registers();
     }
 
+    fn debugger_step(&mut self) {
+        let Some(d) = self.debugger_remote.as_mut() else {
+            return;
+        };
+        match d.step() {
+            Ok(reason) => {
+                self.debugger_last_stop = Some(reason);
+                self.debugger_refresh();
+            }
+            Err(e) => self.add_toast(ToastKind::Error, format!("Step error: {}", e)),
+        }
+    }
+
+    fn debugger_continue(&mut self) {
+        let Some(d) = self.debugger_remote.as_mut() else {
+            return;
+        };
+        match d.continue_exec() {
+            Ok(reason) => {
+                self.debugger_last_stop = Some(reason);
+                self.debugger_refresh();
+            }
+            Err(e) => self.add_toast(ToastKind::Error, format!("Continue error: {}", e)),
+        }
+    }
+
+    fn debugger_set_breakpoint(&mut self, hardware: bool) {
+        let Some(addr) = parse_hex_or_dec(&self.debugger_bp_input) else {
+            self.add_toast(
+                ToastKind::Error,
+                "Breakpoint address must be hex (0x...) or decimal.".into(),
+            );
+            return;
+        };
+        let kind = if hardware {
+            BreakpointKind::Hardware
+        } else {
+            BreakpointKind::Software
+        };
+        let Some(d) = self.debugger_remote.as_mut() else {
+            return;
+        };
+        match d.set_breakpoint(addr, kind) {
+            Ok(()) => self.add_toast(
+                ToastKind::Success,
+                format!("Breakpoint set at 0x{:x}", addr),
+            ),
+            Err(e) => self.add_toast(ToastKind::Error, format!("Set BP failed: {}", e)),
+        }
+    }
+
+    fn debugger_remove_breakpoint(&mut self, address: u64) {
+        let Some(d) = self.debugger_remote.as_mut() else {
+            return;
+        };
+        // Try removing both kinds — the Vec dedupe is by (addr, kind).
+        let _ = d.remove_breakpoint(address, BreakpointKind::Software);
+        let _ = d.remove_breakpoint(address, BreakpointKind::Hardware);
+    }
+
     fn debugger_read_memory(&mut self) {
         let Some(ref d) = self.debugger_remote else {
             return;
@@ -185,6 +304,30 @@ impl SleuthreApp {
                 self.add_toast(ToastKind::Error, format!("Memory read failed: {}", e));
             }
         }
+    }
+}
+
+fn stop_reason_summary(reason: &StopReason) -> (String, egui::Color32) {
+    match reason {
+        StopReason::Step => ("stepped".into(), egui::Color32::LIGHT_GRAY),
+        StopReason::SoftwareBreakpoint(pc) => (
+            format!("hit sw bp @ 0x{:x}", pc),
+            egui::Color32::from_rgb(255, 200, 80),
+        ),
+        StopReason::HardwareBreakpoint(pc) => (
+            format!("hit hw bp @ 0x{:x}", pc),
+            egui::Color32::from_rgb(255, 200, 80),
+        ),
+        StopReason::Signal(sig) => (format!("signal {}", sig), egui::Color32::LIGHT_BLUE),
+        StopReason::Exited(code) => (
+            format!("exited ({})", code),
+            egui::Color32::from_rgb(120, 200, 120),
+        ),
+        StopReason::Terminated(sig) => (
+            format!("killed by signal {}", sig),
+            egui::Color32::from_rgb(220, 80, 80),
+        ),
+        StopReason::Other(s) => (format!("stop: {}", s), egui::Color32::GRAY),
     }
 }
 
