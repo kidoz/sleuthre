@@ -2076,6 +2076,18 @@ pub fn decompile(
     // Phase 4: Field Access Recovery
     fold_field_accesses(&mut hlil_stmts, type_info, &inferred_types, types);
 
+    // Phase 4b: Resolve indirect calls through known C++ vtables. After this
+    // pass, `(*(void(**)())(obj+0x10))()` becomes `Widget_OnPaint(obj)` when
+    // the type/vtable metadata is sufficient.
+    resolve_vtable_calls(
+        &mut hlil_stmts,
+        &inferred_types,
+        types,
+        memory,
+        symbols,
+        arch,
+    );
+
     // Phase 2 (Roadmap): Combine nested if statements
     combine_nested_if_statements(&mut hlil_stmts);
 
@@ -2098,6 +2110,191 @@ pub fn decompile(
     info.locals.extend(ssa_locals);
 
     hlil::render_pseudocode_with_info(name, &hlil_stmts, &info, types)
+}
+
+/// Walk HLIL statements looking for indirect calls through a vtable pointer.
+///
+/// The shape we recognize is `Call { target: Deref { addr: BinOp(Add, base, Const(off)) } }`
+/// where `base` either has an inferred type that resolves to a class with a
+/// known `vtable_address`, or — for the common case `*(this->vtbl + N)` — has
+/// already been folded into a `FieldAccess` whose name is `vtbl`/`vftable`.
+///
+/// On a successful resolution we replace the target with `Global(addr, name)`,
+/// matching how a directly-called function renders.
+fn resolve_vtable_calls(
+    stmts: &mut [HlilStmt],
+    inferred_types: &HashMap<String, TypeRef>,
+    types: &TypeManager,
+    memory: &crate::memory::MemoryMap,
+    symbols: &HashMap<u64, String>,
+    arch: crate::arch::Architecture,
+) {
+    for stmt in stmts {
+        resolve_vtable_calls_in_stmt(stmt, inferred_types, types, memory, symbols, arch);
+    }
+}
+
+fn resolve_vtable_calls_in_stmt(
+    stmt: &mut HlilStmt,
+    inferred_types: &HashMap<String, TypeRef>,
+    types: &TypeManager,
+    memory: &crate::memory::MemoryMap,
+    symbols: &HashMap<u64, String>,
+    arch: crate::arch::Architecture,
+) {
+    match stmt {
+        HlilStmt::Assign { src, .. } => {
+            resolve_vtable_calls_in_expr(src, inferred_types, types, memory, symbols, arch);
+        }
+        HlilStmt::Store { value, .. } => {
+            resolve_vtable_calls_in_expr(value, inferred_types, types, memory, symbols, arch);
+        }
+        HlilStmt::Expr(e) => {
+            resolve_vtable_calls_in_expr(e, inferred_types, types, memory, symbols, arch);
+        }
+        HlilStmt::Return(Some(e)) => {
+            resolve_vtable_calls_in_expr(e, inferred_types, types, memory, symbols, arch);
+        }
+        HlilStmt::Return(None) => {}
+        HlilStmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            resolve_vtable_calls_in_expr(cond, inferred_types, types, memory, symbols, arch);
+            resolve_vtable_calls(then_body, inferred_types, types, memory, symbols, arch);
+            resolve_vtable_calls(else_body, inferred_types, types, memory, symbols, arch);
+        }
+        HlilStmt::While { cond, body } => {
+            resolve_vtable_calls_in_expr(cond, inferred_types, types, memory, symbols, arch);
+            resolve_vtable_calls(body, inferred_types, types, memory, symbols, arch);
+        }
+        HlilStmt::DoWhile { body, cond } => {
+            resolve_vtable_calls(body, inferred_types, types, memory, symbols, arch);
+            resolve_vtable_calls_in_expr(cond, inferred_types, types, memory, symbols, arch);
+        }
+        HlilStmt::For {
+            init,
+            cond,
+            update,
+            body,
+        } => {
+            resolve_vtable_calls_in_stmt(init, inferred_types, types, memory, symbols, arch);
+            resolve_vtable_calls_in_expr(cond, inferred_types, types, memory, symbols, arch);
+            resolve_vtable_calls_in_stmt(update, inferred_types, types, memory, symbols, arch);
+            resolve_vtable_calls(body, inferred_types, types, memory, symbols, arch);
+        }
+        HlilStmt::Switch {
+            cond,
+            cases,
+            default,
+        } => {
+            resolve_vtable_calls_in_expr(cond, inferred_types, types, memory, symbols, arch);
+            for (_, body) in cases {
+                resolve_vtable_calls(body, inferred_types, types, memory, symbols, arch);
+            }
+            resolve_vtable_calls(default, inferred_types, types, memory, symbols, arch);
+        }
+        HlilStmt::Block(b) => {
+            resolve_vtable_calls(b, inferred_types, types, memory, symbols, arch);
+        }
+        _ => {}
+    }
+}
+
+fn resolve_vtable_calls_in_expr(
+    expr: &mut HlilExpr,
+    inferred_types: &HashMap<String, TypeRef>,
+    types: &TypeManager,
+    memory: &crate::memory::MemoryMap,
+    symbols: &HashMap<u64, String>,
+    arch: crate::arch::Architecture,
+) {
+    match expr {
+        HlilExpr::Call { target, args } => {
+            // Recurse into the args first.
+            for a in args.iter_mut() {
+                resolve_vtable_calls_in_expr(a, inferred_types, types, memory, symbols, arch);
+            }
+            // Look for `Deref { addr: BinOp(Add, base, Const(offset)) }` and try
+            // to match the `base` to a known class.
+            if let HlilExpr::Deref { addr, .. } = target.as_ref()
+                && let HlilExpr::BinOp { op, left, right } = addr.as_ref()
+                && *op == crate::il::llil::BinOp::Add
+                && let HlilExpr::Const(method_offset) = right.as_ref()
+                && let Some(class_name) = base_class_name(left, inferred_types)
+                && let Some(info) = types.classes.get(&class_name)
+                && let Some(vtable_addr) = info.vtable_address
+            {
+                let entry_addr = vtable_addr + *method_offset;
+                if let Some(method_addr) = read_pointer(memory, entry_addr, arch) {
+                    let name = symbols
+                        .get(&method_addr)
+                        .cloned()
+                        .unwrap_or_else(|| format!("{}::method_{:x}", class_name, method_offset));
+                    **target = HlilExpr::Global(method_addr, name);
+                }
+            }
+        }
+        HlilExpr::BinOp { left, right, .. } => {
+            resolve_vtable_calls_in_expr(left, inferred_types, types, memory, symbols, arch);
+            resolve_vtable_calls_in_expr(right, inferred_types, types, memory, symbols, arch);
+        }
+        HlilExpr::UnaryOp { operand, .. } => {
+            resolve_vtable_calls_in_expr(operand, inferred_types, types, memory, symbols, arch);
+        }
+        HlilExpr::Deref { addr, .. } => {
+            resolve_vtable_calls_in_expr(addr, inferred_types, types, memory, symbols, arch);
+        }
+        HlilExpr::AddrOf(inner) => {
+            resolve_vtable_calls_in_expr(inner, inferred_types, types, memory, symbols, arch);
+        }
+        HlilExpr::FieldAccess { base, .. } => {
+            resolve_vtable_calls_in_expr(base, inferred_types, types, memory, symbols, arch);
+        }
+        HlilExpr::ArrayAccess { base, index } => {
+            resolve_vtable_calls_in_expr(base, inferred_types, types, memory, symbols, arch);
+            resolve_vtable_calls_in_expr(index, inferred_types, types, memory, symbols, arch);
+        }
+        _ => {}
+    }
+}
+
+/// Resolve `expr` to the name of the class (in `types.classes`) that it points to.
+/// Handles two common shapes: a typed local variable or a `FieldAccess` chain
+/// rooted in one.
+fn base_class_name(expr: &HlilExpr, inferred_types: &HashMap<String, TypeRef>) -> Option<String> {
+    let var_name = match expr {
+        HlilExpr::Var(n) => n.clone(),
+        HlilExpr::Deref { addr, .. } => match addr.as_ref() {
+            HlilExpr::Var(n) => n.clone(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let ty = inferred_types.get(&var_name)?;
+    match ty {
+        TypeRef::Pointer(inner) => match inner.as_ref() {
+            TypeRef::Named(n) => Some(n.clone()),
+            _ => None,
+        },
+        TypeRef::Named(n) => Some(n.clone()),
+        _ => None,
+    }
+}
+
+fn read_pointer(
+    memory: &crate::memory::MemoryMap,
+    address: u64,
+    arch: crate::arch::Architecture,
+) -> Option<u64> {
+    let size = arch.pointer_size();
+    let bytes = memory.get_data(address, size)?;
+    match size {
+        4 => Some(u32::from_le_bytes(bytes.try_into().ok()?) as u64),
+        8 => Some(u64::from_le_bytes(bytes.try_into().ok()?)),
+        _ => None,
+    }
 }
 
 fn fold_field_accesses(
