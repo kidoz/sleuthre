@@ -2,6 +2,7 @@ mod archives;
 mod bytecode;
 mod callgraph;
 mod data_inspector;
+mod debugger;
 mod decompiler;
 mod diff;
 mod disassembly;

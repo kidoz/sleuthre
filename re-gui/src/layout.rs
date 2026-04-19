@@ -43,6 +43,7 @@ impl TabViewer for SleuthreTabViewer<'_> {
                 self.app.show_image_preview(ui);
             }
             Tab::Bytecode => self.app.show_bytecode(ui),
+            Tab::Debugger => self.app.show_debugger(ui),
         }
     }
 }
@@ -179,6 +180,8 @@ impl eframe::App for SleuthreApp {
         self.show_toasts(ctx);
         self.show_loading_overlay(ctx);
         self.broadcast_pending_undo_events();
+        self.poll_plugin_results();
+        self.apply_inbound_collab_events();
     }
 }
 
@@ -903,7 +906,7 @@ impl SleuthreApp {
                     }
                     for (name, source) in scripts {
                         if ui.button(format!("Run: {}", name)).clicked() {
-                            self.run_script(&source);
+                            self.submit_plugin_script(&name, &source);
                             ui.close();
                         }
                     }
@@ -944,6 +947,7 @@ impl SleuthreApp {
                     ("Tabular", Tab::Tabular),
                     ("Images", Tab::ImagePreview),
                     ("Bytecode", Tab::Bytecode),
+                    ("Debugger", Tab::Debugger),
                 ] {
                     if ui.button(name).clicked() {
                         self.focus_or_open_tab(tab);
@@ -1962,6 +1966,160 @@ fn entropy_nav_color(normalized: f32) -> egui::Color32 {
 }
 
 impl SleuthreApp {
+    /// Submit a plugin script to the background runner so the UI never
+    /// blocks on long-running scripts. Snapshots the project state at the
+    /// moment of submission; mutations come back asynchronously via
+    /// [`Self::poll_plugin_results`].
+    pub(crate) fn submit_plugin_script(&mut self, name: &str, source: &str) {
+        let snapshot = self.snapshot_for_plugins();
+        match self.plugin_runner.submit(source.to_string(), snapshot) {
+            Ok(_id) => {
+                self.add_toast(
+                    crate::app::ToastKind::Info,
+                    format!("Plugin '{}' running in background...", name),
+                );
+            }
+            Err(e) => {
+                self.add_toast(
+                    crate::app::ToastKind::Error,
+                    format!("Plugin submit failed: {}", e),
+                );
+            }
+        }
+    }
+
+    fn snapshot_for_plugins(&self) -> re_core::scripting::ProjectSnapshot {
+        use re_core::scripting::ProjectSnapshot;
+        let Some(ref project) = self.project else {
+            return ProjectSnapshot::default();
+        };
+        let functions: Vec<(u64, String, usize)> = project
+            .functions
+            .functions
+            .values()
+            .map(|f| {
+                let size = f
+                    .end_address
+                    .and_then(|e| e.checked_sub(f.start_address))
+                    .map(|s| s as usize)
+                    .unwrap_or(0);
+                (f.start_address, f.name.clone(), size)
+            })
+            .collect();
+        let strings: Vec<(u64, String)> = project
+            .strings
+            .strings
+            .iter()
+            .map(|s| (s.address, s.value.clone()))
+            .collect();
+        let comments: Vec<(u64, String)> = project
+            .comments
+            .iter()
+            .map(|(&a, t)| (a, t.clone()))
+            .collect();
+        ProjectSnapshot {
+            functions,
+            strings,
+            comments,
+            arch: project.arch.display_name().to_string(),
+        }
+    }
+
+    /// Drain finished plugin results and apply their actions on the main
+    /// thread. Called once per UI frame.
+    pub(crate) fn poll_plugin_results(&mut self) {
+        let results = self.plugin_runner.poll();
+        if results.is_empty() {
+            return;
+        }
+        for msg in results {
+            if let Some(err) = msg.error {
+                self.add_toast(
+                    crate::app::ToastKind::Error,
+                    format!("Plugin job {} error: {}", msg.id, err),
+                );
+                continue;
+            }
+            for action in msg.actions {
+                self.apply_script_action(action);
+            }
+            if !msg.output.is_empty() {
+                self.output.push_str("=> ");
+                self.output.push_str(&msg.output);
+                self.output.push('\n');
+            }
+        }
+    }
+
+    fn apply_script_action(&mut self, action: re_core::scripting::ScriptAction) {
+        use re_core::scripting::ScriptAction;
+        let Some(ref mut project) = self.project else {
+            return;
+        };
+        match action {
+            ScriptAction::Rename { address, new_name } => {
+                let old_name = project
+                    .functions
+                    .functions
+                    .get(&address)
+                    .map(|f| f.name.clone())
+                    .unwrap_or_default();
+                project.execute(re_core::project::UndoCommand::Rename {
+                    address,
+                    old_name,
+                    new_name,
+                });
+            }
+            ScriptAction::Comment { address, text } => {
+                let old_comment = project.comments.get(&address).cloned();
+                project.execute(re_core::project::UndoCommand::Comment {
+                    address,
+                    old_comment,
+                    new_comment: Some(text),
+                });
+            }
+            ScriptAction::Goto(addr) => {
+                self.current_address = addr;
+                self.update_cfg();
+            }
+            ScriptAction::Print(msg) => {
+                self.output.push_str(&msg);
+                self.output.push('\n');
+            }
+            ScriptAction::ImportSymbols { path } => {
+                if let Some(ref mut project) = self.project {
+                    let _ = import_symbols_from_path(project, &path);
+                }
+            }
+        }
+    }
+
+    /// Drain inbound collab events from the broadcaster and apply them as
+    /// local `UndoCommand`s. The high-water mark is bumped past the resulting
+    /// undo entries so we don't immediately re-publish events we just applied.
+    pub(crate) fn apply_inbound_collab_events(&mut self) {
+        let Some(ref bcast) = self.collab_broadcaster else {
+            return;
+        };
+        let events = bcast.drain_inbound();
+        if events.is_empty() {
+            return;
+        }
+        let Some(ref mut project) = self.project else {
+            return;
+        };
+        for ev in events {
+            if let Some(cmd) = collab_event_to_undo(&ev, project) {
+                project.execute(cmd);
+                self.output
+                    .push_str(&format!("[collab:{}] applied {}\n", ev.author, ev.kind));
+            }
+        }
+        // Mark all newly-applied commands as already-published so the
+        // outbound hook doesn't fan them back out.
+        self.last_published_undo_idx = project.undo_stack.len();
+    }
+
     /// Drain any newly-executed `UndoCommand`s from the project's undo stack
     /// and publish them as `CollabEvent`s on the broadcaster, if one is
     /// running. This intercept point captures every mutation regardless of
@@ -1984,6 +2142,78 @@ impl SleuthreApp {
             let _ = bcast.publish(event);
         }
         self.last_published_undo_idx = stack_len;
+    }
+}
+
+/// Translate an inbound `CollabEvent` into a local `UndoCommand`. Returns
+/// `None` for kinds we don't yet apply (e.g. `patch`, which would need bytes
+/// rather than a length).
+fn collab_event_to_undo(
+    event: &re_core::collab::CollabEvent,
+    project: &re_core::project::Project,
+) -> Option<re_core::project::UndoCommand> {
+    let payload = &event.payload;
+    let parse_addr = |key: &str| -> Option<u64> {
+        let s = payload.get(key)?.as_str()?;
+        if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+            u64::from_str_radix(rest, 16).ok()
+        } else {
+            s.parse().ok()
+        }
+    };
+    match event.kind.as_str() {
+        "rename" => {
+            let address = parse_addr("address")?;
+            let new_name = payload
+                .get("new_name")
+                .and_then(|v| v.as_str())?
+                .to_string();
+            let old_name = project
+                .functions
+                .functions
+                .get(&address)
+                .map(|f| f.name.clone())
+                .unwrap_or_default();
+            Some(re_core::project::UndoCommand::Rename {
+                address,
+                old_name,
+                new_name,
+            })
+        }
+        "comment" => {
+            let address = parse_addr("address")?;
+            let new_comment = payload
+                .get("text")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let old_comment = project.comments.get(&address).cloned();
+            Some(re_core::project::UndoCommand::Comment {
+                address,
+                old_comment,
+                new_comment,
+            })
+        }
+        "add_bookmark" => {
+            let address = parse_addr("address")?;
+            let note = payload.get("note").and_then(|v| v.as_str())?.to_string();
+            Some(re_core::project::UndoCommand::AddBookmark { address, note })
+        }
+        "remove_bookmark" => {
+            let address = parse_addr("address")?;
+            let note = payload.get("note").and_then(|v| v.as_str())?.to_string();
+            Some(re_core::project::UndoCommand::RemoveBookmark { address, note })
+        }
+        "add_tag" => {
+            let address = parse_addr("address")?;
+            let tag = payload.get("tag").and_then(|v| v.as_str())?.to_string();
+            Some(re_core::project::UndoCommand::AddTag { address, tag })
+        }
+        "remove_tag" => {
+            let address = parse_addr("address")?;
+            let tag = payload.get("tag").and_then(|v| v.as_str())?.to_string();
+            Some(re_core::project::UndoCommand::RemoveTag { address, tag })
+        }
+        _ => None,
     }
 }
 

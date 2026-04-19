@@ -234,6 +234,7 @@ pub(crate) struct SleuthreApp {
 
     // Plugin registry (Rhai scripts hot-reloaded from a user directory).
     pub(crate) plugins: re_core::scripting::PluginRegistry,
+    pub(crate) plugin_runner: re_core::scripting::AsyncPluginRunner,
 
     // Live collaboration broadcaster.
     pub(crate) collab_broadcaster: Option<re_core::collab::CollabBroadcaster>,
@@ -243,6 +244,14 @@ pub(crate) struct SleuthreApp {
     /// High-water mark of `project.undo_stack` indices already published over
     /// the collab broadcaster.
     pub(crate) last_published_undo_idx: usize,
+
+    // Debugger panel
+    pub(crate) debugger_remote: Option<re_core::debuggers::GdbRemoteDebugger>,
+    pub(crate) debugger_addr_input: String,
+    pub(crate) debugger_regs: std::collections::HashMap<String, u64>,
+    pub(crate) debugger_mem_addr: String,
+    pub(crate) debugger_mem_size: u32,
+    pub(crate) debugger_mem_data: Option<Vec<u8>>,
 }
 
 pub(crate) use crate::views::image_preview::ImagePreviewSlot;
@@ -305,6 +314,7 @@ pub(crate) enum Tab {
     Tabular,
     ImagePreview,
     Bytecode,
+    Debugger,
 }
 
 impl std::fmt::Display for Tab {
@@ -329,6 +339,7 @@ impl std::fmt::Display for Tab {
             Tab::Tabular => write!(f, "Tabular"),
             Tab::ImagePreview => write!(f, "Images"),
             Tab::Bytecode => write!(f, "Bytecode"),
+            Tab::Debugger => write!(f, "Debugger"),
         }
     }
 }
@@ -567,11 +578,18 @@ impl Default for SleuthreApp {
                 }
                 reg
             },
+            plugin_runner: re_core::scripting::AsyncPluginRunner::new(),
             collab_broadcaster: None,
             collab_status: None,
             collab_dialog_active: false,
             collab_port_input: String::new(),
             last_published_undo_idx: 0,
+            debugger_remote: None,
+            debugger_addr_input: "127.0.0.1:1234".into(),
+            debugger_regs: std::collections::HashMap::new(),
+            debugger_mem_addr: "0x0".into(),
+            debugger_mem_size: 64,
+            debugger_mem_data: None,
         }
     }
 }
