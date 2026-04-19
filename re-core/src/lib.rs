@@ -1,5 +1,6 @@
 pub mod analysis;
 pub mod arch;
+pub mod collab;
 pub mod db;
 pub mod debuggers;
 pub mod debuginfo;
