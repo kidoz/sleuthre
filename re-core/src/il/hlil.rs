@@ -121,6 +121,58 @@ pub struct DecompiledCode {
     pub annotations: Vec<SourceAnnotation>,
 }
 
+impl DecompiledCode {
+    /// Extract the cache-invalidation dependency set from the annotation list.
+    /// Returns `(referenced_callees, referenced_type_names)` so the caller can
+    /// populate `Project::cache_deps`.
+    pub fn dependencies(
+        &self,
+    ) -> (
+        std::collections::HashSet<u64>,
+        std::collections::HashSet<String>,
+    ) {
+        let mut callees = std::collections::HashSet::new();
+        let mut types = std::collections::HashSet::new();
+        for ann in &self.annotations {
+            match &ann.kind {
+                AnnotationKind::Function(addr) => {
+                    callees.insert(*addr);
+                }
+                AnnotationKind::Type(name) => {
+                    // Skip plain stdint primitives — they never trigger
+                    // user-driven invalidation.
+                    if !is_primitive_type_name(name) {
+                        types.insert(name.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        (callees, types)
+    }
+}
+
+fn is_primitive_type_name(name: &str) -> bool {
+    matches!(
+        name,
+        "void"
+            | "bool"
+            | "char"
+            | "uint8_t"
+            | "uint16_t"
+            | "uint32_t"
+            | "uint64_t"
+            | "int8_t"
+            | "int16_t"
+            | "int32_t"
+            | "int64_t"
+            | "size_t"
+            | "ssize_t"
+            | "float"
+            | "double"
+    )
+}
+
 /// Internal helper for building annotated source code.
 struct SourceWriter {
     code: DecompiledCode,
@@ -1126,6 +1178,47 @@ mod tests {
         let mut w = SourceWriter::new();
         write_expr(&mut w, &expr);
         assert_eq!(w.finish().text, "-(a + b)");
+    }
+
+    #[test]
+    fn dependencies_extracted_from_annotations() {
+        let code = DecompiledCode {
+            text: String::new(),
+            annotations: vec![
+                SourceAnnotation {
+                    start: 0,
+                    end: 1,
+                    kind: AnnotationKind::Function(0x1000),
+                },
+                SourceAnnotation {
+                    start: 2,
+                    end: 3,
+                    kind: AnnotationKind::Function(0x2000),
+                },
+                SourceAnnotation {
+                    start: 4,
+                    end: 5,
+                    kind: AnnotationKind::Type("Player".into()),
+                },
+                SourceAnnotation {
+                    start: 6,
+                    end: 7,
+                    // Primitive types are skipped — they can't be edited.
+                    kind: AnnotationKind::Type("uint32_t".into()),
+                },
+                SourceAnnotation {
+                    start: 8,
+                    end: 9,
+                    kind: AnnotationKind::Local("x".into()),
+                },
+            ],
+        };
+        let (callees, types) = code.dependencies();
+        assert_eq!(callees.len(), 2);
+        assert!(callees.contains(&0x1000));
+        assert!(callees.contains(&0x2000));
+        assert_eq!(types.len(), 1);
+        assert!(types.contains("Player"));
     }
 
     #[test]

@@ -231,6 +231,15 @@ pub(crate) struct SleuthreApp {
     pub(crate) class_edit_base: String,
     pub(crate) class_edit_vtable_label: String,
     pub(crate) class_edit_vtable_addr: String,
+
+    // Plugin registry (Rhai scripts hot-reloaded from a user directory).
+    pub(crate) plugins: re_core::scripting::PluginRegistry,
+
+    // Live collaboration broadcaster.
+    pub(crate) collab_broadcaster: Option<re_core::collab::CollabBroadcaster>,
+    pub(crate) collab_status: Option<String>,
+    pub(crate) collab_dialog_active: bool,
+    pub(crate) collab_port_input: String,
 }
 
 pub(crate) use crate::views::image_preview::ImagePreviewSlot;
@@ -547,6 +556,18 @@ impl Default for SleuthreApp {
             class_edit_base: String::new(),
             class_edit_vtable_label: String::new(),
             class_edit_vtable_addr: String::new(),
+            plugins: {
+                let mut reg = re_core::scripting::PluginRegistry::new();
+                if let Some(dir) = re_core::scripting::PluginRegistry::default_user_dir() {
+                    reg.set_dir(dir);
+                    let _ = reg.reload_changed();
+                }
+                reg
+            },
+            collab_broadcaster: None,
+            collab_status: None,
+            collab_dialog_active: false,
+            collab_port_input: String::new(),
         }
     }
 }
@@ -774,7 +795,12 @@ impl SleuthreApp {
                 &project.memory_map,
             );
 
-            // Cache it
+            // Cache it and record what it referenced so a future rename or
+            // type edit invalidates this entry without a project-wide clear.
+            let (callees, types) = code.dependencies();
+            project
+                .cache_deps
+                .set_dependencies(self.current_address, callees, types);
             project
                 .decompilation_cache
                 .insert(self.current_address, code.clone());
