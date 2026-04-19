@@ -766,7 +766,16 @@ impl McpServer {
                                     &project.types,
                                     &project.memory_map,
                                 );
-                                tool_text_result(&id, &pseudocode.text)
+                                let response = tool_text_result(&id, &pseudocode.text);
+                                // Cache + record dependencies so a later
+                                // rename or type edit invalidates exactly
+                                // the right entries (matches the GUI path).
+                                let (callees, refd_types) = pseudocode.dependencies();
+                                if let Some(p) = self.project.as_mut() {
+                                    p.cache_deps.set_dependencies(addr, callees, refd_types);
+                                    p.decompilation_cache.insert(addr, pseudocode);
+                                }
+                                response
                             }
                             Err(e) => {
                                 json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32002, "message": e.to_string() } })
