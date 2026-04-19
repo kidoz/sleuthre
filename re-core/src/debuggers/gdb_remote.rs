@@ -127,6 +127,10 @@ pub struct GdbRemoteDebugger {
     /// Currently active breakpoints, mirrored client-side so the GUI can
     /// enumerate them without an extra protocol round-trip.
     breakpoints: Vec<(u64, BreakpointKind)>,
+    /// Thread ids reported by the stub the last time `threads()` was called.
+    threads_cache: std::sync::Mutex<Vec<u64>>,
+    /// Currently active thread (used to scope `g`/`m` operations on multi-threaded stubs).
+    active_thread: std::sync::Mutex<Option<u64>>,
 }
 
 impl GdbRemoteDebugger {
@@ -147,9 +151,24 @@ impl GdbRemoteDebugger {
             state: DebuggerState::Paused,
             arch,
             breakpoints: Vec::new(),
+            threads_cache: std::sync::Mutex::new(Vec::new()),
+            active_thread: std::sync::Mutex::new(None),
         };
         dbg.handshake()?;
         Ok(dbg)
+    }
+
+    /// Direct write of a single byte to the underlying socket — used by
+    /// [`Debugger::interrupt`] to send the unframed `\x03` (Ctrl+C) byte.
+    fn write_raw(&self, byte: u8) -> Result<()> {
+        let mut stream = self
+            .stream
+            .lock()
+            .map_err(|_| Error::Debugger("gdb mutex poisoned".into()))?;
+        stream
+            .write_all(&[byte])
+            .map_err(|e| Error::Debugger(format!("gdb interrupt write: {}", e)))?;
+        Ok(())
     }
 
     fn handshake(&mut self) -> Result<()> {
@@ -413,6 +432,54 @@ impl Debugger for GdbRemoteDebugger {
 
     fn breakpoints(&self) -> Vec<(u64, BreakpointKind)> {
         self.breakpoints.clone()
+    }
+
+    fn threads(&self) -> Vec<u64> {
+        // RSP enumerates with `qfThreadInfo` followed by repeated
+        // `qsThreadInfo` until the stub replies `l`. Each reply is `m<tid>[,<tid>...]`.
+        let mut out = Vec::new();
+        let mut packet = "qfThreadInfo".to_string();
+        while let Ok(reply) = self.send_recv(&packet) {
+            if reply.is_empty() || reply == "l" {
+                break;
+            }
+            let Some(rest) = reply.strip_prefix('m') else {
+                break;
+            };
+            for tok in rest.split(',') {
+                if let Ok(tid) = u64::from_str_radix(tok.trim(), 16) {
+                    out.push(tid);
+                }
+            }
+            packet = "qsThreadInfo".to_string();
+        }
+        if let Ok(mut cache) = self.threads_cache.lock() {
+            *cache = out.clone();
+        }
+        out
+    }
+
+    fn set_active_thread(&mut self, tid: u64) -> Result<()> {
+        // `Hg<tid>` selects the thread for subsequent `g`/`m` operations.
+        let pkt = format!("Hg{:x}", tid);
+        let reply = self.send_recv(&pkt)?;
+        if reply == "OK" || reply.is_empty() {
+            if let Ok(mut active) = self.active_thread.lock() {
+                *active = Some(tid);
+            }
+            Ok(())
+        } else if let Some(code) = reply.strip_prefix('E') {
+            Err(Error::Debugger(format!("Hg E{}", code)))
+        } else {
+            Err(Error::Debugger(format!("Hg unexpected: {}", reply)))
+        }
+    }
+
+    fn interrupt(&mut self) -> Result<()> {
+        // `\x03` is the standard RSP all-stop interrupt — sent unframed
+        // (no `$...#cc` envelope) so the stub reads it even when the link
+        // is already mid-packet from a `c` reply.
+        self.write_raw(0x03)
     }
 
     fn registers(&self) -> HashMap<String, u64> {

@@ -79,6 +79,16 @@ impl SleuthreApp {
             if ui.button("Refresh").clicked() {
                 self.debugger_refresh();
             }
+            // Stop button only meaningful while a continue is in flight; the
+            // interrupt is sent over the same socket the worker thread is
+            // already blocked reading on, so the worker returns shortly after.
+            if busy
+                && ui.button("Stop").clicked()
+                && let Some(d) = self.debugger_remote.as_mut()
+                && let Err(e) = d.interrupt()
+            {
+                self.add_toast(ToastKind::Error, format!("Interrupt failed: {}", e));
+            }
             if busy {
                 ui.add_space(16.0);
                 ui.label(
@@ -101,26 +111,32 @@ impl SleuthreApp {
 
         ui.separator();
 
-        // Breakpoint controls.
-        let mut add_clicked = false;
-        let mut clear_addr: Option<u64> = None;
+        // Breakpoint + watchpoint controls.
+        let mut requested: Option<BreakpointKind> = None;
         ui.horizontal(|ui| {
             ui.label("BP @");
             ui.text_edit_singleline(&mut self.debugger_bp_input);
             if ui.button("+ Set").clicked() {
-                add_clicked = true;
+                requested = Some(BreakpointKind::Software);
             }
             if ui.button("+ Set HW").clicked() {
-                add_clicked = true;
-                self.debugger_bp_kind_hw = true;
+                requested = Some(BreakpointKind::Hardware);
+            }
+            if ui.button("+ Watch W").clicked() {
+                requested = Some(BreakpointKind::WriteWatch);
+            }
+            if ui.button("+ Watch R").clicked() {
+                requested = Some(BreakpointKind::ReadWatch);
+            }
+            if ui.button("+ Watch RW").clicked() {
+                requested = Some(BreakpointKind::AccessWatch);
             }
         });
-        if add_clicked {
-            let hw = self.debugger_bp_kind_hw;
-            self.debugger_bp_kind_hw = false;
-            self.debugger_set_breakpoint(hw);
+        if let Some(kind) = requested {
+            self.debugger_set_breakpoint_kind(kind);
         }
         // Active breakpoints list.
+        let mut clear_addr: Option<u64> = None;
         let bps: Vec<(u64, BreakpointKind)> = self
             .debugger_remote
             .as_ref()
@@ -155,6 +171,66 @@ impl SleuthreApp {
         }
 
         ui.separator();
+
+        // Thread selector — only shown when the stub reports more than one.
+        let threads: Vec<u64> = self
+            .debugger_remote
+            .as_ref()
+            .map(|d| d.threads())
+            .unwrap_or_default();
+        if threads.len() > 1 {
+            let mut selected = self.debugger_active_thread;
+            ui.horizontal(|ui| {
+                ui.label("Thread:");
+                egui::ComboBox::from_id_salt("debugger_threads")
+                    .selected_text(
+                        selected
+                            .map(|t| format!("0x{:x}", t))
+                            .unwrap_or_else(|| "(any)".into()),
+                    )
+                    .show_ui(ui, |ui| {
+                        for tid in &threads {
+                            ui.selectable_value(&mut selected, Some(*tid), format!("0x{:x}", tid));
+                        }
+                    });
+            });
+            if selected != self.debugger_active_thread
+                && let Some(tid) = selected
+                && let Some(d) = self.debugger_remote.as_mut()
+            {
+                match d.set_active_thread(tid) {
+                    Ok(()) => {
+                        self.debugger_active_thread = Some(tid);
+                        self.debugger_refresh();
+                    }
+                    Err(e) => self.add_toast(ToastKind::Error, format!("Set thread failed: {}", e)),
+                }
+            }
+        }
+
+        // Backtrace.
+        let bt = self.debugger_remote.as_ref().map(|d| {
+            d.frame_pointer_backtrace(
+                self.project
+                    .as_ref()
+                    .map(|p| p.arch)
+                    .unwrap_or(re_core::arch::Architecture::X86_64),
+                32,
+            )
+        });
+        if let Some(frames) = bt
+            && !frames.is_empty()
+        {
+            ui.label(
+                egui::RichText::new("Backtrace (frame-pointer):")
+                    .size(10.0)
+                    .color(egui::Color32::GRAY),
+            );
+            for (i, addr) in frames.iter().enumerate() {
+                ui.monospace(egui::RichText::new(format!("  #{:<2}  0x{:x}", i, addr)).size(11.0));
+            }
+            ui.separator();
+        }
 
         let avail = ui.available_size();
         ui.horizontal(|ui| {
@@ -307,6 +383,15 @@ impl SleuthreApp {
     }
 
     pub(crate) fn debugger_set_breakpoint(&mut self, hardware: bool) {
+        let kind = if hardware {
+            BreakpointKind::Hardware
+        } else {
+            BreakpointKind::Software
+        };
+        self.debugger_set_breakpoint_kind(kind);
+    }
+
+    fn debugger_set_breakpoint_kind(&mut self, kind: BreakpointKind) {
         let Some(addr) = parse_hex_or_dec(&self.debugger_bp_input) else {
             self.add_toast(
                 ToastKind::Error,
@@ -314,20 +399,19 @@ impl SleuthreApp {
             );
             return;
         };
-        let kind = if hardware {
-            BreakpointKind::Hardware
-        } else {
-            BreakpointKind::Software
-        };
         let Some(d) = self.debugger_remote.as_mut() else {
             return;
         };
+        let label = match kind {
+            BreakpointKind::Software => "sw breakpoint",
+            BreakpointKind::Hardware => "hw breakpoint",
+            BreakpointKind::WriteWatch => "write watchpoint",
+            BreakpointKind::ReadWatch => "read watchpoint",
+            BreakpointKind::AccessWatch => "access watchpoint",
+        };
         match d.set_breakpoint(addr, kind) {
-            Ok(()) => self.add_toast(
-                ToastKind::Success,
-                format!("Breakpoint set at 0x{:x}", addr),
-            ),
-            Err(e) => self.add_toast(ToastKind::Error, format!("Set BP failed: {}", e)),
+            Ok(()) => self.add_toast(ToastKind::Success, format!("{} set at 0x{:x}", label, addr)),
+            Err(e) => self.add_toast(ToastKind::Error, format!("Set {} failed: {}", label, e)),
         }
     }
 

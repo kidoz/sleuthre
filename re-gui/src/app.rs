@@ -253,7 +253,6 @@ pub(crate) struct SleuthreApp {
     pub(crate) debugger_mem_size: u32,
     pub(crate) debugger_mem_data: Option<Vec<u8>>,
     pub(crate) debugger_bp_input: String,
-    pub(crate) debugger_bp_kind_hw: bool,
     pub(crate) debugger_last_stop: Option<re_core::StopReason>,
     /// Async operation currently in flight on the debugger; the handle is
     /// borrowed to a worker thread and returned via the channel when the
@@ -263,6 +262,9 @@ pub(crate) struct SleuthreApp {
     /// scroll-area closure can't call `&mut self` methods directly so the
     /// click stashes intent here for the post-closure handler.
     pub(crate) pending_bp_set: Option<(u64, bool)>,
+    /// Active thread ID selected in the debugger panel; `None` until the
+    /// user picks one from the thread selector.
+    pub(crate) debugger_active_thread: Option<u64>,
 }
 
 /// Async operation in flight on the debugger.
@@ -611,10 +613,10 @@ impl Default for SleuthreApp {
             debugger_mem_size: 64,
             debugger_mem_data: None,
             debugger_bp_input: "0x0".into(),
-            debugger_bp_kind_hw: false,
             debugger_last_stop: None,
             debugger_pending: None,
             pending_bp_set: None,
+            debugger_active_thread: None,
         }
     }
 }
