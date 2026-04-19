@@ -265,6 +265,9 @@ pub(crate) struct SleuthreApp {
     /// Active thread ID selected in the debugger panel; `None` until the
     /// user picks one from the thread selector.
     pub(crate) debugger_active_thread: Option<u64>,
+    /// DWARF stack-unwinder built once when a binary is loaded; used by the
+    /// debugger panel to walk frames without requiring frame pointers.
+    pub(crate) debugger_unwinder: Option<re_core::debuginfo::unwind::StackUnwinder>,
 }
 
 /// Async operation in flight on the debugger.
@@ -617,6 +620,7 @@ impl Default for SleuthreApp {
             debugger_pending: None,
             pending_bp_set: None,
             debugger_active_thread: None,
+            debugger_unwinder: None,
         }
     }
 }
@@ -699,6 +703,16 @@ impl SleuthreApp {
                             256,
                             256,
                         ));
+                    }
+                    // Build the DWARF stack-unwinder from the binary so the
+                    // debugger panel can walk frames without requiring frame
+                    // pointers. Best-effort: a binary without `.eh_frame`
+                    // simply leaves the option as `None`.
+                    if let Some(ref project) = self.project
+                        && let Ok(bytes) = std::fs::read(&project.path)
+                    {
+                        self.debugger_unwinder =
+                            re_core::debuginfo::unwind::StackUnwinder::from_bytes(&bytes);
                     }
                     self.update_cfg();
                     self.load_receiver = None;

@@ -2,6 +2,7 @@ mod dwarf;
 mod pdb_parser;
 mod source_map;
 mod type_mapper;
+pub mod unwind;
 
 use crate::types::{CompoundType, FunctionSignature, SourceLineInfo, VariableInfo};
 use std::collections::BTreeMap;

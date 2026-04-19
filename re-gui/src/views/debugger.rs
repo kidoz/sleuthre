@@ -109,6 +109,25 @@ impl SleuthreApp {
             self.debugger_continue();
         }
 
+        // Source-line step: only meaningful when the current binary has DWARF
+        // line info (DebugInfo populated `types.source_lines`). Reaches for
+        // the next address whose (file, line) differs from the current one,
+        // sets a software breakpoint, and triggers Continue.
+        let mut step_source_clicked = false;
+        if !busy
+            && self
+                .project
+                .as_ref()
+                .map(|p| !p.types.source_lines.is_empty())
+                .unwrap_or(false)
+            && ui.button("Step Source").clicked()
+        {
+            step_source_clicked = true;
+        }
+        if step_source_clicked {
+            self.debugger_step_source_line();
+        }
+
         ui.separator();
 
         // Breakpoint + watchpoint controls.
@@ -208,21 +227,34 @@ impl SleuthreApp {
             }
         }
 
-        // Backtrace.
-        let bt = self.debugger_remote.as_ref().map(|d| {
-            d.frame_pointer_backtrace(
-                self.project
-                    .as_ref()
-                    .map(|p| p.arch)
-                    .unwrap_or(re_core::arch::Architecture::X86_64),
-                32,
-            )
-        });
-        if let Some(frames) = bt
-            && !frames.is_empty()
-        {
+        // Backtrace — DWARF first (works on optimized release builds), fall
+        // back to the frame-pointer chain when no `.eh_frame` is available
+        // for the current PC.
+        let arch = self
+            .project
+            .as_ref()
+            .map(|p| p.arch)
+            .unwrap_or(re_core::arch::Architecture::X86_64);
+        let (frames, source): (Vec<u64>, &str) = match (
+            self.debugger_remote.as_ref(),
+            self.debugger_unwinder.as_ref(),
+        ) {
+            (Some(d), Some(uw)) => {
+                let regs = d.registers();
+                let unwound =
+                    uw.unwind(arch, &regs, 32, |addr, size| d.read_memory(addr, size).ok());
+                if unwound.len() > 1 {
+                    (unwound, "DWARF .eh_frame")
+                } else {
+                    (d.frame_pointer_backtrace(arch, 32), "frame-pointer")
+                }
+            }
+            (Some(d), None) => (d.frame_pointer_backtrace(arch, 32), "frame-pointer"),
+            _ => (Vec::new(), ""),
+        };
+        if !frames.is_empty() {
             ui.label(
-                egui::RichText::new("Backtrace (frame-pointer):")
+                egui::RichText::new(format!("Backtrace ({}):", source))
                     .size(10.0)
                     .color(egui::Color32::GRAY),
             );
@@ -413,6 +445,53 @@ impl SleuthreApp {
             Ok(()) => self.add_toast(ToastKind::Success, format!("{} set at 0x{:x}", label, addr)),
             Err(e) => self.add_toast(ToastKind::Error, format!("Set {} failed: {}", label, e)),
         }
+    }
+
+    /// Find the next address that maps to a different source line than the
+    /// current PC, set a temporary software breakpoint there, and resume.
+    /// The breakpoint is *not* auto-cleared after the next stop — the user
+    /// can remove it from the active list. A future improvement would book
+    /// a one-shot via the stub's `vCont;c1:tid` if available.
+    fn debugger_step_source_line(&mut self) {
+        let pc = self.debugger_remote.as_ref().and_then(|d| {
+            let regs = d.registers();
+            regs.get("rip")
+                .or_else(|| regs.get("eip"))
+                .or_else(|| regs.get("pc"))
+                .copied()
+        });
+        let Some(pc) = pc else {
+            self.add_toast(ToastKind::Error, "PC unknown — Refresh first.".into());
+            return;
+        };
+        let next_addr = self.project.as_ref().and_then(|project| {
+            let cur = project.types.source_lines.get(&pc);
+            // Walk addresses ascending; find the first whose (file, line) differs.
+            project
+                .types
+                .source_lines
+                .range((pc + 1)..)
+                .find(|(_, info)| match cur {
+                    Some(c) => info.file != c.file || info.line != c.line,
+                    None => true,
+                })
+                .map(|(&addr, _)| addr)
+        });
+        let Some(addr) = next_addr else {
+            self.add_toast(
+                ToastKind::Warning,
+                "No further source line found (end of function?).".into(),
+            );
+            return;
+        };
+        let Some(d) = self.debugger_remote.as_mut() else {
+            return;
+        };
+        if let Err(e) = d.set_breakpoint(addr, BreakpointKind::Software) {
+            self.add_toast(ToastKind::Error, format!("Set step BP failed: {}", e));
+            return;
+        }
+        self.debugger_continue();
     }
 
     fn debugger_remove_breakpoint(&mut self, address: u64) {

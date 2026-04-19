@@ -98,14 +98,36 @@ pub trait Debugger {
         Err(Error::Debugger("breakpoints not supported".into()))
     }
 
+    /// Set a breakpoint scoped to a specific thread. The stub may translate
+    /// this into a thread-conditional breakpoint or apply it process-wide
+    /// depending on its capabilities. Default delegates to `set_breakpoint`
+    /// (process-wide).
+    fn set_breakpoint_for_thread(
+        &mut self,
+        address: u64,
+        kind: BreakpointKind,
+        _thread_id: u64,
+    ) -> Result<()> {
+        self.set_breakpoint(address, kind)
+    }
+
     /// Remove a breakpoint previously set with [`set_breakpoint`].
     fn remove_breakpoint(&mut self, _address: u64, _kind: BreakpointKind) -> Result<()> {
         Err(Error::Debugger("breakpoints not supported".into()))
     }
 
-    /// Enumerate currently-set breakpoints.
+    /// Enumerate currently-set breakpoints. Each entry is `(address, kind, optional thread)`.
     fn breakpoints(&self) -> Vec<(u64, BreakpointKind)> {
         Vec::new()
+    }
+
+    /// Enumerate breakpoints with thread scope. Default falls back to the
+    /// process-wide list with `None` for the thread.
+    fn breakpoints_scoped(&self) -> Vec<(u64, BreakpointKind, Option<u64>)> {
+        self.breakpoints()
+            .into_iter()
+            .map(|(a, k)| (a, k, None))
+            .collect()
     }
 
     /// Walk the frame-pointer chain starting at the current RBP/EBP and

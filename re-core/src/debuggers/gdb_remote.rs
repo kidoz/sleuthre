@@ -125,8 +125,9 @@ pub struct GdbRemoteDebugger {
     state: DebuggerState,
     arch: crate::arch::Architecture,
     /// Currently active breakpoints, mirrored client-side so the GUI can
-    /// enumerate them without an extra protocol round-trip.
-    breakpoints: Vec<(u64, BreakpointKind)>,
+    /// enumerate them without an extra protocol round-trip. The optional
+    /// `Option<u64>` is the thread id when scoped, or `None` for process-wide.
+    breakpoints: Vec<(u64, BreakpointKind, Option<u64>)>,
     /// Thread ids reported by the stub the last time `threads()` was called.
     threads_cache: std::sync::Mutex<Vec<u64>>,
     /// Currently active thread (used to scope `g`/`m` operations on multi-threaded stubs).
@@ -395,21 +396,16 @@ impl Debugger for GdbRemoteDebugger {
     }
 
     fn set_breakpoint(&mut self, address: u64, kind: BreakpointKind) -> Result<()> {
-        let z = bp_kind_byte(kind);
-        let len = bp_kind_length(kind);
-        let pkt = format!("Z{},{:x},{}", z, address, len);
-        let reply = self.send_recv(&pkt)?;
-        if reply == "OK" || reply.is_empty() {
-            self.breakpoints.push((address, kind));
-            Ok(())
-        } else if let Some(code) = reply.strip_prefix('E') {
-            Err(Error::Debugger(format!("set bp E{}", code)))
-        } else {
-            Err(Error::Debugger(format!(
-                "set bp unexpected reply: {}",
-                reply
-            )))
-        }
+        self.set_breakpoint_internal(address, kind, None)
+    }
+
+    fn set_breakpoint_for_thread(
+        &mut self,
+        address: u64,
+        kind: BreakpointKind,
+        thread_id: u64,
+    ) -> Result<()> {
+        self.set_breakpoint_internal(address, kind, Some(thread_id))
     }
 
     fn remove_breakpoint(&mut self, address: u64, kind: BreakpointKind) -> Result<()> {
@@ -418,7 +414,8 @@ impl Debugger for GdbRemoteDebugger {
         let pkt = format!("z{},{:x},{}", z, address, len);
         let reply = self.send_recv(&pkt)?;
         if reply == "OK" || reply.is_empty() {
-            self.breakpoints.retain(|bp| bp != &(address, kind));
+            self.breakpoints
+                .retain(|bp| bp.0 != address || bp.1 != kind);
             Ok(())
         } else if let Some(code) = reply.strip_prefix('E') {
             Err(Error::Debugger(format!("clear bp E{}", code)))
@@ -431,6 +428,10 @@ impl Debugger for GdbRemoteDebugger {
     }
 
     fn breakpoints(&self) -> Vec<(u64, BreakpointKind)> {
+        self.breakpoints.iter().map(|(a, k, _)| (*a, *k)).collect()
+    }
+
+    fn breakpoints_scoped(&self) -> Vec<(u64, BreakpointKind, Option<u64>)> {
         self.breakpoints.clone()
     }
 
@@ -518,6 +519,39 @@ impl Debugger for GdbRemoteDebugger {
             return Err(Error::Debugger(format!("gdb E{}", code)));
         }
         hex_to_bytes(&reply).ok_or_else(|| Error::Debugger("gdb bad memory reply".into()))
+    }
+}
+
+impl GdbRemoteDebugger {
+    /// Internal: set a breakpoint with optional thread scope. The RSP `Z`
+    /// packet supports a `;X<thread>` suffix on stubs that advertise
+    /// `swbreak+`/`hwbreak+` capability — see the gdbserver protocol docs.
+    /// Stubs that don't recognize the suffix simply ignore it and apply the
+    /// breakpoint process-wide, which matches our default trait impl.
+    fn set_breakpoint_internal(
+        &mut self,
+        address: u64,
+        kind: BreakpointKind,
+        thread_id: Option<u64>,
+    ) -> Result<()> {
+        let z = bp_kind_byte(kind);
+        let len = bp_kind_length(kind);
+        let pkt = match thread_id {
+            Some(tid) => format!("Z{},{:x},{};X{:x}", z, address, len, tid),
+            None => format!("Z{},{:x},{}", z, address, len),
+        };
+        let reply = self.send_recv(&pkt)?;
+        if reply == "OK" || reply.is_empty() {
+            self.breakpoints.push((address, kind, thread_id));
+            Ok(())
+        } else if let Some(code) = reply.strip_prefix('E') {
+            Err(Error::Debugger(format!("set bp E{}", code)))
+        } else {
+            Err(Error::Debugger(format!(
+                "set bp unexpected reply: {}",
+                reply
+            )))
+        }
     }
 }
 
