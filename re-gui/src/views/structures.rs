@@ -1,7 +1,23 @@
 use eframe::egui;
+use re_core::project::Project;
 use re_core::types::{CompoundType, PrimitiveType, TypeRef};
 
 use crate::app::SleuthreApp;
+
+/// Drop cached decompilation only for functions that the dependency graph
+/// records as referencing this type. Falls back to a full clear if the graph
+/// has no entry — that case is conservative and matches the legacy behavior.
+fn invalidate_type(project: &mut Project, type_name: &str) {
+    let dependents = project.cache_deps.dependents_of_type(type_name);
+    if dependents.is_empty() {
+        project.decompilation_cache.clear();
+        return;
+    }
+    for addr in dependents {
+        project.decompilation_cache.remove(&addr);
+        project.cache_deps.forget(addr);
+    }
+}
 
 impl SleuthreApp {
     pub(crate) fn show_structures(&mut self, ui: &mut egui::Ui) {
@@ -220,12 +236,15 @@ impl SleuthreApp {
             }
         });
 
-        // Apply deferred mutations
+        // Apply deferred mutations. We invalidate only functions that the
+        // dependency graph says reference the touched type — a full
+        // `cache.clear()` would force a re-decompile of every visited
+        // function in the project.
         if let Some(name) = delete_type
             && let Some(ref mut project) = self.project
         {
+            invalidate_type(project, &name);
             project.types.remove_type(&name);
-            project.decompilation_cache.clear();
         }
         if let Some((old, new)) = rename_type
             && let Some(ref mut project) = self.project
@@ -240,7 +259,7 @@ impl SleuthreApp {
                 }
             }
             project.types.add_type(ty);
-            project.decompilation_cache.clear();
+            invalidate_type(project, &old);
         }
         if let Some((struct_name, field_idx)) = delete_field
             && let Some(ref mut project) = self.project
@@ -251,7 +270,7 @@ impl SleuthreApp {
             {
                 fields.remove(field_idx);
             }
-            project.decompilation_cache.clear();
+            invalidate_type(project, &struct_name);
         }
         if let Some((struct_name, field_idx, name, offset_str, type_str)) = edit_field
             && let Some(ref mut project) = self.project
@@ -266,7 +285,7 @@ impl SleuthreApp {
                 }
                 fields[field_idx].type_ref = parse_type_str(&type_str);
             }
-            project.decompilation_cache.clear();
+            invalidate_type(project, &struct_name);
         }
 
         // Edit Field dialog

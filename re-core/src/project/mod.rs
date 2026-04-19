@@ -89,6 +89,8 @@ pub struct Project {
     pub bookmarks: BTreeMap<u64, String>,
     pub tags: BTreeMap<u64, Vec<String>>,
     pub decompilation_cache: HashMap<u64, crate::il::hlil::DecompiledCode>,
+    /// Dependency graph for surgical decompile-cache invalidation.
+    pub cache_deps: CacheDependencyGraph,
     pub nav_history: Vec<u64>,
     pub nav_position: usize,
     pub undo_stack: Vec<UndoCommand>,
@@ -97,6 +99,99 @@ pub struct Project {
     pub arch: Architecture,
     pub binary_format: BinaryFormat,
     pub struct_overlays: Vec<StructOverlay>,
+}
+
+/// Tracks which functions a cached decompilation depends on so a single edit
+/// invalidates exactly the affected entries.
+///
+/// Two relationships are tracked:
+///   * `func_to_called` — function F called callee G; renaming G invalidates F.
+///   * `func_to_types` — function F referenced type T; editing T invalidates F.
+///
+/// The reverse direction (`called_to_funcs`, `type_to_funcs`) is maintained in
+/// parallel so invalidation lookups are O(1).
+#[derive(Debug, Clone, Default)]
+pub struct CacheDependencyGraph {
+    func_to_called: HashMap<u64, std::collections::HashSet<u64>>,
+    called_to_funcs: HashMap<u64, std::collections::HashSet<u64>>,
+    func_to_types: HashMap<u64, std::collections::HashSet<String>>,
+    type_to_funcs: HashMap<String, std::collections::HashSet<u64>>,
+}
+
+impl CacheDependencyGraph {
+    /// Replace the dependency set for a function in one shot, keeping the
+    /// reverse indexes consistent.
+    pub fn set_dependencies(
+        &mut self,
+        func: u64,
+        callees: std::collections::HashSet<u64>,
+        types: std::collections::HashSet<String>,
+    ) {
+        // Remove old reverse edges first.
+        if let Some(old_callees) = self.func_to_called.remove(&func) {
+            for c in old_callees {
+                if let Some(set) = self.called_to_funcs.get_mut(&c) {
+                    set.remove(&func);
+                }
+            }
+        }
+        if let Some(old_types) = self.func_to_types.remove(&func) {
+            for t in old_types {
+                if let Some(set) = self.type_to_funcs.get_mut(&t) {
+                    set.remove(&func);
+                }
+            }
+        }
+        // Insert new edges.
+        for c in &callees {
+            self.called_to_funcs.entry(*c).or_default().insert(func);
+        }
+        for t in &types {
+            self.type_to_funcs
+                .entry(t.clone())
+                .or_default()
+                .insert(func);
+        }
+        self.func_to_called.insert(func, callees);
+        self.func_to_types.insert(func, types);
+    }
+
+    /// Drop everything tracked for this function (e.g. when its cache entry is
+    /// evicted independently of an edit).
+    pub fn forget(&mut self, func: u64) {
+        if let Some(callees) = self.func_to_called.remove(&func) {
+            for c in callees {
+                if let Some(set) = self.called_to_funcs.get_mut(&c) {
+                    set.remove(&func);
+                }
+            }
+        }
+        if let Some(types) = self.func_to_types.remove(&func) {
+            for t in types {
+                if let Some(set) = self.type_to_funcs.get_mut(&t) {
+                    set.remove(&func);
+                }
+            }
+        }
+    }
+
+    /// Functions that should be re-decompiled when `callee` is renamed or has
+    /// its signature changed. Includes `callee` itself.
+    pub fn dependents_of_function(&self, callee: u64) -> std::collections::HashSet<u64> {
+        let mut out = self
+            .called_to_funcs
+            .get(&callee)
+            .cloned()
+            .unwrap_or_default();
+        out.insert(callee);
+        out
+    }
+
+    /// Functions that should be re-decompiled when type `name` is renamed,
+    /// has fields edited, or is deleted.
+    pub fn dependents_of_type(&self, name: &str) -> std::collections::HashSet<u64> {
+        self.type_to_funcs.get(name).cloned().unwrap_or_default()
+    }
 }
 
 /// A named struct/type applied to a memory address, optionally as an array.
@@ -129,6 +224,7 @@ impl Project {
             bookmarks: BTreeMap::new(),
             tags: BTreeMap::new(),
             decompilation_cache: HashMap::new(),
+            cache_deps: CacheDependencyGraph::default(),
             nav_history: Vec::new(),
             nav_position: 0,
             undo_stack: Vec::new(),
@@ -183,23 +279,28 @@ impl Project {
                 if let Some(f) = self.functions.functions.get_mut(address) {
                     f.name = name.clone();
                 }
-                self.decompilation_cache.remove(address);
-
-                // Invalidate callers too, as they might inline the function name
+                // Invalidate exactly the function and any cached entry that
+                // recorded a dependency on it; the dep-graph is more precise
+                // than the xref-walk fallback because it understands inlined
+                // names that don't carry call xrefs (e.g. function-pointer
+                // tables).
+                let mut to_invalidate = self.cache_deps.dependents_of_function(*address);
                 if let Some(xrefs) = self.xrefs.to_address_xrefs.get(address) {
                     for xref in xrefs {
-                        if xref.xref_type == crate::analysis::xrefs::XrefType::Call {
-                            // Find function containing the call site
-                            if let Some((&caller_addr, _)) = self
+                        if xref.xref_type == crate::analysis::xrefs::XrefType::Call
+                            && let Some((&caller_addr, _)) = self
                                 .functions
                                 .functions
                                 .range(..=xref.from_address)
                                 .next_back()
-                            {
-                                self.decompilation_cache.remove(&caller_addr);
-                            }
+                        {
+                            to_invalidate.insert(caller_addr);
                         }
                     }
+                }
+                for addr in to_invalidate {
+                    self.decompilation_cache.remove(&addr);
+                    self.cache_deps.forget(addr);
                 }
 
                 if undo {
@@ -1126,6 +1227,38 @@ mod tests {
         assert!(result.merged.contains("\"kind\":\"conflict\""));
         assert!(result.merged.contains("from left"));
         assert!(result.merged.contains("from right"));
+    }
+
+    #[test]
+    fn cache_dep_graph_invalidates_dependents() {
+        let mut g = CacheDependencyGraph::default();
+        // Function 0x1000 calls 0x2000 and references type Player.
+        g.set_dependencies(
+            0x1000,
+            std::collections::HashSet::from([0x2000]),
+            std::collections::HashSet::from(["Player".to_string()]),
+        );
+        // Function 0x1100 calls 0x2000 too.
+        g.set_dependencies(
+            0x1100,
+            std::collections::HashSet::from([0x2000]),
+            std::collections::HashSet::new(),
+        );
+
+        // Renaming 0x2000 should invalidate 0x1000, 0x1100, and 0x2000 itself.
+        let dep = g.dependents_of_function(0x2000);
+        assert!(dep.contains(&0x1000));
+        assert!(dep.contains(&0x1100));
+        assert!(dep.contains(&0x2000));
+
+        // Editing Player should invalidate only 0x1000.
+        let dep = g.dependents_of_type("Player");
+        assert_eq!(dep.len(), 1);
+        assert!(dep.contains(&0x1000));
+
+        // After forgetting 0x1000 the type-side index is empty.
+        g.forget(0x1000);
+        assert!(g.dependents_of_type("Player").is_empty());
     }
 
     #[test]
