@@ -438,7 +438,8 @@ impl SleuthreApp {
         if !self.rename_active {
             return;
         }
-        let mut published_event: Option<re_core::collab::CollabEvent> = None;
+        // The rename mutation is broadcast automatically by the per-frame
+        // `broadcast_pending_undo_events` hook — no per-dialog plumbing needed.
         egui::Window::new("Rename").show(ctx, |ui| {
             ui.text_edit_singleline(&mut self.rename_input);
             ui.horizontal(|ui| {
@@ -450,21 +451,10 @@ impl SleuthreApp {
                             .get(&addr)
                             .map(|f| f.name.clone())
                             .unwrap_or_default();
-                        let new_name = self.rename_input.clone();
                         p.execute(UndoCommand::Rename {
                             address: addr,
-                            old_name: old_name.clone(),
-                            new_name: new_name.clone(),
-                        });
-                        published_event = Some(re_core::collab::CollabEvent {
-                            kind: "rename".into(),
-                            author: "local".into(),
-                            seq: 0,
-                            payload: serde_json::json!({
-                                "address": format!("0x{:x}", addr),
-                                "old_name": old_name,
-                                "new_name": new_name,
-                            }),
+                            old_name,
+                            new_name: self.rename_input.clone(),
                         });
                     }
                     self.rename_active = false;
@@ -474,9 +464,6 @@ impl SleuthreApp {
                 }
             });
         });
-        if let (Some(event), Some(b)) = (published_event, &self.collab_broadcaster) {
-            let _ = b.publish(event);
-        }
     }
 
     fn show_comment_dialog(&mut self, ctx: &egui::Context) {

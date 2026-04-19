@@ -178,6 +178,7 @@ impl eframe::App for SleuthreApp {
         self.show_modals(ctx);
         self.show_toasts(ctx);
         self.show_loading_overlay(ctx);
+        self.broadcast_pending_undo_events();
     }
 }
 
@@ -1957,6 +1958,92 @@ fn entropy_nav_color(normalized: f32) -> egui::Color32 {
         egui::Color32::from_rgb(50, 180, 80)
     } else {
         egui::Color32::from_rgb(220, 60, 60)
+    }
+}
+
+impl SleuthreApp {
+    /// Drain any newly-executed `UndoCommand`s from the project's undo stack
+    /// and publish them as `CollabEvent`s on the broadcaster, if one is
+    /// running. This intercept point captures every mutation regardless of
+    /// which dialog or shortcut produced it — wiring publish at each
+    /// `execute()` call site would have been a 15-place patch.
+    pub(crate) fn broadcast_pending_undo_events(&mut self) {
+        let Some(ref bcast) = self.collab_broadcaster else {
+            return;
+        };
+        let Some(ref project) = self.project else {
+            return;
+        };
+        let stack_len = project.undo_stack.len();
+        if stack_len <= self.last_published_undo_idx {
+            self.last_published_undo_idx = stack_len;
+            return;
+        }
+        for cmd in &project.undo_stack[self.last_published_undo_idx..stack_len] {
+            let event = undo_command_to_event(cmd);
+            let _ = bcast.publish(event);
+        }
+        self.last_published_undo_idx = stack_len;
+    }
+}
+
+fn undo_command_to_event(cmd: &re_core::project::UndoCommand) -> re_core::collab::CollabEvent {
+    use re_core::project::UndoCommand;
+    let (kind, payload) = match cmd {
+        UndoCommand::Rename {
+            address,
+            old_name,
+            new_name,
+        } => (
+            "rename",
+            serde_json::json!({
+                "address": format!("0x{:x}", address),
+                "old_name": old_name,
+                "new_name": new_name,
+            }),
+        ),
+        UndoCommand::Comment {
+            address,
+            new_comment,
+            ..
+        } => (
+            "comment",
+            serde_json::json!({
+                "address": format!("0x{:x}", address),
+                "text": new_comment,
+            }),
+        ),
+        UndoCommand::AddBookmark { address, note } => (
+            "add_bookmark",
+            serde_json::json!({"address": format!("0x{:x}", address), "note": note}),
+        ),
+        UndoCommand::RemoveBookmark { address, note } => (
+            "remove_bookmark",
+            serde_json::json!({"address": format!("0x{:x}", address), "note": note}),
+        ),
+        UndoCommand::PatchMemory {
+            address, new_bytes, ..
+        } => (
+            "patch",
+            serde_json::json!({
+                "address": format!("0x{:x}", address),
+                "len": new_bytes.len(),
+            }),
+        ),
+        UndoCommand::AddTag { address, tag } => (
+            "add_tag",
+            serde_json::json!({"address": format!("0x{:x}", address), "tag": tag}),
+        ),
+        UndoCommand::RemoveTag { address, tag } => (
+            "remove_tag",
+            serde_json::json!({"address": format!("0x{:x}", address), "tag": tag}),
+        ),
+    };
+    re_core::collab::CollabEvent {
+        kind: kind.into(),
+        author: "local".into(),
+        seq: 0,
+        payload,
     }
 }
 

@@ -240,6 +240,9 @@ pub(crate) struct SleuthreApp {
     pub(crate) collab_status: Option<String>,
     pub(crate) collab_dialog_active: bool,
     pub(crate) collab_port_input: String,
+    /// High-water mark of `project.undo_stack` indices already published over
+    /// the collab broadcaster.
+    pub(crate) last_published_undo_idx: usize,
 }
 
 pub(crate) use crate::views::image_preview::ImagePreviewSlot;
@@ -568,6 +571,7 @@ impl Default for SleuthreApp {
             collab_status: None,
             collab_dialog_active: false,
             collab_port_input: String::new(),
+            last_published_undo_idx: 0,
         }
     }
 }
