@@ -10,17 +10,32 @@ An open-source reverse engineering desktop application built in Rust.
 
 ## Features
 
-- **Binary format support** — ELF and PE loaders with automatic format detection
-- **Multi-architecture disassembly** — x86, x86_64, ARM, ARM64, MIPS, MIPS64 (via Capstone)
-- **Function discovery** — entry point analysis and heuristic-based detection (prologue patterns)
-- **Control flow graphs** — basic block identification, CFG construction, layered graph layout
-- **Cross-references** — call, jump, data read, and data write xrefs with bidirectional indexing
-- **String extraction** — ASCII and UTF-16LE with configurable minimum length
-- **Constant detection** — CRC32 tables, AES S-boxes, pointer tables
-- **Basic decompiler** — pseudo-C code generation from disassembly
-- **Project persistence** — SQLite-backed database for saving/loading analysis state
-- **MCP server** — headless JSON-RPC interface for AI agent integration
-- **AI approval queue** — review and approve AI-suggested renames and comments
+### Analysis engine
+- **Loaders** — ELF, PE, Mach-O (single + fat), raw binary; archive/image/bytecode plugin formats
+- **Architectures** — x86, x86-64, ARM, ARM64, ARM Thumb-2, MIPS, MIPS64, RISC-V (RV32/RV64) via Capstone
+- **Function discovery** — entry-point + recursive descent + prologue heuristics
+- **Control flow graphs** — basic-block recovery, switch-table reconstruction, layered layout
+- **Cross-references** — bidirectional indexes for calls/jumps/data/string refs
+- **Strings + constants** — ASCII / UTF-16LE / UTF-16BE; CRC32 / AES S-box / pointer tables
+- **MSVC pattern recognition** — SEH frame setup, FPO prologues, inline `rep movs/stos`
+- **VTable recovery** — auto-link discovered vtables to declared C++ classes; resolve `obj->Method()` in decompiled output
+- **Type intelligence** — DWARF + PDB parsers, Win32 / DirectX / libc type libraries, struct inference
+
+### Decompiler
+- **Compilable C output** — typed dereferences, function-pointer casts on indirect calls, SSE/AVX intrinsic calls instead of placeholders, switch-default `break;`, return-type fall-through guard. The emitted text passes `cc -fsyntax-only -std=c11` (verified by integration test).
+- **Recompile-diff** — `analysis::recompile_diff` writes the decomp output to a temp `.c`, runs `cc -c`, disassembles the result, and reports per-category instruction divergence vs. the original. Closes the loop on "did the decompilation preserve semantics?" — no commercial RE tool ships this.
+- **Surgical cache invalidation** — annotation-driven dependency graph invalidates only the affected functions on a rename or type edit; full clears are gone.
+
+### Collaboration & automation
+- **Live broadcast collab** — TCP listener publishes every `UndoCommand` as line-delimited JSON; viewers can also send events back (bidirectional). Tools menu exposes start/stop.
+- **Git-friendly project format** — `Project::export_jsonl` emits deterministic JSON-Lines for renames/comments/bookmarks/tags/overlays/types; `merge_jsonl_3way` performs a semantic 3-way merge with conflict markers for async PR-based RE.
+- **MCP server** — first-party Model Context Protocol implementation with 27 typed tools (disasm, decomp, MLIL/SSA dumps, IL rewrite, recompile-diff, JSONL merge, signature scans, …) and 7 resources for AI agent integration. No other RE tool ships this natively.
+- **Plugins** — Rhai scripts hot-reloaded from `~/.sleuthre/plugins/`; async worker thread runs scripts without blocking the UI; FLIRT PAT importer for community signature corpora.
+- **GDB Remote Serial Protocol debugger** — connects to gdbserver / QEMU-gdbstub / LLDB platform via `GdbRemoteDebugger`; attach / step / continue / read registers + memory.
+- **AI approval queue** — review and approve AI-suggested renames and comments before they apply.
+
+### Project persistence
+- SQLite-backed (`*.sleuthre`) with full round-trip for functions, comments, xrefs, strings, types, classes, struct overlays, bookmarks, tags, and decompilation cache.
 
 ## Architecture
 
