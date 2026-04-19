@@ -146,6 +146,12 @@ impl Database {
                 count INTEGER NOT NULL,
                 PRIMARY KEY (address, label)
             );
+            CREATE TABLE IF NOT EXISTS classes (
+                name TEXT PRIMARY KEY,
+                base TEXT,
+                vtable_label TEXT,
+                vtable_address INTEGER
+            );
             COMMIT;",
             )
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
@@ -374,7 +380,8 @@ impl Database {
                  DELETE FROM source_lines;
                  DELETE FROM decompilation_cache;
                  DELETE FROM tags;
-                 DELETE FROM struct_overlays;",
+                 DELETE FROM struct_overlays;
+                 DELETE FROM classes;",
             )
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
         Ok(())
@@ -707,6 +714,55 @@ impl Database {
             overlays.push(row.map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?);
         }
         Ok(overlays)
+    }
+
+    // --- ClassInfo persistence ---
+
+    pub fn save_class(&self, name: &str, info: &crate::types::ClassInfo) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO classes (name, base, vtable_label, vtable_address) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    name,
+                    info.base.as_deref(),
+                    info.vtable_label.as_deref(),
+                    info.vtable_address.map(|v| v as i64),
+                ],
+            )
+            .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn load_classes(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, crate::types::ClassInfo>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name, base, vtable_label, vtable_address FROM classes ORDER BY name")
+            .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let name: String = row.get(0)?;
+                let base: Option<String> = row.get(1)?;
+                let vtable_label: Option<String> = row.get(2)?;
+                let vtable_address: Option<i64> = row.get(3)?;
+                Ok((
+                    name,
+                    crate::types::ClassInfo {
+                        base,
+                        vtable_label,
+                        vtable_address: vtable_address.map(|v| v as u64),
+                    },
+                ))
+            })
+            .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
+        let mut out = std::collections::BTreeMap::new();
+        for row in rows {
+            let (n, info) = row.map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
+            out.insert(n, info);
+        }
+        Ok(out)
     }
 
     // --- Function signature persistence ---
@@ -1166,6 +1222,24 @@ mod tests {
         assert_eq!(loaded[0].label, "player");
         assert_eq!(loaded[1].address, 0x600000);
         assert_eq!(loaded[1].count, 32);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn round_trip_classes() {
+        let (db, path) = temp_db();
+        let info = crate::types::ClassInfo {
+            base: Some("Widget".into()),
+            vtable_label: Some("vtable_Button".into()),
+            vtable_address: Some(0x404010),
+        };
+        db.save_class("Button", &info).unwrap();
+        let loaded = db.load_classes().unwrap();
+        assert_eq!(loaded.len(), 1);
+        let restored = loaded.get("Button").unwrap();
+        assert_eq!(restored.base.as_deref(), Some("Widget"));
+        assert_eq!(restored.vtable_label.as_deref(), Some("vtable_Button"));
+        assert_eq!(restored.vtable_address, Some(0x404010));
         let _ = std::fs::remove_file(path);
     }
 }

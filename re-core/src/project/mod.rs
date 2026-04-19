@@ -556,6 +556,11 @@ impl Project {
                 db.save_struct_overlay(overlay)?;
             }
 
+            // Persist class metadata (vtable address + base class).
+            for (name, info) in &self.types.classes {
+                db.save_class(name, info)?;
+            }
+
             Ok(())
         })();
 
@@ -632,6 +637,9 @@ impl Project {
 
         // Restore struct overlays
         project.struct_overlays = db.load_struct_overlays()?;
+
+        // Restore class metadata.
+        project.types.classes = db.load_classes()?;
 
         project.db = Some(db);
         Ok(project)
