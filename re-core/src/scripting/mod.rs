@@ -1,3 +1,5 @@
+pub mod plugin;
+
 use crate::formats::archive::default_registry as default_archive_registry;
 use crate::formats::bytecode::{OpcodeDefinition, OperandType, disassemble_with_table};
 use crate::import::symbols::{detect_format, parse_symbols};
@@ -5,6 +7,8 @@ use crate::project::Project;
 use rhai::{Dynamic, Engine, EvalAltResult, Scope};
 use std::cell::RefCell;
 use std::rc::Rc;
+
+pub use plugin::{PluginRegistry, PluginScript, ReloadReport};
 
 /// Actions that scripts can request. Applied by the caller after eval.
 #[derive(Debug, Clone)]
