@@ -1,3 +1,4 @@
+pub mod async_runner;
 pub mod plugin;
 
 use crate::formats::archive::default_registry as default_archive_registry;
@@ -8,6 +9,7 @@ use rhai::{Dynamic, Engine, EvalAltResult, Scope};
 use std::cell::RefCell;
 use std::rc::Rc;
 
+pub use async_runner::{AsyncPluginRunner, ProjectSnapshot, ScriptJob, ScriptResultMsg};
 pub use plugin::{PluginRegistry, PluginScript, ReloadReport};
 
 /// Actions that scripts can request. Applied by the caller after eval.
