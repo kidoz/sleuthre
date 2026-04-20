@@ -14,6 +14,49 @@
 - DWARF location expression evaluator exposed for `.debug_loc` consumers
 - Multi-binary `Workspace` scaffolding (library-only API) with cross-binary symbol and import resolution
 
+## [0.3.0] - 2026-03-26
+
+### Added
+
+- Struct inference pass that promotes pointer-to-blob arguments into named structs
+- Bundled Win32 and DirectX struct type definitions for better Windows analysis
+- `BinaryFile` scripting API exposing raw bytes, sections, and memory ranges to Rhai
+- x86 `thiscall` / `fastcall` calling-convention detection
+- x87 FPU instruction support in the x86 disassembler and lifter
+- macOS ARM64 release job in CI
+
+### Fixed
+
+- Save path consistency across project open/save; the write is now wrapped in a single SQLite transaction
+- `cargo fmt` drift across the workspace
+- Functions panel layout glitches
+- CI tag trigger and release asset upload
+
+### Changed
+
+- Added initial integration tests for `re-gui` and `re-mcp`
+
+## [0.2.0] - 2026-03-23
+
+### Added
+
+- RISC-V architecture support (disassembly + function discovery)
+- Global-variable resolution pass that names data references
+- Binary diff view and entropy visualization
+- Screenshot in README and release badge
+- `justfile` with common dev shortcuts
+
+### Changed
+
+- Binary loading moved into a shared pipeline so GUI and CLI share one analysis path
+- UI responsiveness improvements (background work off the main thread)
+- Analysis performance improvements on the function-discovery hot path
+- Graph view refresh
+
+### Fixed
+
+- Disassembler handling of empty/zero-length instruction streams
+
 ## [0.1.0-alpha] - 2026-02-17
 
 ### Added
