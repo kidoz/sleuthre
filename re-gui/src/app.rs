@@ -271,6 +271,8 @@ pub(crate) struct SleuthreApp {
     /// Software breakpoints set transiently by step-source / step-over and
     /// removed on the next stop reply.
     pub(crate) debugger_temp_breakpoints: Vec<u64>,
+    /// When `true`, the next BP set targets only `debugger_active_thread`.
+    pub(crate) debugger_bp_scope_thread: bool,
 }
 
 /// Async operation in flight on the debugger.
@@ -625,6 +627,7 @@ impl Default for SleuthreApp {
             debugger_active_thread: None,
             debugger_unwinder: None,
             debugger_temp_breakpoints: Vec::new(),
+            debugger_bp_scope_thread: false,
         }
     }
 }

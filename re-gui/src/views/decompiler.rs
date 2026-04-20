@@ -1,4 +1,5 @@
 use eframe::egui;
+use re_core::Debugger;
 
 use crate::app::SleuthreApp;
 use crate::theme::SyntaxColors;
@@ -20,10 +21,34 @@ impl SleuthreApp {
         });
         ui.separator();
 
+        let mut pending_run_to: Option<u64> = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
             let job = highlight_pseudocode(&self.decompiled_code.text, &self.syntax);
             let galley = ui.painter().layout_job(job);
-            let response = ui.add(egui::Label::new(galley.clone()).sense(egui::Sense::click()));
+            let response = ui.add(
+                egui::Label::new(galley.clone())
+                    .sense(egui::Sense::click())
+                    .sense(egui::Sense::click_and_drag()),
+            );
+
+            let hover_addr = response.hover_pos().and_then(|pos| {
+                let relative_pos = pos - response.rect.min;
+                let cursor = galley.cursor_from_pos(relative_pos);
+                let char_idx = cursor.index;
+                // Any Function/Global annotation at this char index is a candidate
+                // target for run-to-cursor.
+                self.decompiled_code.annotations.iter().find_map(|ann| {
+                    if char_idx >= ann.start && char_idx < ann.end {
+                        match &ann.kind {
+                            re_core::il::hlil::AnnotationKind::Function(a)
+                            | re_core::il::hlil::AnnotationKind::Global(a) => Some(*a),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                })
+            });
 
             if response.clicked()
                 && let Some(pos) = response.interact_pointer_pos()
@@ -47,7 +72,42 @@ impl SleuthreApp {
                     }
                 }
             }
+
+            // Right-click "Run to cursor" — only enabled when a debugger is
+            // connected and the hover landed on an annotated address.
+            if self.debugger_remote.is_some() {
+                response.context_menu(|ui| {
+                    let enabled = hover_addr.is_some();
+                    if ui
+                        .add_enabled(enabled, egui::Button::new("Run to Cursor"))
+                        .clicked()
+                    {
+                        pending_run_to = hover_addr;
+                        ui.close();
+                    }
+                });
+            }
         });
+
+        if let Some(addr) = pending_run_to {
+            self.debugger_run_to_cursor(addr);
+        }
+    }
+
+    fn debugger_run_to_cursor(&mut self, addr: u64) {
+        let Some(d) = self.debugger_remote.as_mut() else {
+            return;
+        };
+        match d.set_breakpoint(addr, re_core::BreakpointKind::Software) {
+            Ok(()) => {
+                self.debugger_temp_breakpoints.push(addr);
+                self.debugger_continue();
+            }
+            Err(e) => self.add_toast(
+                crate::app::ToastKind::Error,
+                format!("Run-to-cursor BP failed: {}", e),
+            ),
+        }
     }
 }
 

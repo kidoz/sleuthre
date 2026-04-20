@@ -6,7 +6,7 @@
 //! address. The actual transport lives in `re_core::debuggers::GdbRemoteDebugger`.
 
 use eframe::egui;
-use re_core::{BreakpointKind, Debugger, StopReason};
+use re_core::{BreakpointKind, Debugger, StopReason, WatchpointHit};
 
 use crate::app::{PendingDebuggerOp, SleuthreApp, ToastKind};
 
@@ -149,6 +149,11 @@ impl SleuthreApp {
             }
             if ui.button("+ Watch RW").clicked() {
                 requested = Some(BreakpointKind::AccessWatch);
+            }
+            // Scope-to-thread checkbox; only visible when an active thread
+            // is selected so single-thread targets don't see clutter.
+            if self.debugger_active_thread.is_some() {
+                ui.checkbox(&mut self.debugger_bp_scope_thread, "this thread");
             }
         });
         if let Some(kind) = requested {
@@ -360,7 +365,7 @@ impl SleuthreApp {
         self.spawn_debugger_op(DebuggerOp::Step);
     }
 
-    fn debugger_continue(&mut self) {
+    pub(crate) fn debugger_continue(&mut self) {
         self.spawn_debugger_op(DebuggerOp::Continue);
     }
 
@@ -400,6 +405,26 @@ impl SleuthreApp {
                 self.debugger_pending = None;
                 match result {
                     Ok(reason) => {
+                        // Watchpoint stops carry a data address that's more
+                        // useful than the PC — log it to the output panel so
+                        // the analyst can pair it with the memory inspector.
+                        if let StopReason::Watchpoint {
+                            kind,
+                            pc,
+                            data_address,
+                        } = &reason
+                        {
+                            let kind_str = match kind {
+                                WatchpointHit::Write => "write",
+                                WatchpointHit::Read => "read",
+                                WatchpointHit::Access => "access",
+                            };
+                            self.output.push_str(&format!(
+                                "Watchpoint ({}) at 0x{:x} accessed data 0x{:x}\n",
+                                kind_str, pc, data_address
+                            ));
+                            self.debugger_mem_addr = format!("0x{:x}", data_address);
+                        }
                         self.debugger_last_stop = Some(reason);
                         self.debugger_refresh();
                         self.debugger_clear_temp_breakpoints();
@@ -470,6 +495,11 @@ impl SleuthreApp {
             );
             return;
         };
+        let scope_tid = if self.debugger_bp_scope_thread {
+            self.debugger_active_thread
+        } else {
+            None
+        };
         let Some(d) = self.debugger_remote.as_mut() else {
             return;
         };
@@ -480,8 +510,20 @@ impl SleuthreApp {
             BreakpointKind::ReadWatch => "read watchpoint",
             BreakpointKind::AccessWatch => "access watchpoint",
         };
-        match d.set_breakpoint(addr, kind) {
-            Ok(()) => self.add_toast(ToastKind::Success, format!("{} set at 0x{:x}", label, addr)),
+        let result = match scope_tid {
+            Some(tid) => d.set_breakpoint_for_thread(addr, kind, tid),
+            None => d.set_breakpoint(addr, kind),
+        };
+        match result {
+            Ok(()) => {
+                let scope_note = scope_tid
+                    .map(|t| format!(" (thread 0x{:x})", t))
+                    .unwrap_or_default();
+                self.add_toast(
+                    ToastKind::Success,
+                    format!("{} set at 0x{:x}{}", label, addr, scope_note),
+                );
+            }
             Err(e) => self.add_toast(ToastKind::Error, format!("Set {} failed: {}", label, e)),
         }
     }
@@ -574,6 +616,24 @@ fn stop_reason_summary(reason: &StopReason) -> (String, egui::Color32) {
             format!("hit hw bp @ 0x{:x}", pc),
             egui::Color32::from_rgb(255, 200, 80),
         ),
+        StopReason::Watchpoint {
+            kind,
+            pc,
+            data_address,
+        } => {
+            let kind_str = match kind {
+                WatchpointHit::Write => "write",
+                WatchpointHit::Read => "read",
+                WatchpointHit::Access => "access",
+            };
+            (
+                format!(
+                    "{} watch @ 0x{:x} (data 0x{:x})",
+                    kind_str, pc, data_address
+                ),
+                egui::Color32::from_rgb(255, 170, 60),
+            )
+        }
         StopReason::Signal(sig) => (format!("signal {}", sig), egui::Color32::LIGHT_BLUE),
         StopReason::Exited(code) => (
             format!("exited ({})", code),
