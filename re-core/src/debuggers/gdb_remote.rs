@@ -18,7 +18,7 @@
 //! mode, extended-remote launch. The transport is stable so those layer in
 //! without protocol changes.
 
-use crate::{BreakpointKind, Debugger, DebuggerState, Error, Result, StopReason};
+use crate::{BreakpointKind, Debugger, DebuggerState, Error, Result, StopReason, WatchpointHit};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -304,15 +304,26 @@ fn parse_stop_reply(reply: &str) -> StopReason {
             let mut pc: Option<u64> = None;
             let mut sw_break = false;
             let mut hw_break = false;
+            let mut watch: Option<(WatchpointHit, u64)> = None;
             for kv in body.split(';') {
                 if kv.is_empty() {
                     continue;
                 }
                 let (key, value) = kv.split_once(':').unwrap_or((kv, ""));
-                if key == "swbreak" {
-                    sw_break = true;
-                } else if key == "hwbreak" {
-                    hw_break = true;
+                match key {
+                    "swbreak" => sw_break = true,
+                    "hwbreak" => hw_break = true,
+                    // Watch kv pairs carry the accessed data address in hex.
+                    "watch" | "rwatch" | "awatch" => {
+                        let kind = match key {
+                            "watch" => WatchpointHit::Write,
+                            "rwatch" => WatchpointHit::Read,
+                            _ => WatchpointHit::Access,
+                        };
+                        let data_addr = u64::from_str_radix(value, 16).unwrap_or(0);
+                        watch = Some((kind, data_addr));
+                    }
+                    _ => {}
                 }
                 // Numeric keys are register dumps; the lowest-numbered one is
                 // typically PC for x86 (rip is at the end of the layout
@@ -328,7 +339,13 @@ fn parse_stop_reply(reply: &str) -> StopReason {
                     pc = Some(v);
                 }
             }
-            if hw_break {
+            if let Some((kind, data_address)) = watch {
+                StopReason::Watchpoint {
+                    kind,
+                    pc: pc.unwrap_or(0),
+                    data_address,
+                }
+            } else if hw_break {
                 StopReason::HardwareBreakpoint(pc.unwrap_or(0))
             } else if sw_break {
                 StopReason::SoftwareBreakpoint(pc.unwrap_or(0))

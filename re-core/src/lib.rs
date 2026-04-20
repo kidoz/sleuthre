@@ -37,6 +37,14 @@ pub enum StopReason {
     SoftwareBreakpoint(u64),
     /// A hardware breakpoint at the given address was hit.
     HardwareBreakpoint(u64),
+    /// A watchpoint fired. `pc` is the instruction that triggered the
+    /// access; `data_address` is the memory location that was read or
+    /// written. `kind` indicates which flavour of watch (write/read/access).
+    Watchpoint {
+        kind: WatchpointHit,
+        pc: u64,
+        data_address: u64,
+    },
     /// The inferior received a POSIX signal (e.g. 5 = SIGTRAP).
     Signal(u32),
     /// The inferior exited normally.
@@ -45,6 +53,14 @@ pub enum StopReason {
     Terminated(u32),
     /// The stub returned a stop reply we couldn't classify.
     Other(String),
+}
+
+/// Kind of watchpoint that fired in a [`StopReason::Watchpoint`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchpointHit {
+    Write,
+    Read,
+    Access,
 }
 
 /// Type of breakpoint or watchpoint to set. Maps directly to the GDB Remote
