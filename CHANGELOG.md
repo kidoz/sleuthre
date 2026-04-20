@@ -4,15 +4,45 @@
 
 ### Added
 
-- Auto-detect PDB sidecar files for PE binaries (embedded path, sibling `.pdb`, basename fallback)
-- Per-thread breakpoint scope toggle in the debugger panel
-- Run-to-cursor from the decompiler and disassembly views
+- GDB Remote Serial Protocol debugger backend with software/hardware breakpoints, read/write/access watchpoints, multi-thread support, interrupt, and stop-reply parsing
+- Debugger panel in the GUI with async continue/step, run-to-cursor, per-thread BP scope, disassembly context menu, and auto-jump to PC on stop
+- DWARF `.eh_frame` + `.debug_frame` stack unwinder with frame-pointer fallback, source-line stepping, and per-thread breakpoints
+- DWARF location expression evaluator exposed for `.debug_loc` consumers
 - Watchpoint stop replies expose the faulting data address and auto-scroll the hex view
 - `WatchpointHit` and `StopReason::Watchpoint` in the public debugger API
+- Live collaboration broadcaster over TCP with bidirectional `UndoCommand` streaming
+- 3-way JSONL merge for git-friendly project collaboration
+- JSON-Lines project export for git-friendly diffs
+- Rhai plugin discovery, hot-reload, and async runner so scripts never block the UI
 - Bundled Rhai example plugins (`rename_alloc_funcs`, `find_xor_loops`) with plugin API README
+- Rhai archive, bytecode, and symbol import APIs (`open_archive`, `archive_entries`, `archive_extract`, `disassemble_bytecode`, `import_symbols`)
+- FLIRT PAT signature importer
+- ARM / Thumb-2 lifter (minimum viable)
+- C++ vtable resolution for indirect calls, with `ClassInfo` persisted in SQLite and auto-linked to declared classes
+- MSVC pattern recognition analysis pass
+- Struct overlay persistence
+- Compilable C output from the decompiler, with FP arithmetic rendered using C operators and indirect calls rendered as function-pointer casts
+- Recompile-diff harness to verify decompiler semantics
+- Cache dependency graph for surgical decomp invalidation
+- MCP tools for MLIL, SSA form, IL rewrite, variable uses, source diff, and JSONL merge
+- Decompilation cache reused through the MCP `get_decompilation` path
+- Data inspector, source compare, and tabular views in the GUI
 - Binary Ninja `.bndb` symbol / function rename / comment importer
-- DWARF location expression evaluator exposed for `.debug_loc` consumers
+- Auto-detect PDB sidecar files for PE binaries (embedded path, sibling directory, basename fallback)
 - Multi-binary `Workspace` scaffolding (library-only API) with cross-binary symbol and import resolution
+- Criterion benchmark harness for analysis hot paths
+- Linux and Windows release jobs plus `bench-compile` in CI
+
+### Changed
+
+- `parse_type_str` promoted into `re-core` so scripting and MCP share one parser
+- `formats`, `import`, and `vtable` modules wired through the `re-core` public surface
+- Class metadata now lives in `TypeManager` alongside other type definitions
+
+### Fixed
+
+- Temporary breakpoints cleared automatically once the debugger stops
+- Disassembly view jumps to the current PC when the inferior reports a stop
 
 ## [0.3.0] - 2026-03-26
 
