@@ -11,23 +11,28 @@
 //! the caller can transparently degrade to the frame-pointer chain.
 
 use gimli::{
-    BaseAddresses, CfaRule, EhFrame, EndianSlice, RegisterRule, RunTimeEndian, UnwindContext,
-    UnwindSection,
+    BaseAddresses, CfaRule, DebugFrame, EhFrame, EndianSlice, RegisterRule, RunTimeEndian,
+    UnwindContext, UnwindSection, UnwindTableRow,
 };
 use object::{Object, ObjectSection};
 use std::collections::HashMap;
 
 /// Owned copy of the unwind sections for a binary, plus the resolved base
 /// addresses gimli needs to interpret PC-relative pointer encodings.
+///
+/// `.eh_frame` is preferred (it's what runtime unwinders use, ships with
+/// non-debug binaries on Linux/macOS). `.debug_frame` is a fallback for
+/// embedded ELFs where only the debug variant is present.
 pub struct StackUnwinder {
-    eh_frame_data: Vec<u8>,
+    eh_frame_data: Option<Vec<u8>>,
+    debug_frame_data: Option<Vec<u8>>,
     bases: BaseAddresses,
     endian: RunTimeEndian,
 }
 
 impl StackUnwinder {
     /// Build an unwinder from raw binary bytes (ELF or Mach-O). Returns `None`
-    /// when no `.eh_frame` section is present.
+    /// when neither `.eh_frame` nor `.debug_frame` is present.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let obj = object::File::parse(bytes).ok()?;
         let endian = if obj.is_little_endian() {
@@ -36,11 +41,18 @@ impl StackUnwinder {
             RunTimeEndian::Big
         };
 
-        let eh_frame_section = obj.section_by_name(".eh_frame")?;
-        let eh_frame_addr = eh_frame_section.address();
-        let eh_frame_data = eh_frame_section.data().ok()?.to_vec();
+        let eh_frame_section = obj.section_by_name(".eh_frame");
+        let debug_frame_section = obj.section_by_name(".debug_frame");
+        if eh_frame_section.is_none() && debug_frame_section.is_none() {
+            return None;
+        }
 
-        let mut bases = BaseAddresses::default().set_eh_frame(eh_frame_addr);
+        let mut bases = BaseAddresses::default();
+        let eh_frame_data = eh_frame_section.and_then(|s| {
+            bases = std::mem::take(&mut bases).set_eh_frame(s.address());
+            s.data().ok().map(|d| d.to_vec())
+        });
+        let debug_frame_data = debug_frame_section.and_then(|s| s.data().ok().map(|d| d.to_vec()));
         if let Some(s) = obj.section_by_name(".text") {
             bases = bases.set_text(s.address());
         }
@@ -50,6 +62,7 @@ impl StackUnwinder {
 
         Some(Self {
             eh_frame_data,
+            debug_frame_data,
             bases,
             endian,
         })
@@ -86,11 +99,6 @@ impl StackUnwinder {
         }
 
         let pc_reg = layout.pc;
-        let cfa_seed_reg = layout.cfa_seed;
-        let return_reg = layout.return_address;
-
-        let slice = EndianSlice::new(&self.eh_frame_data, self.endian);
-        let eh_frame: EhFrame<_> = EhFrame::from(slice);
 
         let mut out = Vec::new();
         let Some(&start_pc) = state.get(&pc_reg) else {
@@ -98,78 +106,125 @@ impl StackUnwinder {
         };
         out.push(start_pc);
 
-        let mut ctx: Box<UnwindContext<usize>> = Box::default();
-        for _ in 0..max_depth {
-            let Some(&pc) = state.get(&pc_reg) else {
-                break;
-            };
-            let row = match eh_frame.unwind_info_for_address(
-                &self.bases,
+        // Try `.eh_frame` first; fall back to `.debug_frame` if it didn't
+        // produce any extra frames (binary lacks .eh_frame for this PC).
+        if let Some(ref eh_data) = self.eh_frame_data {
+            let slice = EndianSlice::new(eh_data, self.endian);
+            let section: EhFrame<_> = EhFrame::from(slice);
+            let mut ctx: Box<UnwindContext<usize>> = Box::default();
+            walk_unwind_loop(
+                |pc, ctx| {
+                    section
+                        .unwind_info_for_address(&self.bases, ctx, pc, EhFrame::cie_from_offset)
+                        .ok()
+                        .cloned()
+                },
                 &mut ctx,
-                pc,
-                EhFrame::cie_from_offset,
-            ) {
-                Ok(r) => r,
-                Err(_) => break,
-            };
-
-            // Compute the call frame address (CFA) — the SP value at the
-            // moment of the call — using the row's CFA rule.
-            let cfa = match row.cfa() {
-                CfaRule::RegisterAndOffset { register, offset } => {
-                    let Some(&base) = state.get(&register.0) else {
-                        break;
-                    };
-                    let signed = base as i64 + offset;
-                    signed as u64
-                }
-                CfaRule::Expression(_) => break, // CFI expressions aren't supported in MVP.
-            };
-
-            // Apply the RA rule to recover the caller's PC.
-            let ra_rule = row.register(gimli::Register(return_reg));
-            let caller_ra =
-                match resolve_register_rule(&ra_rule, cfa, &state, ptr_size, &mut read_memory) {
-                    Some(v) => v,
-                    None => break,
-                };
-            if caller_ra == 0 {
-                break;
+                &layout,
+                &mut state,
+                &mut out,
+                max_depth,
+                ptr_size,
+                &mut read_memory,
+            );
+            if out.len() > 1 {
+                return out;
             }
+        }
 
-            // Apply CFA-seed rule (typically RSP/SP) so the next iteration's
-            // CFA computation has fresh base values.
-            let mut next_state = state.clone();
-            next_state.insert(pc_reg, caller_ra);
-            let cfa_seed_rule = row.register(gimli::Register(cfa_seed_reg));
-            let next_seed = match cfa_seed_rule {
-                RegisterRule::Undefined => Some(cfa),
-                _ => resolve_register_rule(&cfa_seed_rule, cfa, &state, ptr_size, &mut read_memory),
-            };
-            if let Some(seed) = next_seed {
-                next_state.insert(cfa_seed_reg, seed);
-            }
-            // Restore other named registers if the FDE recovers them; this is
-            // strictly optional but improves results for callers that read
-            // saved frame pointers etc.
-            for (_, dw_no) in layout.named_regs.iter() {
-                if *dw_no == pc_reg || *dw_no == cfa_seed_reg {
-                    continue;
-                }
-                let rule = row.register(gimli::Register(*dw_no));
-                if !matches!(rule, RegisterRule::Undefined)
-                    && let Some(v) =
-                        resolve_register_rule(&rule, cfa, &state, ptr_size, &mut read_memory)
-                {
-                    next_state.insert(*dw_no, v);
-                }
-            }
-
-            state = next_state;
-            out.push(caller_ra);
+        if let Some(ref dbg_data) = self.debug_frame_data {
+            let slice = EndianSlice::new(dbg_data, self.endian);
+            let section: DebugFrame<_> = DebugFrame::from(slice);
+            let mut ctx: Box<UnwindContext<usize>> = Box::default();
+            walk_unwind_loop(
+                |pc, ctx| {
+                    section
+                        .unwind_info_for_address(&self.bases, ctx, pc, DebugFrame::cie_from_offset)
+                        .ok()
+                        .cloned()
+                },
+                &mut ctx,
+                &layout,
+                &mut state,
+                &mut out,
+                max_depth,
+                ptr_size,
+                &mut read_memory,
+            );
         }
 
         out
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_unwind_loop<L, F>(
+    mut lookup_row: L,
+    ctx: &mut UnwindContext<usize>,
+    layout: &RegisterLayout,
+    state: &mut HashMap<u16, u64>,
+    out: &mut Vec<u64>,
+    max_depth: usize,
+    ptr_size: usize,
+    read_memory: &mut F,
+) where
+    L: FnMut(u64, &mut UnwindContext<usize>) -> Option<UnwindTableRow<usize>>,
+    F: FnMut(u64, usize) -> Option<Vec<u8>>,
+{
+    let pc_reg = layout.pc;
+    let cfa_seed_reg = layout.cfa_seed;
+    let return_reg = layout.return_address;
+
+    for _ in 0..max_depth {
+        let Some(&pc) = state.get(&pc_reg) else {
+            break;
+        };
+        let Some(row) = lookup_row(pc, ctx) else {
+            break;
+        };
+
+        let cfa = match row.cfa() {
+            CfaRule::RegisterAndOffset { register, offset } => {
+                let Some(&base) = state.get(&register.0) else {
+                    break;
+                };
+                (base as i64 + offset) as u64
+            }
+            CfaRule::Expression(_) => break,
+        };
+
+        let ra_rule = row.register(gimli::Register(return_reg));
+        let caller_ra = match resolve_register_rule(&ra_rule, cfa, state, ptr_size, read_memory) {
+            Some(v) => v,
+            None => break,
+        };
+        if caller_ra == 0 {
+            break;
+        }
+
+        let mut next_state = state.clone();
+        next_state.insert(pc_reg, caller_ra);
+        let cfa_seed_rule = row.register(gimli::Register(cfa_seed_reg));
+        let next_seed = match cfa_seed_rule {
+            RegisterRule::Undefined => Some(cfa),
+            _ => resolve_register_rule(&cfa_seed_rule, cfa, state, ptr_size, read_memory),
+        };
+        if let Some(seed) = next_seed {
+            next_state.insert(cfa_seed_reg, seed);
+        }
+        for (_, dw_no) in layout.named_regs.iter() {
+            if *dw_no == pc_reg || *dw_no == cfa_seed_reg {
+                continue;
+            }
+            let rule = row.register(gimli::Register(*dw_no));
+            if !matches!(rule, RegisterRule::Undefined)
+                && let Some(v) = resolve_register_rule(&rule, cfa, state, ptr_size, read_memory)
+            {
+                next_state.insert(*dw_no, v);
+            }
+        }
+        *state = next_state;
+        out.push(caller_ra);
     }
 }
 
