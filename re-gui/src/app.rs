@@ -268,6 +268,9 @@ pub(crate) struct SleuthreApp {
     /// DWARF stack-unwinder built once when a binary is loaded; used by the
     /// debugger panel to walk frames without requiring frame pointers.
     pub(crate) debugger_unwinder: Option<re_core::debuginfo::unwind::StackUnwinder>,
+    /// Software breakpoints set transiently by step-source / step-over and
+    /// removed on the next stop reply.
+    pub(crate) debugger_temp_breakpoints: Vec<u64>,
 }
 
 /// Async operation in flight on the debugger.
@@ -621,6 +624,7 @@ impl Default for SleuthreApp {
             pending_bp_set: None,
             debugger_active_thread: None,
             debugger_unwinder: None,
+            debugger_temp_breakpoints: Vec::new(),
         }
     }
 }

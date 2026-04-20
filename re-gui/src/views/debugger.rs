@@ -402,6 +402,8 @@ impl SleuthreApp {
                     Ok(reason) => {
                         self.debugger_last_stop = Some(reason);
                         self.debugger_refresh();
+                        self.debugger_clear_temp_breakpoints();
+                        self.debugger_jump_disasm_to_pc();
                     }
                     Err(e) => self.add_toast(ToastKind::Error, format!("{:?} error: {}", op, e)),
                 }
@@ -412,6 +414,43 @@ impl SleuthreApp {
                 self.add_toast(ToastKind::Error, "Debugger worker disconnected.".into());
             }
         }
+    }
+
+    /// Remove every breakpoint recorded in `debugger_temp_breakpoints` from
+    /// the live stub. Called once per stop so single-shot source-step BPs
+    /// don't pollute the user's breakpoint list.
+    fn debugger_clear_temp_breakpoints(&mut self) {
+        let temps = std::mem::take(&mut self.debugger_temp_breakpoints);
+        let Some(d) = self.debugger_remote.as_mut() else {
+            return;
+        };
+        for addr in temps {
+            // Try both kinds — we don't track the kind separately for temps.
+            let _ = d.remove_breakpoint(addr, BreakpointKind::Software);
+            let _ = d.remove_breakpoint(addr, BreakpointKind::Hardware);
+        }
+    }
+
+    /// After a stop, scroll the disassembly view to the current PC so the
+    /// analyst sees what just stopped. Falls through silently when no PC
+    /// register is exposed.
+    fn debugger_jump_disasm_to_pc(&mut self) {
+        let Some(ref d) = self.debugger_remote else {
+            return;
+        };
+        let regs = d.registers();
+        let Some(&pc) = regs
+            .get("rip")
+            .or_else(|| regs.get("eip"))
+            .or_else(|| regs.get("pc"))
+        else {
+            return;
+        };
+        self.current_address = pc;
+        if let Some(ref mut project) = self.project {
+            project.navigate_to(pc);
+        }
+        self.update_cfg();
     }
 
     pub(crate) fn debugger_set_breakpoint(&mut self, hardware: bool) {
@@ -449,9 +488,8 @@ impl SleuthreApp {
 
     /// Find the next address that maps to a different source line than the
     /// current PC, set a temporary software breakpoint there, and resume.
-    /// The breakpoint is *not* auto-cleared after the next stop — the user
-    /// can remove it from the active list. A future improvement would book
-    /// a one-shot via the stub's `vCont;c1:tid` if available.
+    /// The address is recorded in `temp_breakpoints` so the next stop poll
+    /// auto-clears it.
     fn debugger_step_source_line(&mut self) {
         let pc = self.debugger_remote.as_ref().and_then(|d| {
             let regs = d.registers();
@@ -491,6 +529,7 @@ impl SleuthreApp {
             self.add_toast(ToastKind::Error, format!("Set step BP failed: {}", e));
             return;
         }
+        self.debugger_temp_breakpoints.push(addr);
         self.debugger_continue();
     }
 
