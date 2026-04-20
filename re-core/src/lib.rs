@@ -17,6 +17,7 @@ pub mod scripting;
 pub mod signatures;
 pub mod typelib;
 pub mod types;
+pub mod workspace;
 
 pub use error::Error;
 pub type Result<T> = std::result::Result<T, Error>;
