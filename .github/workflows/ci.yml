@@ -35,6 +35,24 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  bench-build:
+    # Build the criterion bench binaries on every PR so a regression in the
+    # signatures or analysis hot paths fails fast — actually running the
+    # benches is left to a manual workflow_dispatch to keep CI minutes low.
+    name: Bench compile
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake pkg-config
+      - name: Compile benches without running them
+        run: cargo build -p re-core --benches
+
   release-macos:
     name: Release macOS ARM64
     runs-on: macos-15
@@ -57,5 +75,75 @@ jobs:
         run: |
           gh release create "${GITHUB_REF_NAME}" --generate-notes --draft 2>/dev/null || true
           gh release upload "${GITHUB_REF_NAME}" sleuthre-${GITHUB_REF_NAME}-macos-arm64.tar.gz --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release-linux:
+    name: Release Linux x86_64
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev pkg-config
+
+      - name: Build release binaries
+        run: |
+          cargo build --release -p re-gui
+          cargo build --release -p re-mcp
+          cargo build --release -p re-cli
+
+      - name: Package
+        run: |
+          tar czf sleuthre-${GITHUB_REF_NAME}-linux-x86_64.tar.gz \
+            -C target/release re-gui re-mcp re-cli
+
+      - name: Upload to GitHub Release
+        run: |
+          gh release create "${GITHUB_REF_NAME}" --generate-notes --draft 2>/dev/null || true
+          gh release upload "${GITHUB_REF_NAME}" sleuthre-${GITHUB_REF_NAME}-linux-x86_64.tar.gz --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release-windows:
+    name: Release Windows x86_64
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        shell: pwsh
+        run: |
+          cargo build --release -p re-gui
+          cargo build --release -p re-mcp
+          cargo build --release -p re-cli
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          Compress-Archive -Path target/release/re-gui.exe,target/release/re-mcp.exe,target/release/re-cli.exe `
+            -DestinationPath "sleuthre-$tag-windows-x86_64.zip"
+
+      - name: Upload to GitHub Release
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          gh release create "$tag" --generate-notes --draft 2>$null
+          gh release upload "$tag" "sleuthre-$tag-windows-x86_64.zip" --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
