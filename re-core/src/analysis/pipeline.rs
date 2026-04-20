@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::Result;
 use crate::analysis::passes::{HeuristicNamePass, SignaturePass, SuspiciousNamePass};
@@ -204,21 +204,31 @@ fn analyze_loaded_with_bytes(
     on_progress(AnalysisStage::ExtractingDebugInfo);
     let debug_info = debuginfo::extract_debug_info(raw_bytes, loaded.arch).unwrap_or_default();
 
-    let pdb_debug = if let Some(ref pdb_path) = loaded.debug_info_path {
-        let pdb_candidate = path
-            .parent()
-            .map(|dir| dir.join(pdb_path.file_name().unwrap_or_default()))
-            .unwrap_or_else(|| pdb_path.clone());
-        if pdb_candidate.exists() {
-            debuginfo::extract_pdb_info(&pdb_candidate, loaded.arch).unwrap_or_default()
-        } else if pdb_path.exists() {
-            debuginfo::extract_pdb_info(pdb_path, loaded.arch).unwrap_or_default()
-        } else {
-            Default::default()
+    // PDB resolution chain:
+    //   1. Path embedded in the PE debug directory (loaded.debug_info_path).
+    //   2. Same filename next to the PE (handles relocated builds).
+    //   3. <basename>.pdb sibling — covers stripped binaries whose PE no
+    //      longer references the .pdb but it ships beside the EXE anyway.
+    let mut pdb_candidates: Vec<PathBuf> = Vec::new();
+    if let Some(ref pdb_path) = loaded.debug_info_path {
+        if let Some(parent) = path.parent()
+            && let Some(name) = pdb_path.file_name()
+        {
+            pdb_candidates.push(parent.join(name));
         }
-    } else {
-        Default::default()
-    };
+        pdb_candidates.push(pdb_path.clone());
+    }
+    if loaded.format == BinaryFormat::Pe
+        && let Some(stem) = path.file_stem()
+    {
+        let sibling = path.with_file_name(format!("{}.pdb", stem.to_string_lossy()));
+        pdb_candidates.push(sibling);
+    }
+    let pdb_debug = pdb_candidates
+        .into_iter()
+        .find(|p| p.exists())
+        .map(|p| debuginfo::extract_pdb_info(&p, loaded.arch).unwrap_or_default())
+        .unwrap_or_default();
 
     let mut debug_type_count = 0usize;
     let mut debug_sig_count = 0usize;
