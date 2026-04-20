@@ -11,8 +11,8 @@
 //! the caller can transparently degrade to the frame-pointer chain.
 
 use gimli::{
-    BaseAddresses, CfaRule, DebugFrame, EhFrame, EndianSlice, RegisterRule, RunTimeEndian,
-    UnwindContext, UnwindSection, UnwindTableRow,
+    BaseAddresses, CfaRule, DebugFrame, EhFrame, EndianSlice, EvaluationResult, Expression,
+    Location, RegisterRule, RunTimeEndian, UnwindContext, UnwindSection, UnwindTableRow, Value,
 };
 use object::{Object, ObjectSection};
 use std::collections::HashMap;
@@ -190,6 +190,12 @@ fn walk_unwind_loop<L, F>(
                 };
                 (base as i64 + offset) as u64
             }
+            // CfaRule::Expression references bytes via an UnwindExpression
+            // handle that needs section-relative resolution; our evaluator
+            // runs against concrete `Expression<R>` only. Rather than plumb
+            // the section through, we bail and let the caller fall back to
+            // the frame-pointer walker. This is a best-effort degradation:
+            // most SysV CFI uses simple RegisterAndOffset rules.
             CfaRule::Expression(_) => break,
         };
 
@@ -251,10 +257,107 @@ where
         }
         RegisterRule::ValOffset(off) => Some((cfa as i64 + off) as u64),
         RegisterRule::Register(other) => state.get(&other.0).copied(),
-        // CFI expression / val-expression rules need a full DWARF expression
-        // evaluator; a real implementation would reach for `gimli::Evaluation`.
-        // For MVP we bail and let the caller drop to the FP fallback.
+        // CFI expression rules reference the section via `UnwindExpression`
+        // and need section-relative resolution before we can evaluate them.
+        // For now fall through so the caller can walk the frame-pointer chain.
         _ => None,
+    }
+}
+
+/// Run a DWARF expression to completion against the supplied register state
+/// and memory reader. Returns the top of stack as a `u64`.
+///
+/// Handles the subset of operations exercised by typical `.eh_frame` /
+/// `.debug_frame` CFI rules: register reads, constant pushes, `plus`/`minus`,
+/// `deref`. Caller must already have a concrete `Expression<R>` — `.eh_frame`
+/// unwind rules actually reference an `UnwindExpression` handle that needs
+/// section-relative resolution first. This function is exposed primarily for
+/// future `.debug_loc` / `.loclists` consumers (e.g. variable-location display).
+pub fn eval_dwarf_expression<F>(
+    expr: Expression<EndianSlice<RunTimeEndian>>,
+    state: &HashMap<u16, u64>,
+    initial_tos: u64,
+    address_size: u8,
+    read_memory: &mut F,
+) -> Option<u64>
+where
+    F: FnMut(u64, usize) -> Option<Vec<u8>>,
+{
+    eval_dwarf_expression_impl(expr, state, initial_tos, address_size, read_memory)
+}
+
+fn eval_dwarf_expression_impl<F>(
+    expr: Expression<EndianSlice<RunTimeEndian>>,
+    state: &HashMap<u16, u64>,
+    initial_tos: u64,
+    address_size: u8,
+    read_memory: &mut F,
+) -> Option<u64>
+where
+    F: FnMut(u64, usize) -> Option<Vec<u8>>,
+{
+    let encoding = gimli::Encoding {
+        format: gimli::Format::Dwarf32,
+        version: 4,
+        address_size,
+    };
+    let mut eval = expr.evaluation(encoding);
+    // Many CFI expressions start by pushing the CFA — gimli models that as
+    // `set_initial_value`.
+    eval.set_initial_value(initial_tos);
+    let mut result = eval.evaluate().ok()?;
+    loop {
+        match result {
+            EvaluationResult::Complete => {
+                let pieces = eval.result();
+                let piece = pieces.first()?;
+                return match piece.location {
+                    Location::Address { address } => Some(address),
+                    Location::Value { value } => match value {
+                        Value::Generic(v) => Some(v),
+                        Value::U8(v) => Some(v as u64),
+                        Value::U16(v) => Some(v as u64),
+                        Value::U32(v) => Some(v as u64),
+                        Value::U64(v) => Some(v),
+                        Value::I8(v) => Some(v as u64),
+                        Value::I16(v) => Some(v as u64),
+                        Value::I32(v) => Some(v as u64),
+                        Value::I64(v) => Some(v as u64),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+            }
+            EvaluationResult::RequiresRegister { register, .. } => {
+                let v = *state.get(&register.0)?;
+                result = eval.resume_with_register(Value::Generic(v)).ok()?;
+            }
+            EvaluationResult::RequiresMemory { address, size, .. } => {
+                let bytes = read_memory(address, size as usize)?;
+                let v = match size {
+                    1 => bytes.first().copied().map(|b| b as u64),
+                    2 => bytes
+                        .get(..2)
+                        .map(|b| u16::from_le_bytes([b[0], b[1]]) as u64),
+                    4 => bytes
+                        .get(..4)
+                        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64),
+                    8 => bytes.get(..8).map(|b| {
+                        u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+                    }),
+                    _ => None,
+                }?;
+                result = eval.resume_with_memory(Value::Generic(v)).ok()?;
+            }
+            EvaluationResult::RequiresFrameBase => {
+                // CFI expressions shouldn't need a frame base — the CFA
+                // itself is already seeded via set_initial_value.
+                return None;
+            }
+            // Other resume kinds (relocation, CFA, TLS, etc.) aren't worth
+            // pulling in extra state for; fall back to the FP walker.
+            _ => return None,
+        }
     }
 }
 
