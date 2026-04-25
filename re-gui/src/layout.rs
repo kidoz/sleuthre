@@ -2,8 +2,8 @@ use eframe::egui;
 use egui_dock::TabViewer;
 
 use crate::app::{
-    CommandBarResult, CommandBarResultKind, FunctionSortColumn, FunctionTypeFilter, NavBandLayer,
-    SleuthreApp, Tab,
+    CommandAction, CommandBarResult, CommandBarResultKind, FunctionSortColumn, FunctionTypeFilter,
+    NavBandLayer, SleuthreApp, Tab,
 };
 use crate::theme::{SyntaxColors, ThemeMode, apply_theme};
 
@@ -58,6 +58,7 @@ impl eframe::App for SleuthreApp {
 
         // Poll background loader
         self.poll_load();
+        self.poll_reanalysis();
 
         if self.trigger_decompile {
             self.focus_or_open_tab(Tab::Decompiler);
@@ -118,6 +119,11 @@ impl eframe::App for SleuthreApp {
                     self.command_bar_active = true;
                     self.command_bar_input.clear();
                     self.command_bar_results.clear();
+                }
+                if i.modifiers.command && i.key_pressed(egui::Key::P) {
+                    self.command_bar_active = true;
+                    self.command_bar_input = ">".to_string();
+                    self.update_command_bar_results();
                 }
                 if i.modifiers.command && i.key_pressed(egui::Key::D) {
                     self.bookmark_active = true;
@@ -256,8 +262,8 @@ impl SleuthreApp {
             });
     }
 
-    fn show_loading_overlay(&self, ctx: &egui::Context) {
-        let Some(ref stage) = self.load_stage else {
+    fn show_loading_overlay(&mut self, ctx: &egui::Context) {
+        let Some(stage) = self.load_stage.clone() else {
             return;
         };
         // Semi-transparent backdrop
@@ -285,6 +291,12 @@ impl SleuthreApp {
                             ui.spinner();
                             ui.add_space(8.0);
                             ui.label(egui::RichText::new(stage).size(14.0));
+                            ui.add_space(8.0);
+                            if ui.button("Cancel analysis").clicked()
+                                && let Some(cancel) = &self.load_cancel
+                            {
+                                cancel.cancel();
+                            }
                         });
                     });
             });
@@ -390,6 +402,21 @@ impl SleuthreApp {
                 if ui.button("Open").clicked() && !self.is_loading() {
                     self.open_binary(ui.ctx());
                 }
+                egui::ComboBox::from_id_salt("analysis_mode_combo")
+                    .selected_text(self.analysis_mode.label())
+                    .width(110.0)
+                    .show_ui(ui, |ui| {
+                        for mode in re_core::analysis::pipeline::AnalysisMode::ALL_PRESETS {
+                            if ui
+                                .selectable_label(self.analysis_mode == mode, mode.label())
+                                .clicked()
+                            {
+                                self.analysis_mode = mode;
+                                self.reanalyze_config =
+                                    re_core::analysis::pipeline::AnalysisConfig::for_mode(mode);
+                            }
+                        }
+                    });
                 if ui.button("Save").clicked() {
                     self.save_project();
                 }
@@ -482,15 +509,11 @@ impl SleuthreApp {
             if navigate
                 && let Some(result) = self.command_bar_results.get(self.command_bar_selected)
             {
-                let addr = result.address;
+                let result = result.clone();
                 self.command_bar_input.clear();
                 self.command_bar_results.clear();
                 self.command_bar_active = false;
-                if let Some(ref mut project) = self.project {
-                    project.navigate_to(addr);
-                }
-                self.current_address = addr;
-                self.update_cfg();
+                self.execute_command_bar_result(result, ui.ctx());
             }
         } else if self.command_bar_active {
             // Enter on empty results = try direct address
@@ -543,7 +566,11 @@ impl SleuthreApp {
         self.command_bar_selected = 0;
 
         let query = self.command_bar_input.to_lowercase();
+        self.push_command_actions(&query);
+        self.push_command_views(&query);
+
         let Some(ref project) = self.project else {
+            self.command_bar_results.truncate(20);
             return;
         };
 
@@ -658,7 +685,7 @@ impl SleuthreApp {
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.set_min_width(300.0);
-                    let mut navigate_addr = None;
+                    let mut selected_result = None;
                     for (i, result) in self.command_bar_results.iter().enumerate() {
                         let is_selected = i == self.command_bar_selected;
                         let kind_color = match result.kind {
@@ -666,27 +693,139 @@ impl SleuthreApp {
                             CommandBarResultKind::Import => self.syntax.keyword,
                             CommandBarResultKind::Export => self.syntax.number,
                             CommandBarResultKind::StringRef => self.syntax.string,
+                            CommandBarResultKind::View(_) => self.syntax.link,
+                            CommandBarResultKind::Action(_) => self.syntax.keyword,
                         };
                         let text = egui::RichText::new(&result.label)
                             .monospace()
                             .size(11.0)
                             .color(kind_color);
                         if ui.selectable_label(is_selected, text).clicked() {
-                            navigate_addr = Some(result.address);
+                            selected_result = Some(result.clone());
                         }
                     }
-                    if let Some(addr) = navigate_addr {
+                    if let Some(result) = selected_result {
                         self.command_bar_input.clear();
                         self.command_bar_results.clear();
                         self.command_bar_active = false;
-                        if let Some(ref mut project) = self.project {
-                            project.navigate_to(addr);
-                        }
-                        self.current_address = addr;
-                        self.update_cfg();
+                        self.execute_command_bar_result(result, ctx);
                     }
                 });
             });
+    }
+
+    fn execute_command_bar_result(&mut self, result: CommandBarResult, ctx: &egui::Context) {
+        match result.kind {
+            CommandBarResultKind::Function
+            | CommandBarResultKind::Import
+            | CommandBarResultKind::Export
+            | CommandBarResultKind::StringRef => {
+                if let Some(ref mut project) = self.project {
+                    project.navigate_to(result.address);
+                }
+                self.current_address = result.address;
+                self.update_cfg();
+            }
+            CommandBarResultKind::View(tab) => {
+                self.focus_or_open_tab(tab);
+            }
+            CommandBarResultKind::Action(action) => self.execute_command_action(action, ctx),
+        }
+    }
+
+    fn execute_command_action(&mut self, action: CommandAction, ctx: &egui::Context) {
+        match action {
+            CommandAction::OpenBinary => {
+                if !self.is_loading() {
+                    self.open_binary(ctx);
+                }
+            }
+            CommandAction::SaveProject => self.save_project(),
+            CommandAction::Search => {
+                self.search_active = true;
+            }
+            CommandAction::Reanalyze => {
+                self.reanalyze_active = true;
+            }
+            CommandAction::Decompile => {
+                self.trigger_decompile = true;
+            }
+            CommandAction::ToggleOutput => {
+                self.output_panel_visible = !self.output_panel_visible;
+            }
+            CommandAction::Findings => {
+                self.show_findings_window = true;
+            }
+        }
+    }
+
+    fn push_command_actions(&mut self, query: &str) {
+        let action_query = query.strip_prefix('>').unwrap_or(query).trim();
+        if action_query.is_empty() && !query.starts_with('>') {
+            return;
+        }
+        for (label, action, requires_project) in [
+            ("Open Binary", CommandAction::OpenBinary, false),
+            ("Save Project", CommandAction::SaveProject, true),
+            ("Search", CommandAction::Search, false),
+            ("Re-Analyze", CommandAction::Reanalyze, true),
+            ("Decompile Current Function", CommandAction::Decompile, true),
+            ("Toggle Output Panel", CommandAction::ToggleOutput, false),
+            ("Show Analysis Findings", CommandAction::Findings, true),
+        ] {
+            if requires_project && self.project.is_none() {
+                continue;
+            }
+            if fuzzy_match(label, action_query) {
+                self.command_bar_results.push(CommandBarResult {
+                    label: format!("> {}", label),
+                    address: action as u64,
+                    kind: CommandBarResultKind::Action(action),
+                });
+            }
+        }
+    }
+
+    fn push_command_views(&mut self, query: &str) {
+        let view_query = query
+            .strip_prefix("view ")
+            .or_else(|| query.strip_prefix("@"))
+            .unwrap_or(query)
+            .trim();
+        if view_query.is_empty() && !query.starts_with('@') && !query.starts_with("view ") {
+            return;
+        }
+        for tab in [
+            Tab::Disassembly,
+            Tab::Graph,
+            Tab::Decompiler,
+            Tab::HexView,
+            Tab::Strings,
+            Tab::Imports,
+            Tab::Exports,
+            Tab::Structures,
+            Tab::CallGraph,
+            Tab::Xrefs,
+            Tab::Entropy,
+            Tab::Signatures,
+            Tab::Diff,
+            Tab::Archives,
+            Tab::DataInspector,
+            Tab::SourceCompare,
+            Tab::Tabular,
+            Tab::ImagePreview,
+            Tab::Bytecode,
+            Tab::Debugger,
+        ] {
+            let label = tab.to_string();
+            if fuzzy_match(&label, view_query) {
+                self.command_bar_results.push(CommandBarResult {
+                    label: format!("@ {}", label),
+                    address: tab as u64,
+                    kind: CommandBarResultKind::View(tab),
+                });
+            }
+        }
     }
 
     fn show_menu_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {

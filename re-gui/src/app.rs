@@ -1,5 +1,6 @@
 use eframe::egui;
 use re_core::analysis::cfg::ControlFlowGraph;
+use re_core::analysis::pipeline::{AnalysisCancellation, AnalysisMode};
 use re_core::analysis::type_propagation::FunctionTypeInfo;
 use re_core::disasm::Disassembler;
 use re_core::plugin::{AnalysisFinding, PluginManager};
@@ -148,9 +149,12 @@ pub(crate) struct SleuthreApp {
     pub(crate) command_bar_selected: usize,
     pub(crate) command_bar_active: bool,
 
-    // Background loading
+    // Background analysis work
     pub(crate) load_receiver: Option<std::sync::mpsc::Receiver<LoadProgress>>,
     pub(crate) load_stage: Option<String>,
+    pub(crate) load_cancel: Option<AnalysisCancellation>,
+    pub(crate) reanalysis_receiver: Option<std::sync::mpsc::Receiver<ReanalysisProgress>>,
+    pub(crate) analysis_mode: AnalysisMode,
 
     // Entropy
     pub(crate) entropy_map: Option<re_core::analysis::entropy::EntropyMap>,
@@ -430,11 +434,32 @@ pub(crate) enum CommandBarResultKind {
     Import,
     Export,
     StringRef,
+    View(Tab),
+    Action(CommandAction),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommandAction {
+    OpenBinary,
+    SaveProject,
+    Search,
+    Reanalyze,
+    Decompile,
+    ToggleOutput,
+    Findings,
 }
 
 pub(crate) enum LoadProgress {
     Stage(String),
     Done(std::result::Result<Box<re_core::analysis::pipeline::AnalysisResult>, String>),
+}
+
+pub(crate) enum ReanalysisProgress {
+    Stage(String),
+    Done {
+        project: Box<Project>,
+        findings: std::result::Result<Vec<AnalysisFinding>, String>,
+    },
 }
 
 impl Default for SleuthreApp {
@@ -547,6 +572,9 @@ impl Default for SleuthreApp {
             command_bar_active: false,
             load_receiver: None,
             load_stage: None,
+            load_cancel: None,
+            reanalysis_receiver: None,
+            analysis_mode: AnalysisMode::Normal,
             entropy_map: None,
             diff_project_b: None,
             diff_result: None,
@@ -655,12 +683,20 @@ impl SleuthreApp {
 
         let (tx, rx) = std::sync::mpsc::channel();
         let ctx_clone = ctx.clone();
+        let config = re_core::analysis::pipeline::AnalysisConfig::for_mode(self.analysis_mode);
+        let cancellation = AnalysisCancellation::new();
+        let worker_cancellation = cancellation.clone();
 
         std::thread::spawn(move || {
-            let result = re_core::analysis::pipeline::analyze_binary(&path, |stage| {
-                let _ = tx.send(LoadProgress::Stage(stage.to_string()));
-                ctx_clone.request_repaint();
-            });
+            let result = re_core::analysis::pipeline::analyze_binary_with_config(
+                &path,
+                &config,
+                Some(&worker_cancellation),
+                |stage| {
+                    let _ = tx.send(LoadProgress::Stage(stage.to_string()));
+                    ctx_clone.request_repaint();
+                },
+            );
             let _ = tx.send(LoadProgress::Done(
                 result.map(Box::new).map_err(|e| e.to_string()),
             ));
@@ -668,7 +704,8 @@ impl SleuthreApp {
         });
 
         self.load_receiver = Some(rx);
-        self.load_stage = Some("Loading...".into());
+        self.load_stage = Some(format!("Loading with {} analysis...", self.analysis_mode));
+        self.load_cancel = Some(cancellation);
     }
 
     /// Poll the background loader for progress/completion.
@@ -724,13 +761,102 @@ impl SleuthreApp {
                     self.update_cfg();
                     self.load_receiver = None;
                     self.load_stage = None;
+                    self.load_cancel = None;
                     return;
                 }
                 LoadProgress::Done(Err(e)) => {
-                    self.add_toast(ToastKind::Error, format!("Load error: {}", e));
-                    self.output.push_str(&format!("Error: {}\n", e));
+                    if e.contains("Analysis cancelled") {
+                        self.add_toast(ToastKind::Warning, "Analysis cancelled.".into());
+                        self.output.push_str("Analysis cancelled.\n");
+                    } else {
+                        self.add_toast(ToastKind::Error, format!("Load error: {}", e));
+                        self.output.push_str(&format!("Error: {}\n", e));
+                    }
                     self.load_receiver = None;
                     self.load_stage = None;
+                    self.load_cancel = None;
+                    return;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn start_reanalysis(&mut self, ctx: &eframe::egui::Context) {
+        if self.project.is_none() || self.is_loading() {
+            return;
+        }
+
+        let Some(mut project) = self.project.take() else {
+            return;
+        };
+        let config = self.reanalyze_config.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx_clone = ctx.clone();
+        let cancellation = AnalysisCancellation::new();
+        let worker_cancellation = cancellation.clone();
+
+        std::thread::spawn(move || {
+            let findings = re_core::analysis::pipeline::reanalyze_with_cancellation(
+                &mut project,
+                &config,
+                Some(&worker_cancellation),
+                |stage| {
+                    let _ = tx.send(ReanalysisProgress::Stage(stage.to_string()));
+                    ctx_clone.request_repaint();
+                },
+            )
+            .map_err(|e| e.to_string());
+
+            let _ = tx.send(ReanalysisProgress::Done {
+                project: Box::new(project),
+                findings,
+            });
+            ctx_clone.request_repaint();
+        });
+
+        self.reanalysis_receiver = Some(rx);
+        self.load_stage = Some("Re-analyzing...".into());
+        self.load_cancel = Some(cancellation);
+    }
+
+    /// Poll the background re-analysis worker for progress/completion.
+    pub(crate) fn poll_reanalysis(&mut self) {
+        let Some(ref rx) = self.reanalysis_receiver else {
+            return;
+        };
+
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                ReanalysisProgress::Stage(s) => {
+                    self.load_stage = Some(s);
+                }
+                ReanalysisProgress::Done { project, findings } => {
+                    self.project = Some(*project);
+                    self.disasm = self
+                        .project
+                        .as_ref()
+                        .and_then(|project| Disassembler::new(project.arch).ok());
+                    match findings {
+                        Ok(findings) => {
+                            if !findings.is_empty() {
+                                self.plugin_findings = findings;
+                            }
+                            self.add_toast(ToastKind::Success, "Re-analysis complete.".into());
+                        }
+                        Err(e) if e.contains("Analysis cancelled") => {
+                            self.add_toast(ToastKind::Warning, "Re-analysis cancelled.".into());
+                            self.output.push_str("Re-analysis cancelled.\n");
+                        }
+                        Err(e) => {
+                            self.add_toast(ToastKind::Error, format!("Re-analysis error: {}", e));
+                            self.output.push_str(&format!("Re-analysis error: {}\n", e));
+                        }
+                    }
+                    self.cached_func_list_dirty = true;
+                    self.update_cfg();
+                    self.reanalysis_receiver = None;
+                    self.load_stage = None;
+                    self.load_cancel = None;
                     return;
                 }
             }
@@ -738,7 +864,7 @@ impl SleuthreApp {
     }
 
     pub(crate) fn is_loading(&self) -> bool {
-        self.load_receiver.is_some()
+        self.load_receiver.is_some() || self.reanalysis_receiver.is_some()
     }
 
     pub(crate) fn save_project(&mut self) {

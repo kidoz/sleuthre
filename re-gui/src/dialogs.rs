@@ -863,6 +863,7 @@ impl SleuthreApp {
                     "Scan Cross-References",
                 );
                 ui.checkbox(&mut self.reanalyze_config.scan_constants, "Scan Constants");
+                ui.checkbox(&mut self.reanalyze_config.scan_vtables, "Scan VTables");
                 ui.checkbox(
                     &mut self.reanalyze_config.extract_debug_info,
                     "Extract Debug Info",
@@ -888,6 +889,7 @@ impl SleuthreApp {
                             scan_strings: false,
                             scan_xrefs: false,
                             scan_constants: false,
+                            scan_vtables: false,
                             extract_debug_info: false,
                             type_propagation: false,
                             run_analysis_passes: false,
@@ -896,21 +898,9 @@ impl SleuthreApp {
                 });
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.button("Run").clicked() {
-                        if let Some(ref mut project) = self.project {
-                            let config = self.reanalyze_config.clone();
-                            let findings =
-                                re_core::analysis::pipeline::reanalyze(project, &config, |_| {});
-                            if !findings.is_empty() {
-                                self.plugin_findings = findings;
-                            }
-                            self.cached_func_list_dirty = true;
-                        }
+                    if ui.button("Run").clicked() && !self.is_loading() {
+                        self.start_reanalysis(ctx);
                         self.reanalyze_active = false;
-                        self.add_toast(
-                            crate::app::ToastKind::Success,
-                            "Re-analysis complete.".into(),
-                        );
                     }
                     if ui.button("Cancel").clicked() {
                         self.reanalyze_active = false;
