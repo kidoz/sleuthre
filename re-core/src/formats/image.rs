@@ -207,8 +207,27 @@ impl ImageDecoder for TgaDecoder {
             return Err(format!("Unsupported TGA type: {}", image_type));
         }
 
-        let bytes_pp = bpp as usize / 8;
-        let pixel_start = 18 + id_len;
+        let bytes_pp = match bpp {
+            24 => 3usize,
+            32 => 4usize,
+            _ => return Err(format!("Unsupported TGA bpp: {}", bpp)),
+        };
+        let pixel_start = 18usize
+            .checked_add(id_len)
+            .ok_or_else(|| "TGA ID field offset overflow".to_string())?;
+        if pixel_start > data.len() {
+            return Err("TGA pixel data starts beyond file".to_string());
+        }
+        let pixel_bytes = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|n| n.checked_mul(bytes_pp))
+            .ok_or_else(|| "TGA pixel data size overflow".to_string())?;
+        let pixel_end = pixel_start
+            .checked_add(pixel_bytes)
+            .ok_or_else(|| "TGA pixel data offset overflow".to_string())?;
+        if pixel_end > data.len() {
+            return Err("TGA pixel data truncated".to_string());
+        }
         let top_to_bottom = (descriptor & 0x20) != 0;
 
         let mut pixels = vec![0u8; (width * height * 4) as usize];
@@ -364,6 +383,32 @@ mod tests {
         let d = PcxDecoder;
         assert!(d.matches(&[0x0A, 5, 1, 8], "image.pcx"));
         assert!(!d.matches(&[0x00, 5, 1, 8], "image.dat"));
+    }
+
+    #[test]
+    fn tga_rejects_unsupported_bpp_without_panicking() {
+        let d = TgaDecoder;
+        let mut data = vec![0u8; 18];
+        data[2] = 2; // uncompressed true-color
+        data[12] = 1; // width = 1
+        data[14] = 1; // height = 1
+        data[16] = 8; // unsupported for this decoder
+
+        let err = d.decode(&data).unwrap_err();
+        assert!(err.contains("Unsupported TGA bpp"));
+    }
+
+    #[test]
+    fn tga_rejects_truncated_pixel_data() {
+        let d = TgaDecoder;
+        let mut data = vec![0u8; 18];
+        data[2] = 2; // uncompressed true-color
+        data[12] = 1; // width = 1
+        data[14] = 1; // height = 1
+        data[16] = 24;
+
+        let err = d.decode(&data).unwrap_err();
+        assert!(err.contains("truncated"));
     }
 
     #[test]
