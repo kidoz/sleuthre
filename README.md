@@ -39,7 +39,7 @@ An open-source reverse engineering desktop application built in Rust.
 
 ## Architecture
 
-The project is a Cargo workspace with three crates:
+The project is a Cargo workspace with four crates:
 
 | Crate | Description |
 |-------|-------------|
