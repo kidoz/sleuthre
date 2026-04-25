@@ -12,6 +12,8 @@ use std::io::{self, BufRead};
 use std::path::PathBuf;
 use uuid::Uuid;
 
+const MAX_DISASM_COUNT: usize = 1_000;
+
 struct McpServer {
     project: Option<Project>,
     disasm: Option<Disassembler>,
@@ -538,8 +540,25 @@ impl McpServer {
                     return missing_param_error(&id, "address");
                 };
                 let count = args.get("count").and_then(|c| c.as_u64()).unwrap_or(10) as usize;
+                if count > MAX_DISASM_COUNT {
+                    return json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "code": -32602,
+                            "message": format!("count exceeds maximum {}", MAX_DISASM_COUNT)
+                        }
+                    });
+                }
+                let Some(byte_limit) = count.checked_mul(15) else {
+                    return json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": { "code": -32602, "message": "count is too large" }
+                    });
+                };
                 if let (Some(project), Some(disasm)) = (&self.project, &self.disasm) {
-                    match disasm.disassemble_range(&project.memory_map, addr, count * 15) {
+                    match disasm.disassemble_range(&project.memory_map, addr, byte_limit) {
                         Ok(insns) => {
                             let result: Vec<_> = insns.into_iter().take(count).collect();
                             tool_result(&id, &result)
@@ -1382,6 +1401,23 @@ mod tests {
             "Expected 'no project' error, got: {}",
             msg
         );
+    }
+
+    #[test]
+    fn get_disasm_rejects_excessive_count() {
+        let mut server = McpServer::new();
+        let req = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "get_disasm",
+                "arguments": { "address": 0, "count": (MAX_DISASM_COUNT as u64) + 1 }
+            }
+        });
+        let resp = server.handle_request(req);
+        assert_eq!(resp["error"]["code"], -32602);
+        let msg = resp["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("count exceeds maximum"));
     }
 
     #[test]
