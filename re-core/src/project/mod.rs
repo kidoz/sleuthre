@@ -5,6 +5,7 @@ use crate::analysis::strings::StringsManager;
 use crate::analysis::xrefs::XrefManager;
 use crate::arch::Architecture;
 use crate::db::Database;
+use crate::error::Error;
 use crate::loader::{BinaryFormat, Export, Import, Symbol};
 use crate::memory::MemoryMap;
 use crate::typelib::TypeLibraryManager;
@@ -584,7 +585,17 @@ impl Project {
             db_path.to_path_buf(),
         );
 
-        project.memory_map.segments = db.load_segments()?;
+        for seg in db.load_segments()? {
+            if seg.size != seg.data.len() as u64 {
+                return Err(Error::Database(format!(
+                    "Invalid segment '{}' in project database: declared size 0x{:x} but data length is 0x{:x}",
+                    seg.name,
+                    seg.size,
+                    seg.data.len()
+                )));
+            }
+            project.memory_map.add_segment(seg)?;
+        }
         for func in db.load_functions()? {
             project.functions.add_function(func);
         }
@@ -1318,6 +1329,57 @@ mod tests {
         assert_eq!(dest.functions.functions[&0x1000].name, "main");
         assert_eq!(dest.struct_overlays.len(), 1);
         assert_eq!(dest.struct_overlays[0].label, "player_table");
+    }
+
+    #[test]
+    fn load_rejects_segment_size_mismatch() {
+        let path = std::env::temp_dir().join(format!(
+            "sleuthre_bad_project_{}.slre",
+            uuid::Uuid::new_v4()
+        ));
+        drop(Database::open(&path).unwrap());
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO segments (name, start, size, data, permissions) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["bad", 0x1000u64, 8u64, vec![0x90u8; 4], 1u8],
+        )
+        .unwrap();
+        drop(conn);
+
+        let err = match Project::load(&path) {
+            Ok(_) => panic!("malformed segment should fail to load"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("declared size"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_rejects_overlapping_segments() {
+        let path = std::env::temp_dir().join(format!(
+            "sleuthre_overlap_project_{}.slre",
+            uuid::Uuid::new_v4()
+        ));
+        drop(Database::open(&path).unwrap());
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO segments (name, start, size, data, permissions) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["a", 0x1000u64, 8u64, vec![0x90u8; 8], 1u8],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO segments (name, start, size, data, permissions) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["b", 0x1004u64, 8u64, vec![0x90u8; 8], 1u8],
+        )
+        .unwrap();
+        drop(conn);
+
+        let err = match Project::load(&path) {
+            Ok(_) => panic!("overlapping segments should fail to load"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("overlaps"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

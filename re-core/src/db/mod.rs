@@ -169,7 +169,7 @@ impl Database {
     pub fn load_segments(&self) -> Result<Vec<MemorySegment>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT name, start, size, data, permissions FROM segments")
+            .prepare("SELECT name, start, size, data, permissions FROM segments ORDER BY start")
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
         let rows = stmt
             .query_map([], |row| {
