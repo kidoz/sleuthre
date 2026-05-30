@@ -41,7 +41,13 @@ fn lift_instruction(func: &mut LlilFunction, insn: &Instruction) -> Vec<LlilStmt
         "jal" | "jalr" => lift_call(func, &ops),
         "beq" => lift_branch(func, &ops, "=="),
         "bne" => lift_branch(func, &ops, "!="),
-        _ => vec![], // Unimplemented
+        // Preserve the instruction as an explicit Unimplemented marker rather
+        // than silently dropping it, so downstream IL/decompilation reflects
+        // that semantics are missing instead of treating it as a no-op.
+        _ => vec![LlilStmt::Unimplemented {
+            mnemonic: insn.mnemonic.clone(),
+            op_str: insn.op_str.clone(),
+        }],
     }
 }
 
@@ -203,4 +209,42 @@ fn lift_branch(func: &mut LlilFunction, ops: &[&str], cmp: &str) -> Vec<LlilStmt
         right,
     });
     vec![LlilStmt::BranchIf { cond, target }]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_insn(mn: &str, op: &str) -> Instruction {
+        Instruction {
+            address: 0x1000,
+            bytes: vec![],
+            mnemonic: mn.to_string(),
+            op_str: op.to_string(),
+            groups: vec![],
+        }
+    }
+
+    #[test]
+    fn unknown_instruction_is_unimplemented_not_dropped() {
+        let mut func = LlilFunction::new("t".into(), 0x1000);
+        // `mthi` is not lifted; it must surface as Unimplemented, not vanish.
+        let stmts = lift_instruction(&mut func, &make_insn("mthi", "$t0"));
+        assert!(matches!(
+            stmts.as_slice(),
+            [LlilStmt::Unimplemented { mnemonic, op_str }]
+                if mnemonic == "mthi" && op_str == "$t0"
+        ));
+    }
+
+    #[test]
+    fn known_instruction_still_lifts() {
+        let mut func = LlilFunction::new("t".into(), 0x1000);
+        let stmts = lift_instruction(&mut func, &make_insn("addu", "$t0, $t1, $t2"));
+        assert!(!stmts.is_empty());
+        assert!(!matches!(
+            stmts.as_slice(),
+            [LlilStmt::Unimplemented { .. }]
+        ));
+    }
 }
