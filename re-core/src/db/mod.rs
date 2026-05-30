@@ -1,6 +1,6 @@
 use crate::Result;
 use crate::analysis::constants::DiscoveredConstant;
-use crate::analysis::functions::{CallingConvention, Function};
+use crate::analysis::functions::Function;
 use crate::analysis::strings::{DiscoveredString, StringEncoding};
 use crate::analysis::xrefs::{Xref, XrefType};
 use crate::error::Error;
@@ -68,7 +68,9 @@ impl Database {
             CREATE TABLE IF NOT EXISTS functions (
                 start_address INTEGER PRIMARY KEY,
                 name TEXT,
-                end_address INTEGER
+                end_address INTEGER,
+                calling_convention TEXT,
+                stack_frame_size INTEGER
             );
             CREATE TABLE IF NOT EXISTS comments (
                 address INTEGER PRIMARY KEY,
@@ -180,6 +182,40 @@ impl Database {
             COMMIT;",
             )
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
+
+        // Migrations for project files created before a column existed. SQLite
+        // has no "ADD COLUMN IF NOT EXISTS", so each is guarded by a presence
+        // check against PRAGMA table_info.
+        self.ensure_column("functions", "calling_convention", "TEXT")?;
+        self.ensure_column("functions", "stack_frame_size", "INTEGER")?;
+        Ok(())
+    }
+
+    /// Add `column` (`<name> <sql-type>`) to `table` if it isn't already there.
+    /// `table`/`column`/`decl` are fixed code literals, never user input.
+    fn ensure_column(&self, table: &str, column: &str, decl: &str) -> Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
+        let existing = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
+        let mut present = false;
+        for name in existing {
+            if name.map_err(|e: rusqlite::Error| Error::Database(e.to_string()))? == column {
+                present = true;
+                break;
+            }
+        }
+        if !present {
+            self.conn
+                .execute(
+                    &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+                    [],
+                )
+                .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
+        }
         Ok(())
     }
 
@@ -244,11 +280,24 @@ impl Database {
     }
 
     pub fn save_function(&self, func: &Function) -> Result<()> {
+        let cc = serde_json::to_string(&func.calling_convention)
+            .map_err(|e| Error::Database(e.to_string()))?;
         self.conn
             .execute(
-                "INSERT INTO functions (start_address, name, end_address) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(start_address) DO UPDATE SET name = excluded.name, end_address = excluded.end_address",
-                params![as_i64(func.start_address), func.name, func.end_address.map(as_i64)],
+                "INSERT INTO functions \
+                 (start_address, name, end_address, calling_convention, stack_frame_size) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(start_address) DO UPDATE SET name = excluded.name, \
+                 end_address = excluded.end_address, \
+                 calling_convention = excluded.calling_convention, \
+                 stack_frame_size = excluded.stack_frame_size",
+                params![
+                    as_i64(func.start_address),
+                    func.name,
+                    func.end_address.map(as_i64),
+                    cc,
+                    as_i64(func.stack_frame_size),
+                ],
             )
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
         Ok(())
@@ -268,16 +317,26 @@ impl Database {
     pub fn load_functions(&self) -> Result<Vec<Function>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT name, start_address, end_address FROM functions")
+            .prepare(
+                "SELECT name, start_address, end_address, calling_convention, stack_frame_size \
+                 FROM functions",
+            )
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
         let rows = stmt
             .query_map([], |row| {
+                // calling_convention / stack_frame_size may be NULL in rows
+                // written before these columns existed, or by `set_name`.
+                let calling_convention = row
+                    .get::<_, Option<String>>(3)?
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default();
+                let stack_frame_size = row.get::<_, Option<i64>>(4)?.unwrap_or(0) as u64;
                 Ok(Function {
                     name: row.get(0)?,
                     start_address: col_u64(row, 1)?,
                     end_address: row.get::<_, Option<i64>>(2)?.map(|v| v as u64),
-                    calling_convention: CallingConvention::default(),
-                    stack_frame_size: 0,
+                    calling_convention,
+                    stack_frame_size,
                 })
             })
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
@@ -1102,13 +1161,15 @@ mod tests {
 
     #[test]
     fn round_trip_functions() {
+        use crate::analysis::functions::CallingConvention;
         let (db, path) = temp_db();
         let func = Function {
             name: "main".to_string(),
             start_address: 0x401000,
             end_address: Some(0x401100),
-            calling_convention: CallingConvention::default(),
-            stack_frame_size: 0,
+            // Non-default so the test would catch silent loss of these fields.
+            calling_convention: CallingConvention::Win64,
+            stack_frame_size: 0x40,
         };
         db.save_function(&func).unwrap();
         let loaded = db.load_functions().unwrap();
@@ -1116,6 +1177,33 @@ mod tests {
         assert_eq!(loaded[0].name, "main");
         assert_eq!(loaded[0].start_address, 0x401000);
         assert_eq!(loaded[0].end_address, Some(0x401100));
+        assert_eq!(loaded[0].calling_convention, CallingConvention::Win64);
+        assert_eq!(loaded[0].stack_frame_size, 0x40);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn functions_table_migrates_from_pre_column_schema() {
+        use crate::analysis::functions::CallingConvention;
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("sleuthre_migrate_{}.db", uuid::Uuid::new_v4()));
+        // Simulate an old project file: a functions table without the
+        // calling_convention / stack_frame_size columns, with one row.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE functions (start_address INTEGER PRIMARY KEY, name TEXT, end_address INTEGER);
+                 INSERT INTO functions (start_address, name, end_address) VALUES (0x401000, 'old', NULL);",
+            )
+            .unwrap();
+        }
+        // Opening must add the new columns and still load the legacy row.
+        let db = Database::open(&path).unwrap();
+        let loaded = db.load_functions().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "old");
+        assert_eq!(loaded[0].calling_convention, CallingConvention::Unknown);
+        assert_eq!(loaded[0].stack_frame_size, 0);
         let _ = std::fs::remove_file(path);
     }
 
