@@ -64,7 +64,7 @@ fn parse_dwarf<'a>(
 
         // Walk DIEs in this unit
         let mut entries = unit.entries();
-        while let Ok(Some((_, entry))) = entries.next_dfs() {
+        while let Ok(Some(entry)) = entries.next_dfs() {
             match entry.tag() {
                 gimli::DW_TAG_subprogram => {
                     parse_subprogram(dwarf, &unit, entry, &mut type_ctx, &mut info);
@@ -95,19 +95,15 @@ fn parse_dwarf<'a>(
 fn parse_subprogram<'a>(
     dwarf: &'a Dwarf<SliceReader<'a>>,
     unit: &gimli::Unit<SliceReader<'a>>,
-    die: &gimli::DebuggingInformationEntry<'_, '_, SliceReader<'a>>,
+    die: &gimli::DebuggingInformationEntry<SliceReader<'a>>,
     type_ctx: &mut TypeContext<SliceReader<'a>>,
     info: &mut DebugInfo,
 ) {
     // Get low_pc (function address)
-    let low_pc = die
-        .attr_value(gimli::DW_AT_low_pc)
-        .ok()
-        .flatten()
-        .and_then(|v| match v {
-            gimli::AttributeValue::Addr(a) => Some(a),
-            _ => None,
-        });
+    let low_pc = die.attr_value(gimli::DW_AT_low_pc).and_then(|v| match v {
+        gimli::AttributeValue::Addr(a) => Some(a),
+        _ => None,
+    });
 
     let addr = match low_pc {
         Some(a) if a != 0 => a,
@@ -122,7 +118,7 @@ fn parse_subprogram<'a>(
     };
 
     // Return type
-    let return_type = if let Ok(Some(attr)) = die.attr_value(gimli::DW_AT_type) {
+    let return_type = if let Some(attr) = die.attr_value(gimli::DW_AT_type) {
         if let Some(offset) = attr_to_unit_offset(&attr, unit) {
             type_ctx.resolve_type(dwarf, unit, offset)
         } else {
@@ -179,7 +175,7 @@ fn parse_subprogram<'a>(
 fn parse_variable<'a>(
     dwarf: &'a Dwarf<SliceReader<'a>>,
     unit: &gimli::Unit<SliceReader<'a>>,
-    die: &gimli::DebuggingInformationEntry<'_, '_, SliceReader<'a>>,
+    die: &gimli::DebuggingInformationEntry<SliceReader<'a>>,
     type_ctx: &mut TypeContext<SliceReader<'a>>,
 ) -> Option<VariableInfo> {
     let name = die_name_string(dwarf, unit, die);
@@ -187,7 +183,7 @@ fn parse_variable<'a>(
         return None;
     }
 
-    let type_ref = if let Ok(Some(attr)) = die.attr_value(gimli::DW_AT_type) {
+    let type_ref = if let Some(attr) = die.attr_value(gimli::DW_AT_type) {
         if let Some(offset) = attr_to_unit_offset(&attr, unit) {
             type_ctx.resolve_type(dwarf, unit, offset)
         } else {
@@ -206,10 +202,8 @@ fn parse_variable<'a>(
     })
 }
 
-fn parse_location(
-    die: &gimli::DebuggingInformationEntry<'_, '_, SliceReader<'_>>,
-) -> VariableLocation {
-    if let Ok(Some(attr)) = die.attr_value(gimli::DW_AT_location) {
+fn parse_location(die: &gimli::DebuggingInformationEntry<SliceReader<'_>>) -> VariableLocation {
+    if let Some(attr) = die.attr_value(gimli::DW_AT_location) {
         match attr {
             gimli::AttributeValue::Exprloc(expr) => {
                 let bytes = expr.0.slice();

@@ -30,10 +30,7 @@ impl<R: Reader<Offset = usize>> TypeContext<R> {
         unit: &Unit<R>,
         type_offset: UnitOffset<R::Offset>,
     ) -> TypeRef {
-        let unit_header_offset = match unit.header.offset() {
-            gimli::UnitSectionOffset::DebugInfoOffset(o) => o.0,
-            gimli::UnitSectionOffset::DebugTypesOffset(o) => o.0,
-        };
+        let unit_header_offset = unit.header.offset().0;
         let key = (unit_header_offset, type_offset.0);
 
         if let Some(cached) = self.cache.get(&key) {
@@ -96,19 +93,13 @@ impl<R: Reader<Offset = usize>> TypeContext<R> {
         }
     }
 
-    fn resolve_base_type(&self, die: &DebuggingInformationEntry<'_, '_, R>) -> TypeRef {
-        let encoding = die
-            .attr_value(gimli::DW_AT_encoding)
-            .ok()
-            .flatten()
-            .and_then(|v| match v {
-                AttributeValue::Encoding(e) => Some(e),
-                _ => None,
-            });
+    fn resolve_base_type(&self, die: &DebuggingInformationEntry<R>) -> TypeRef {
+        let encoding = die.attr_value(gimli::DW_AT_encoding).and_then(|v| match v {
+            AttributeValue::Encoding(e) => Some(e),
+            _ => None,
+        });
         let byte_size = die
             .attr_value(gimli::DW_AT_byte_size)
-            .ok()
-            .flatten()
             .and_then(|v| v.udata_value())
             .unwrap_or(0);
 
@@ -158,9 +149,9 @@ impl<R: Reader<Offset = usize>> TypeContext<R> {
         &mut self,
         dwarf: &Dwarf<R>,
         unit: &Unit<R>,
-        die: &DebuggingInformationEntry<'_, '_, R>,
+        die: &DebuggingInformationEntry<R>,
     ) -> TypeRef {
-        if let Ok(Some(attr)) = die.attr_value(gimli::DW_AT_type)
+        if let Some(attr) = die.attr_value(gimli::DW_AT_type)
             && let Some(offset) = attr_to_unit_offset(&attr, unit)
         {
             return self.resolve_type(dwarf, unit, offset);
@@ -172,14 +163,12 @@ impl<R: Reader<Offset = usize>> TypeContext<R> {
         &mut self,
         dwarf: &Dwarf<R>,
         unit: &Unit<R>,
-        die: &DebuggingInformationEntry<'_, '_, R>,
+        die: &DebuggingInformationEntry<R>,
         is_union: bool,
     ) -> TypeRef {
         let name = die_name_string(dwarf, unit, die);
         let byte_size = die
             .attr_value(gimli::DW_AT_byte_size)
-            .ok()
-            .flatten()
             .and_then(|v| v.udata_value())
             .unwrap_or(0) as usize;
 
@@ -216,7 +205,7 @@ impl<R: Reader<Offset = usize>> TypeContext<R> {
         &mut self,
         dwarf: &Dwarf<R>,
         unit: &Unit<R>,
-        die: &DebuggingInformationEntry<'_, '_, R>,
+        die: &DebuggingInformationEntry<R>,
     ) -> Vec<StructField> {
         let mut fields = Vec::new();
         let Ok(mut tree) = unit.entries_tree(Some(die.offset())) else {
@@ -237,21 +226,15 @@ impl<R: Reader<Offset = usize>> TypeContext<R> {
             let ftype = self.resolve_referenced_type(dwarf, unit, entry);
             let offset = entry
                 .attr_value(gimli::DW_AT_data_member_location)
-                .ok()
-                .flatten()
                 .and_then(|v| v.udata_value())
                 .unwrap_or(0) as usize;
 
             let bit_offset = entry
                 .attr_value(gimli::DW_AT_bit_offset)
-                .ok()
-                .flatten()
                 .and_then(|v| v.udata_value())
                 .map(|v| v as u8);
             let bit_size = entry
                 .attr_value(gimli::DW_AT_bit_size)
-                .ok()
-                .flatten()
                 .and_then(|v| v.udata_value())
                 .map(|v| v as u8);
 
@@ -271,13 +254,11 @@ impl<R: Reader<Offset = usize>> TypeContext<R> {
         &mut self,
         dwarf: &Dwarf<R>,
         unit: &Unit<R>,
-        die: &DebuggingInformationEntry<'_, '_, R>,
+        die: &DebuggingInformationEntry<R>,
     ) -> TypeRef {
         let name = die_name_string(dwarf, unit, die);
         let byte_size = die
             .attr_value(gimli::DW_AT_byte_size)
-            .ok()
-            .flatten()
             .and_then(|v| v.udata_value())
             .unwrap_or(4) as usize;
 
@@ -300,8 +281,6 @@ impl<R: Reader<Offset = usize>> TypeContext<R> {
                 let vname = die_name_string(dwarf, unit, entry);
                 let value = entry
                     .attr_value(gimli::DW_AT_const_value)
-                    .ok()
-                    .flatten()
                     .and_then(|v| {
                         v.sdata_value()
                             .or_else(|| v.udata_value().map(|u| u as i64))
@@ -324,7 +303,7 @@ impl<R: Reader<Offset = usize>> TypeContext<R> {
         &mut self,
         dwarf: &Dwarf<R>,
         unit: &Unit<R>,
-        die: &DebuggingInformationEntry<'_, '_, R>,
+        die: &DebuggingInformationEntry<R>,
     ) -> TypeRef {
         let element = self.resolve_referenced_type(dwarf, unit, die);
         let mut count = 0usize;
@@ -336,9 +315,9 @@ impl<R: Reader<Offset = usize>> TypeContext<R> {
             while let Ok(Some(child)) = children.next() {
                 let entry = child.entry();
                 if entry.tag() == gimli::DW_TAG_subrange_type {
-                    if let Ok(Some(attr)) = entry.attr_value(gimli::DW_AT_count) {
+                    if let Some(attr) = entry.attr_value(gimli::DW_AT_count) {
                         count = attr.udata_value().unwrap_or(0) as usize;
-                    } else if let Ok(Some(attr)) = entry.attr_value(gimli::DW_AT_upper_bound) {
+                    } else if let Some(attr) = entry.attr_value(gimli::DW_AT_upper_bound) {
                         count = attr.udata_value().map(|v| v as usize + 1).unwrap_or(0);
                     }
                 }
@@ -355,7 +334,7 @@ impl<R: Reader<Offset = usize>> TypeContext<R> {
         &mut self,
         dwarf: &Dwarf<R>,
         unit: &Unit<R>,
-        die: &DebuggingInformationEntry<'_, '_, R>,
+        die: &DebuggingInformationEntry<R>,
     ) -> TypeRef {
         let return_type = self.resolve_referenced_type(dwarf, unit, die);
         let mut params = Vec::new();
@@ -392,7 +371,7 @@ impl<R: Reader<Offset = usize>> TypeContext<R> {
         &mut self,
         dwarf: &Dwarf<R>,
         unit: &Unit<R>,
-        die: &DebuggingInformationEntry<'_, '_, R>,
+        die: &DebuggingInformationEntry<R>,
     ) -> FunctionParameter {
         let name = die_name_string(dwarf, unit, die);
         let type_ref = self.resolve_referenced_type(dwarf, unit, die);
@@ -409,10 +388,7 @@ pub fn attr_to_unit_offset<R: Reader<Offset = usize>>(
         AttributeValue::UnitRef(offset) => Some(offset),
         AttributeValue::DebugInfoRef(di_offset) => {
             // Convert DebugInfoRef to UnitOffset by subtracting unit header offset + size
-            let unit_offset = match unit.header.offset() {
-                gimli::UnitSectionOffset::DebugInfoOffset(o) => o.0,
-                gimli::UnitSectionOffset::DebugTypesOffset(o) => o.0,
-            };
+            let unit_offset = unit.header.offset().0;
             let header_size = unit.header.size_of_header();
             let offset_val = di_offset.0;
             // The UnitOffset is relative to the start of the unit's data (after header)
@@ -430,11 +406,9 @@ pub fn attr_to_unit_offset<R: Reader<Offset = usize>>(
 pub fn die_name_string<R: Reader<Offset = usize>>(
     dwarf: &Dwarf<R>,
     unit: &Unit<R>,
-    die: &DebuggingInformationEntry<'_, '_, R>,
+    die: &DebuggingInformationEntry<R>,
 ) -> String {
     die.attr_value(gimli::DW_AT_name)
-        .ok()
-        .flatten()
         .and_then(|v| {
             let attr_str = dwarf.attr_string(unit, v).ok()?;
             let s = attr_str.to_string().ok()?;

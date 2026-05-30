@@ -1125,10 +1125,10 @@ impl SleuthreApp {
     }
 
     pub(crate) fn focus_or_open_tab(&mut self, tab: Tab) {
-        if let Some((surface, node, tab_idx)) = self.dock_state.find_tab(&tab) {
+        if let Some(path) = self.dock_state.find_tab(&tab) {
             self.dock_state
-                .set_focused_node_and_surface((surface, node));
-            self.dock_state.set_active_tab((surface, node, tab_idx));
+                .set_focused_node_and_surface(path.node_path());
+            let _ = self.dock_state.set_active_tab(path);
         } else {
             self.dock_state.push_to_focused_leaf(tab);
         }

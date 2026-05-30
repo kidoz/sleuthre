@@ -12,6 +12,22 @@ use crate::types::{
 use rusqlite::{Connection, params};
 use std::path::Path;
 
+/// SQLite stores every integer as a signed `i64`. Addresses, sizes, and lengths
+/// in our model are unsigned (`u64`/`usize`), and the `u64 <-> i64` conversion
+/// is a lossless bit reinterpretation (it round-trips even high addresses with
+/// the top bit set, e.g. kernel pointers), which we opt into explicitly at this
+/// boundary.
+#[inline]
+fn as_i64(v: u64) -> i64 {
+    v as i64
+}
+
+/// Read column `idx` as the `i64` SQLite stores and reinterpret it as `u64`.
+#[inline]
+fn col_u64(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<u64> {
+    Ok(row.get::<_, i64>(idx)? as u64)
+}
+
 pub struct Database {
     conn: Connection,
     db_path: std::path::PathBuf,
@@ -170,7 +186,7 @@ impl Database {
     pub fn save_segment(&self, seg: &MemorySegment) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO segments (name, start, size, data, permissions) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![seg.name, seg.start, seg.size, seg.data, seg.permissions.bits()],
+            params![seg.name, as_i64(seg.start), as_i64(seg.size), seg.data, seg.permissions.bits()],
         ).map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
         Ok(())
     }
@@ -185,8 +201,8 @@ impl Database {
                 let bits: u8 = row.get(4)?;
                 Ok(MemorySegment {
                     name: row.get(0)?,
-                    start: row.get(1)?,
-                    size: row.get(2)?,
+                    start: col_u64(row, 1)?,
+                    size: col_u64(row, 2)?,
                     data: row.get(3)?,
                     permissions: Permissions::from_bits_truncate(bits),
                 })
@@ -204,7 +220,7 @@ impl Database {
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO comments (address, text) VALUES (?1, ?2)",
-                params![address, text],
+                params![as_i64(address), text],
             )
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
         Ok(())
@@ -216,9 +232,7 @@ impl Database {
             .prepare("SELECT address, text FROM comments")
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
         let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?))
-            })
+            .query_map([], |row| Ok((col_u64(row, 0)?, row.get::<_, String>(1)?)))
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
 
         let mut comments = std::collections::HashMap::new();
@@ -234,7 +248,7 @@ impl Database {
             .execute(
                 "INSERT INTO functions (start_address, name, end_address) VALUES (?1, ?2, ?3)
                  ON CONFLICT(start_address) DO UPDATE SET name = excluded.name, end_address = excluded.end_address",
-                params![func.start_address, func.name, func.end_address],
+                params![as_i64(func.start_address), func.name, func.end_address.map(as_i64)],
             )
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
         Ok(())
@@ -245,7 +259,7 @@ impl Database {
             .execute(
                 "INSERT INTO functions (start_address, name) VALUES (?1, ?2)
              ON CONFLICT(start_address) DO UPDATE SET name = excluded.name",
-                params![address, name],
+                params![as_i64(address), name],
             )
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
         Ok(())
@@ -260,8 +274,8 @@ impl Database {
             .query_map([], |row| {
                 Ok(Function {
                     name: row.get(0)?,
-                    start_address: row.get(1)?,
-                    end_address: row.get(2)?,
+                    start_address: col_u64(row, 1)?,
+                    end_address: row.get::<_, Option<i64>>(2)?.map(|v| v as u64),
                     calling_convention: CallingConvention::default(),
                     stack_frame_size: 0,
                 })
@@ -286,7 +300,7 @@ impl Database {
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO xrefs (from_address, to_address, xref_type) VALUES (?1, ?2, ?3)",
-                params![xref.from_address, xref.to_address, type_str],
+                params![as_i64(xref.from_address), as_i64(xref.to_address), type_str],
             )
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
         Ok(())
@@ -309,8 +323,8 @@ impl Database {
                     _ => XrefType::Call,
                 };
                 Ok(Xref {
-                    from_address: row.get(0)?,
-                    to_address: row.get(1)?,
+                    from_address: col_u64(row, 0)?,
+                    to_address: col_u64(row, 1)?,
                     xref_type,
                 })
             })
@@ -332,7 +346,7 @@ impl Database {
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO strings (address, value, length, section_name, encoding) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![s.address, s.value, s.length, s.section_name, enc],
+                params![as_i64(s.address), s.value, s.length as i64, s.section_name, enc],
             )
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
         Ok(())
@@ -411,9 +425,9 @@ impl Database {
                     _ => StringEncoding::Ascii,
                 };
                 Ok(DiscoveredString {
-                    address: row.get(0)?,
+                    address: col_u64(row, 0)?,
                     value: row.get(1)?,
-                    length: row.get(2)?,
+                    length: row.get::<_, i64>(2)? as usize,
                     section_name: row.get(3)?,
                     encoding,
                 })
@@ -431,7 +445,7 @@ impl Database {
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO constants (address, value_hex, description) VALUES (?1, ?2, ?3)",
-                params![c.address, c.value_hex, c.description],
+                params![as_i64(c.address), c.value_hex, c.description],
             )
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
         Ok(())
@@ -445,7 +459,7 @@ impl Database {
         let rows = stmt
             .query_map([], |row| {
                 Ok(DiscoveredConstant {
-                    address: row.get(0)?,
+                    address: col_u64(row, 0)?,
                     value_hex: row.get(1)?,
                     description: row.get(2)?,
                 })
@@ -465,7 +479,7 @@ impl Database {
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO imports (name, library, address) VALUES (?1, ?2, ?3)",
-                params![import.name, import.library, import.address],
+                params![import.name, import.library, as_i64(import.address)],
             )
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
         Ok(())
@@ -481,7 +495,7 @@ impl Database {
                 Ok(Import {
                     name: row.get(0)?,
                     library: row.get(1)?,
-                    address: row.get(2)?,
+                    address: col_u64(row, 2)?,
                 })
             })
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
@@ -497,7 +511,7 @@ impl Database {
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO exports (name, address) VALUES (?1, ?2)",
-                params![export.name, export.address],
+                params![export.name, as_i64(export.address)],
             )
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
         Ok(())
@@ -512,7 +526,7 @@ impl Database {
             .query_map([], |row| {
                 Ok(Export {
                     name: row.get(0)?,
-                    address: row.get(1)?,
+                    address: col_u64(row, 1)?,
                 })
             })
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
@@ -533,7 +547,7 @@ impl Database {
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO symbols (name, address, size, kind) VALUES (?1, ?2, ?3, ?4)",
-                params![sym.name, sym.address, sym.size, kind_str],
+                params![sym.name, as_i64(sym.address), as_i64(sym.size), kind_str],
             )
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
         Ok(())
@@ -581,7 +595,7 @@ impl Database {
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO type_annotations (address, type_ref, name) VALUES (?1, ?2, ?3)",
-                params![ann.address, type_ref_json, ann.name],
+                params![as_i64(ann.address), type_ref_json, ann.name],
             )
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
         Ok(())
@@ -594,7 +608,7 @@ impl Database {
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
         let rows = stmt
             .query_map([], |row| {
-                let address: u64 = row.get(0)?;
+                let address: u64 = col_u64(row, 0)?;
                 let type_ref_json: String = row.get(1)?;
                 let name: String = row.get(2)?;
                 Ok((address, type_ref_json, name))
@@ -622,7 +636,7 @@ impl Database {
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO bookmarks (address, note) VALUES (?1, ?2)",
-                params![address, note],
+                params![as_i64(address), note],
             )
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
         Ok(())
@@ -630,7 +644,10 @@ impl Database {
 
     pub fn delete_bookmark(&self, address: u64) -> Result<()> {
         self.conn
-            .execute("DELETE FROM bookmarks WHERE address = ?1", params![address])
+            .execute(
+                "DELETE FROM bookmarks WHERE address = ?1",
+                params![as_i64(address)],
+            )
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
         Ok(())
     }
@@ -641,9 +658,7 @@ impl Database {
             .prepare("SELECT address, note FROM bookmarks")
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
         let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?))
-            })
+            .query_map([], |row| Ok((col_u64(row, 0)?, row.get::<_, String>(1)?)))
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
 
         let mut bookmarks = std::collections::BTreeMap::new();
@@ -660,7 +675,7 @@ impl Database {
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO tags (address, tag) VALUES (?1, ?2)",
-                params![address, tag],
+                params![as_i64(address), tag],
             )
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
         Ok(())
@@ -672,9 +687,7 @@ impl Database {
             .prepare("SELECT address, tag FROM tags ORDER BY address, tag")
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
         let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?))
-            })
+            .query_map([], |row| Ok((col_u64(row, 0)?, row.get::<_, String>(1)?)))
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
 
         let mut tags = std::collections::BTreeMap::<u64, Vec<String>>::new();
@@ -693,10 +706,10 @@ impl Database {
                 "INSERT OR REPLACE INTO struct_overlays (address, label, type_name, count) \
                  VALUES (?1, ?2, ?3, ?4)",
                 params![
-                    overlay.address,
+                    as_i64(overlay.address),
                     overlay.label,
                     overlay.type_name,
-                    overlay.count as u64,
+                    overlay.count as i64,
                 ],
             )
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
@@ -711,10 +724,10 @@ impl Database {
         let rows = stmt
             .query_map([], |row| {
                 Ok(crate::project::StructOverlay {
-                    address: row.get::<_, u64>(0)?,
+                    address: col_u64(row, 0)?,
                     label: row.get::<_, String>(1)?,
                     type_name: row.get::<_, String>(2)?,
-                    count: row.get::<_, u64>(3)? as usize,
+                    count: row.get::<_, i64>(3)? as usize,
                 })
             })
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
@@ -858,7 +871,7 @@ impl Database {
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO function_signatures (address, data) VALUES (?1, ?2)",
-                params![address, data],
+                params![as_i64(address), data],
             )
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
         Ok(())
@@ -872,9 +885,7 @@ impl Database {
             .prepare("SELECT address, data FROM function_signatures")
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
         let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?))
-            })
+            .query_map([], |row| Ok((col_u64(row, 0)?, row.get::<_, String>(1)?)))
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
 
         let mut result = std::collections::BTreeMap::new();
@@ -895,7 +906,7 @@ impl Database {
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO global_variables (address, data) VALUES (?1, ?2)",
-                params![address, data],
+                params![as_i64(address), data],
             )
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
         Ok(())
@@ -907,9 +918,7 @@ impl Database {
             .prepare("SELECT address, data FROM global_variables")
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
         let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?))
-            })
+            .query_map([], |row| Ok((col_u64(row, 0)?, row.get::<_, String>(1)?)))
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
 
         let mut result = std::collections::BTreeMap::new();
@@ -930,7 +939,7 @@ impl Database {
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO local_variables (function_address, data) VALUES (?1, ?2)",
-                params![function_address, data],
+                params![as_i64(function_address), data],
             )
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
         Ok(())
@@ -944,9 +953,7 @@ impl Database {
             .prepare("SELECT function_address, data FROM local_variables")
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
         let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?))
-            })
+            .query_map([], |row| Ok((col_u64(row, 0)?, row.get::<_, String>(1)?)))
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
 
         let mut result = std::collections::BTreeMap::new();
@@ -966,7 +973,7 @@ impl Database {
             .execute(
                 "INSERT OR REPLACE INTO source_lines (address, file, line, column) VALUES (?1, ?2, ?3, ?4)",
                 params![
-                    address,
+                    as_i64(address),
                     info.file,
                     info.line,
                     info.column.map(|c| c as i64)
@@ -985,7 +992,7 @@ impl Database {
             .query_map([], |row| {
                 let col: Option<i64> = row.get(3)?;
                 Ok((
-                    row.get::<_, u64>(0)?,
+                    col_u64(row, 0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, u32>(2)?,
                     col.map(|c| c as u32),
@@ -1017,8 +1024,8 @@ impl Database {
                 };
                 Ok(Symbol {
                     name: row.get(0)?,
-                    address: row.get(1)?,
-                    size: row.get(2)?,
+                    address: col_u64(row, 1)?,
+                    size: col_u64(row, 2)?,
                     kind,
                 })
             })
@@ -1043,7 +1050,7 @@ impl Database {
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO decompilation_cache (address, data) VALUES (?1, ?2)",
-                params![address, data],
+                params![as_i64(address), data],
             )
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
         Ok(())
@@ -1057,9 +1064,7 @@ impl Database {
             .prepare("SELECT address, data FROM decompilation_cache")
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
         let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?))
-            })
+            .query_map([], |row| Ok((col_u64(row, 0)?, row.get::<_, String>(1)?)))
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
 
         let mut result = std::collections::HashMap::new();
@@ -1076,7 +1081,7 @@ impl Database {
         self.conn
             .execute(
                 "DELETE FROM decompilation_cache WHERE address = ?1",
-                params![address],
+                params![as_i64(address)],
             )
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
         Ok(())

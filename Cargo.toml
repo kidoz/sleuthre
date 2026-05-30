@@ -16,8 +16,8 @@ repository = "https://github.com/kidoz/sleuthre"
 description = "An open-source reverse engineering desktop application."
 
 [workspace.dependencies]
-egui = "0.33"
-eframe = "0.33"
+egui = "0.34"
+eframe = "0.34"
 re-core = { path = "re-core" }
 anyhow = "1.0"
 thiserror = "2.0"
@@ -25,20 +25,20 @@ log = "0.4"
 env_logger = "0.11"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-goblin = "0.9"
-capstone = "0.13"
-rusqlite = { version = "0.33", features = ["bundled"] }
-petgraph = "0.7"
+goblin = "0.10"
+capstone = "0.14"
+rusqlite = { version = "0.40", features = ["bundled"] }
+petgraph = "0.8"
 tracing = "0.1"
-bitflags = { version = "2.8", features = ["serde"] }
-rfd = "0.15"
-uuid = { version = "1.10", features = ["v4", "serde"] }
-clap = { version = "4.5", features = ["derive"] }
-gimli = "0.31"
-object = { version = "0.36", default-features = false, features = ["read"] }
+bitflags = { version = "2.11", features = ["serde"] }
+rfd = "0.17"
+uuid = { version = "1.23", features = ["v4", "serde"] }
+clap = { version = "4.6", features = ["derive"] }
+gimli = "0.33"
+object = { version = "0.39", default-features = false, features = ["read"] }
 pdb = "0.8"
-rhai = "1.20"
-egui_dock = "0.18"
+rhai = "1.25"
+egui_dock = "0.19"
 
 [profile.release]
 lto = true

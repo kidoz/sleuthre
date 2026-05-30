@@ -22,6 +22,18 @@
 - RSP reply decoding now handles run-length encoding (`x*`) and `}`-escapes, so register
   dumps and `qXfer` payloads are no longer truncated
 
+### Changed — Dependency upgrades
+
+- Bumped direct dependencies to current releases and migrated to their new APIs:
+  egui/eframe 0.33 → 0.34 and egui_dock 0.18 → 0.19 (unified `Panel` API with
+  `show_inside`, `App::ui` replacing `App::update`); gimli 0.31 → 0.33 (newtype
+  `UnitSectionOffset`, `attr_value` returns `Option`, `next_dfs`/CFI `register`
+  signature changes); rusqlite 0.33 → 0.40 (explicit `u64 <-> i64` casts at the DB
+  boundary now that the lossy `u64` `ToSql`/`FromSql` impls were removed)
+- Bumped goblin 0.9 → 0.10, capstone 0.13 → 0.14, object 0.36 → 0.39,
+  petgraph 0.7 → 0.8, rfd 0.15 → 0.17, and refreshed the lockfile (clap, uuid,
+  bitflags, rhai, etc.) to their latest compatible versions
+
 ## [0.4.0] - 2026-04-20
 
 ### Added

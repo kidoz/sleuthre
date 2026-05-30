@@ -1384,7 +1384,7 @@ mod tests {
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute(
             "INSERT INTO segments (name, start, size, data, permissions) VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params!["bad", 0x1000u64, 8u64, vec![0x90u8; 4], 1u8],
+            rusqlite::params!["bad", 0x1000i64, 8i64, vec![0x90u8; 4], 1u8],
         )
         .unwrap();
         drop(conn);
@@ -1407,12 +1407,12 @@ mod tests {
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute(
             "INSERT INTO segments (name, start, size, data, permissions) VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params!["a", 0x1000u64, 8u64, vec![0x90u8; 8], 1u8],
+            rusqlite::params!["a", 0x1000i64, 8i64, vec![0x90u8; 8], 1u8],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO segments (name, start, size, data, permissions) VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params!["b", 0x1004u64, 8u64, vec![0x90u8; 8], 1u8],
+            rusqlite::params!["b", 0x1004i64, 8i64, vec![0x90u8; 8], 1u8],
         )
         .unwrap();
         drop(conn);

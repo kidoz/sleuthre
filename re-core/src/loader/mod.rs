@@ -291,7 +291,7 @@ fn load_elf(elf: elf::Elf, bytes: &[u8]) -> Result<LoadedBinary> {
 fn load_pe(pe: pe::PE, bytes: &[u8]) -> Result<LoadedBinary> {
     let arch = detect_pe_arch(&pe)?;
     let mut memory_map = MemoryMap::default();
-    let image_base = pe.image_base as u64;
+    let image_base = pe.image_base;
 
     for section in pe.sections.iter() {
         let mut perms = Permissions::empty();

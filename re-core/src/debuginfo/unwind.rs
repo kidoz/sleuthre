@@ -199,8 +199,11 @@ fn walk_unwind_loop<L, F>(
             CfaRule::Expression(_) => break,
         };
 
-        let ra_rule = row.register(gimli::Register(return_reg));
-        let caller_ra = match resolve_register_rule(&ra_rule, cfa, state, ptr_size, read_memory) {
+        // An absent register rule (`None`) is semantically `Undefined`.
+        let caller_ra = match row
+            .register(gimli::Register(return_reg))
+            .and_then(|rule| resolve_register_rule(&rule, cfa, state, ptr_size, read_memory))
+        {
             Some(v) => v,
             None => break,
         };
@@ -210,10 +213,9 @@ fn walk_unwind_loop<L, F>(
 
         let mut next_state = state.clone();
         next_state.insert(pc_reg, caller_ra);
-        let cfa_seed_rule = row.register(gimli::Register(cfa_seed_reg));
-        let next_seed = match cfa_seed_rule {
-            RegisterRule::Undefined => Some(cfa),
-            _ => resolve_register_rule(&cfa_seed_rule, cfa, state, ptr_size, read_memory),
+        let next_seed = match row.register(gimli::Register(cfa_seed_reg)) {
+            None | Some(RegisterRule::Undefined) => Some(cfa),
+            Some(rule) => resolve_register_rule(&rule, cfa, state, ptr_size, read_memory),
         };
         if let Some(seed) = next_seed {
             next_state.insert(cfa_seed_reg, seed);
@@ -222,8 +224,8 @@ fn walk_unwind_loop<L, F>(
             if *dw_no == pc_reg || *dw_no == cfa_seed_reg {
                 continue;
             }
-            let rule = row.register(gimli::Register(*dw_no));
-            if !matches!(rule, RegisterRule::Undefined)
+            if let Some(rule) = row.register(gimli::Register(*dw_no))
+                && !matches!(rule, RegisterRule::Undefined)
                 && let Some(v) = resolve_register_rule(&rule, cfa, state, ptr_size, read_memory)
             {
                 next_state.insert(*dw_no, v);

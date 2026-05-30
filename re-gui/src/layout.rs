@@ -49,9 +49,13 @@ impl TabViewer for SleuthreTabViewer<'_> {
 }
 
 impl eframe::App for SleuthreApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Cloned (cheap, Arc-backed) so we can pass `ui` mutably to the panel
+        // helpers below while still handing the context to the window/overlay
+        // helpers.
+        let ctx = ui.ctx().clone();
         if self.theme_changed {
-            apply_theme(ctx, self.theme_mode);
+            apply_theme(&ctx, self.theme_mode);
             self.syntax = SyntaxColors::for_theme(self.theme_mode);
             self.theme_changed = false;
         }
@@ -173,18 +177,21 @@ impl eframe::App for SleuthreApp {
             });
         }
 
-        self.show_top_panel(ctx);
-        self.show_status_bar(ctx);
+        // Panels reserve space from the root `ui`, in order.
+        self.show_top_panel(ui);
+        self.show_status_bar(ui);
         if self.output_panel_visible {
-            self.show_bottom_panel(ctx);
+            self.show_bottom_panel(ui);
         }
-        self.show_left_panel(ctx);
-        self.show_right_panel(ctx);
-        self.show_central_panel(ctx);
-        self.show_command_bar_dropdown(ctx);
-        self.show_modals(ctx);
-        self.show_toasts(ctx);
-        self.show_loading_overlay(ctx);
+        self.show_left_panel(ui);
+        self.show_right_panel(ui);
+        self.show_central_panel(ui);
+        // Windows / areas / overlays render on the context, independent of the
+        // panel layout.
+        self.show_command_bar_dropdown(&ctx);
+        self.show_modals(&ctx);
+        self.show_toasts(&ctx);
+        self.show_loading_overlay(&ctx);
         self.broadcast_pending_undo_events();
         self.poll_plugin_results();
         self.apply_inbound_collab_events();
@@ -193,16 +200,16 @@ impl eframe::App for SleuthreApp {
 }
 
 impl SleuthreApp {
-    fn show_right_panel(&mut self, ctx: &egui::Context) {
+    fn show_right_panel(&mut self, ui: &mut egui::Ui) {
         let state = self.debugger.state();
         if state == re_core::DebuggerState::Detached {
             return;
         }
 
-        egui::SidePanel::right("right_panel")
+        egui::Panel::right("right_panel")
             .resizable(true)
-            .default_width(200.0)
-            .show(ctx, |ui| {
+            .default_size(200.0)
+            .show_inside(ui, |ui| {
                 ui.heading("Registers");
                 ui.separator();
                 let regs = self.debugger.registers();
@@ -302,10 +309,10 @@ impl SleuthreApp {
             });
     }
 
-    fn show_status_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::bottom("status_bar")
-            .exact_height(20.0)
-            .show(ctx, |ui| {
+    fn show_status_bar(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::bottom("status_bar")
+            .exact_size(20.0)
+            .show_inside(ui, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.style_mut().spacing.item_spacing.x = 12.0;
 
@@ -393,9 +400,10 @@ impl SleuthreApp {
             });
     }
 
-    fn show_top_panel(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
-            self.show_menu_bar(ui, ctx);
+    fn show_top_panel(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        egui::Panel::top("top_panel").show_inside(ui, |ui| {
+            self.show_menu_bar(ui, &ctx);
             ui.separator();
             ui.horizontal(|ui| {
                 ui.style_mut().spacing.item_spacing.x = 2.0;
@@ -1356,11 +1364,11 @@ impl SleuthreApp {
         }
     }
 
-    fn show_bottom_panel(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::bottom("bottom_panel")
+    fn show_bottom_panel(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::bottom("bottom_panel")
             .resizable(true)
-            .default_height(self.output_panel_height)
-            .show(ctx, |ui| {
+            .default_size(self.output_panel_height)
+            .show_inside(ui, |ui| {
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
                         ui.label("Output");
@@ -1649,11 +1657,11 @@ impl SleuthreApp {
         }
     }
 
-    fn show_left_panel(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("left_panel")
+    fn show_left_panel(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::left("left_panel")
             .resizable(true)
-            .default_width(320.0)
-            .show(ctx, |ui| {
+            .default_size(320.0)
+            .show_inside(ui, |ui| {
                 ui.heading("Functions");
 
                 // Filter row
@@ -2052,19 +2060,19 @@ impl SleuthreApp {
             });
     }
 
-    fn show_central_panel(&mut self, ctx: &egui::Context) {
+    fn show_central_panel(&mut self, ui: &mut egui::Ui) {
         // Use std::mem::take to temporarily extract dock_state for the viewer
         let mut dock_state = std::mem::replace(
             &mut self.dock_state,
             egui_dock::DockState::new(vec![Tab::Disassembly]),
         );
 
-        let style = egui_dock::Style::from_egui(ctx.style().as_ref());
+        let style = egui_dock::Style::from_egui(ui.ctx().global_style().as_ref());
         let mut viewer = SleuthreTabViewer { app: self };
 
         egui_dock::DockArea::new(&mut dock_state)
             .style(style)
-            .show(ctx, &mut viewer);
+            .show_inside(ui, &mut viewer);
 
         self.dock_state = dock_state;
     }
