@@ -5,6 +5,10 @@ use petgraph::graph::{DiGraph, NodeIndex};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 
+/// Upper bound on jump-table cases we will follow, to cap pathological or
+/// misidentified tables.
+const MAX_JUMP_TABLE_CASES: usize = 256;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BasicBlock {
     pub start_address: u64,
@@ -96,9 +100,18 @@ impl ControlFlowGraph {
                         // Call usually returns, so continue to next instruction
                         targets.push((next_addr, EdgeKind::CallFallthrough));
                     } else if mnemonic == "jmp" {
-                        // Unconditional jump
                         if let Some(target) = parse_target(&insn.op_str) {
+                            // Direct unconditional jump.
                             targets.push((target, EdgeKind::Unconditional));
+                        } else if let Some(base) = parse_jump_table_base(&insn.op_str) {
+                            // Indirect jump through a compiler-emitted jump
+                            // table (`jmp [reg*scale + base]`): recover each
+                            // case target and link it with a Switch edge. A
+                            // bare `[reg]` indirect jump has no statically
+                            // recoverable target and is left unlinked.
+                            for case in detect_jump_table(memory, base, MAX_JUMP_TABLE_CASES) {
+                                targets.push((case, EdgeKind::Switch));
+                            }
                         }
                     } else {
                         // Conditional jump: branch target (true) and fallthrough (false)
@@ -207,6 +220,33 @@ fn parse_target(op_str: &str) -> Option<u64> {
         .trim_start_matches("0x")
         .trim_start_matches("loc_");
     u64::from_str_radix(cleaned, 16).ok()
+}
+
+/// Recover a jump-table base address from an indirect-jump operand such as
+/// `qword ptr [rax*8 + 0x404060]`.
+///
+/// Only memory operands that use an index *scale* (`*2`/`*4`/`*8`) are treated
+/// as tables: a bare `[reg]` indirect jump or a RIP-relative single pointer
+/// (`[rip + disp]`, no scale) has no statically recoverable case list. Returns
+/// the `0x`-prefixed displacement inside the brackets (the table base).
+fn parse_jump_table_base(op_str: &str) -> Option<u64> {
+    let start = op_str.find('[')?;
+    let end = op_str[start..].find(']')? + start;
+    let inner = &op_str[start + 1..end];
+    // Must be a scaled, indexed access to look like a jump table.
+    if !(inner.contains("*2") || inner.contains("*4") || inner.contains("*8")) {
+        return None;
+    }
+    // The base is the `0x`-prefixed hex displacement within the brackets.
+    let hex_start = inner.find("0x")? + 2;
+    let hex: String = inner[hex_start..]
+        .chars()
+        .take_while(|c| c.is_ascii_hexdigit())
+        .collect();
+    if hex.is_empty() {
+        return None;
+    }
+    u64::from_str_radix(&hex, 16).ok()
 }
 
 #[cfg(test)]
@@ -373,5 +413,70 @@ mod tests {
         let map = MemoryMap::default();
         let targets = detect_jump_table(&map, 0x5000, 16);
         assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn parse_jump_table_base_requires_scale() {
+        assert_eq!(
+            parse_jump_table_base("qword ptr [rax*8 + 0x404060]"),
+            Some(0x404060)
+        );
+        assert_eq!(parse_jump_table_base("[rdi*4 + 0x3000]"), Some(0x3000));
+        // RIP-relative single pointer (no scale) is not a jump table.
+        assert_eq!(parse_jump_table_base("qword ptr [rip + 0x2000]"), None);
+        // Bare register-indirect jumps are unresolvable.
+        assert_eq!(parse_jump_table_base("rax"), None);
+        assert_eq!(parse_jump_table_base("qword ptr [rcx]"), None);
+    }
+
+    #[test]
+    fn switch_jump_table_creates_switch_edges() {
+        // `jmp qword ptr [rax*8 + 0x3000]` dispatching through a 2-entry table.
+        let mut code = vec![0x90u8; 0x40];
+        code[0] = 0xFF; // jmp r/m64 (/4)
+        code[1] = 0x24; // ModRM: [SIB]
+        code[2] = 0xC5; // SIB: rax*8, disp32 base
+        code[3..7].copy_from_slice(&0x3000u32.to_le_bytes());
+        code[0x10] = 0xC3; // ret — case target 0x1010
+        code[0x18] = 0xC3; // ret — case target 0x1018
+
+        let mut map = MemoryMap::default();
+        map.add_segment(MemorySegment {
+            name: "code".to_string(),
+            start: 0x1000,
+            size: code.len() as u64,
+            data: code,
+            permissions: Permissions::READ | Permissions::EXECUTE,
+        })
+        .unwrap();
+
+        // Jump table at 0x3000: two valid entries then an unmapped terminator.
+        let mut table = Vec::new();
+        table.extend_from_slice(&0x1010u64.to_le_bytes());
+        table.extend_from_slice(&0x1018u64.to_le_bytes());
+        table.extend_from_slice(&0xDEADu64.to_le_bytes());
+        map.add_segment(MemorySegment {
+            name: "data".to_string(),
+            start: 0x3000,
+            size: table.len() as u64,
+            data: table,
+            permissions: Permissions::READ,
+        })
+        .unwrap();
+
+        let disasm = Disassembler::new(Architecture::X86_64).unwrap();
+        let mut cfg = ControlFlowGraph::new();
+        cfg.build_for_function(&map, &disasm, 0x1000).unwrap();
+
+        let head = *cfg.addr_to_node.get(&0x1000).unwrap();
+        let switch_edges = cfg
+            .graph
+            .edges(head)
+            .map(|e| *e.weight())
+            .filter(|&k| k == EdgeKind::Switch)
+            .count();
+        assert_eq!(switch_edges, 2, "expected 2 switch edges");
+        assert!(cfg.addr_to_node.contains_key(&0x1010));
+        assert!(cfg.addr_to_node.contains_key(&0x1018));
     }
 }
