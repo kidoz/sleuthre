@@ -1,5 +1,27 @@
 # Changelog
 
+## [Unreleased]
+
+### Added — Debugger completion (roadmap 0.6)
+
+- Launch/attach debug profiles persisted per-project (`debug_profiles` table) with
+  GdbRemote and local-launch transports, optional arch override, and a "save args"
+  toggle so sensitive command lines stay off disk; attach PIDs are never persisted
+- Local launch: sleuthre spawns a `gdbserver` child (free-port pick + retry-connect),
+  owns it, and kills/reaps it on disconnect and on app drop (Linux; clearly gated elsewhere)
+- Attach-to-PID wired into the GUI connection bar
+- Register editing via the `P` packet (per-register width honoured, e.g. 4-byte eflags)
+- Memory writing via the `M` packet, with an editable hex field in the memory inspector
+- Shared-library/module enumeration via `qXfer:libraries-svr4:read`, listed in the panel
+- Clickable backtrace frames (resolve enclosing function name, navigate disassembly)
+- Step Over (call-aware temp breakpoint), Step Out (return-address temp breakpoint),
+  and Step Into; a working Stop button that interrupts via a socket-sharing handle even
+  while a blocking continue runs on the worker thread
+- Source location (`file:line`) readout at PC and a function-level "stopped here" marker
+  in the decompiler when debug info is present
+- RSP reply decoding now handles run-length encoding (`x*`) and `}`-escapes, so register
+  dumps and `qXfer` payloads are no longer truncated
+
 ## [0.4.0] - 2026-04-20
 
 ### Added

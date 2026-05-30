@@ -92,6 +92,25 @@ pub trait Debugger {
     fn registers(&self) -> std::collections::HashMap<String, u64>;
     fn read_memory(&self, addr: u64, size: usize) -> Result<Vec<u8>>;
 
+    /// Overwrite a single named register (e.g. `"rip"`) with `value`. The
+    /// backend is responsible for honouring the register's width. Default:
+    /// not supported.
+    fn write_register(&mut self, _name: &str, _value: u64) -> Result<()> {
+        Err(Error::Debugger("register writes not supported".into()))
+    }
+
+    /// Write `data` to the inferior's memory starting at `addr`. Default: not
+    /// supported.
+    fn write_memory(&mut self, _addr: u64, _data: &[u8]) -> Result<()> {
+        Err(Error::Debugger("memory writes not supported".into()))
+    }
+
+    /// Enumerate loaded modules (shared libraries) as `(name, load_address)`
+    /// pairs. Returns empty when the stub does not support enumeration.
+    fn modules(&self) -> Vec<(String, u64)> {
+        Vec::new()
+    }
+
     /// Enumerate threads currently visible to the stub. Default: empty (single-thread targets).
     fn threads(&self) -> Vec<u64> {
         Vec::new()

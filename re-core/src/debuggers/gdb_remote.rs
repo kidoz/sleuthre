@@ -12,11 +12,14 @@
 //! - `set_breakpoint` / `remove_breakpoint` via `Z<type>,<addr>,<kind>` and the
 //!   matching `z` packet, both software (Z0) and hardware (Z1)
 //!
-//! Packet framing is RSP-standard: `$<body>#<cksum>` with `+`/`-` ack.
+//! Packet framing is RSP-standard: `$<body>#<cksum>` with `+`/`-` ack, and
+//! reply bodies are decoded for run-length encoding and `}`-escapes (see
+//! [`decode_rsp_body`]) so register dumps and `qXfer` payloads survive intact.
 //!
-//! Still missing: multi-thread awareness, watchpoints (Z2/Z3/Z4), non-stop
-//! mode, extended-remote launch. The transport is stable so those layer in
-//! without protocol changes.
+//! Watchpoints (Z2/Z3/Z4), thread-scoped breakpoints, register/memory writes
+//! (`P`/`M`), and shared-library enumeration (`qXfer:libraries-svr4`) are all
+//! supported. Still missing: non-stop mode and extended-remote `vRun` launch
+//! (local launch is handled out-of-band by spawning a `gdbserver` child).
 
 use crate::{BreakpointKind, Debugger, DebuggerState, Error, Result, StopReason, WatchpointHit};
 use std::collections::HashMap;
@@ -119,6 +122,23 @@ fn register_layout(arch: crate::arch::Architecture) -> &'static [(&'static str, 
     }
 }
 
+/// A cheaply-cloneable handle that can asynchronously interrupt a running
+/// inferior even while the owning [`GdbRemoteDebugger`] has been moved into a
+/// worker thread for a blocking `continue`/`step`. It holds a `try_clone` of
+/// the RSP socket; writing the unframed `0x03` (Ctrl+C) byte reaches the same
+/// connection the worker is blocked reading on, so the worker returns shortly.
+pub struct InterruptHandle {
+    stream: TcpStream,
+}
+
+impl InterruptHandle {
+    pub fn interrupt(&mut self) -> Result<()> {
+        self.stream
+            .write_all(&[0x03])
+            .map_err(|e| Error::Debugger(format!("gdb interrupt write: {}", e)))
+    }
+}
+
 /// A live connection to a `gdbserver`-compatible stub.
 pub struct GdbRemoteDebugger {
     stream: Mutex<TcpStream>,
@@ -157,6 +177,20 @@ impl GdbRemoteDebugger {
         };
         dbg.handshake()?;
         Ok(dbg)
+    }
+
+    /// Produce an [`InterruptHandle`] that shares this debugger's socket, so
+    /// the UI can stop a running inferior while the debugger itself is borrowed
+    /// by a worker thread mid-`continue`.
+    pub fn interrupt_handle(&self) -> Result<InterruptHandle> {
+        let stream = self
+            .stream
+            .lock()
+            .map_err(|_| Error::Debugger("gdb mutex poisoned".into()))?;
+        let clone = stream
+            .try_clone()
+            .map_err(|e| Error::Debugger(format!("gdb try_clone: {}", e)))?;
+        Ok(InterruptHandle { stream: clone })
     }
 
     /// Direct write of a single byte to the underlying socket — used by
@@ -207,7 +241,6 @@ fn format_packet(body: &str) -> String {
 }
 
 fn read_packet(stream: &mut TcpStream) -> Result<String> {
-    let mut out = String::new();
     let mut byte = [0u8; 1];
     // Skip until packet start.
     loop {
@@ -218,8 +251,10 @@ fn read_packet(stream: &mut TcpStream) -> Result<String> {
             break;
         }
     }
-    // Body until '#', ignoring RLE/escape edge cases (not exercised by
-    // register/memory queries in MVP stubs).
+    // Collect the raw body until '#'. RSP escapes any literal '#'/'$'/'}'/'*'
+    // in data as `}` followed by (char ^ 0x20), so a bare '#' always
+    // terminates the packet — we can scan for it before decoding.
+    let mut raw: Vec<u8> = Vec::new();
     loop {
         stream
             .read_exact(&mut byte)
@@ -227,7 +262,7 @@ fn read_packet(stream: &mut TcpStream) -> Result<String> {
         if byte[0] == b'#' {
             break;
         }
-        out.push(byte[0] as char);
+        raw.push(byte[0]);
     }
     // Consume the 2-byte checksum; we don't verify.
     let mut cksum = [0u8; 2];
@@ -236,7 +271,54 @@ fn read_packet(stream: &mut TcpStream) -> Result<String> {
         .map_err(|e| Error::Debugger(format!("gdb read cksum: {}", e)))?;
     // Send `+` ack to acknowledge reception.
     let _ = stream.write_all(b"+");
-    Ok(out)
+    Ok(decode_rsp_body(&raw))
+}
+
+/// Decode an RSP packet body, resolving the two compression mechanisms real
+/// stubs (gdbserver, QEMU) use even on register/memory replies:
+///
+/// - **Escape:** a `}` byte means "the next byte XOR `0x20`" — used to embed a
+///   literal `#`/`$`/`}`/`*` in the payload.
+/// - **Run-length encoding:** `<char>*<n>` repeats the byte *preceding* the `*`
+///   an additional `n - 29` times (so `0* ` — where the third byte is the
+///   space `0x20 = 32` — expands to four `0`s).
+///
+/// Without this, runs of `00` in a `g` register dump or the `qXfer` library
+/// XML arrive truncated. Payloads are ASCII (hex or XML), so we return a
+/// `String` built from the decoded bytes.
+fn decode_rsp_body(raw: &[u8]) -> String {
+    let mut out: Vec<u8> = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        match raw[i] {
+            b'}' => {
+                if let Some(&next) = raw.get(i + 1) {
+                    out.push(next ^ 0x20);
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            b'*' => {
+                let prev = out.last().copied();
+                match (prev, raw.get(i + 1).copied()) {
+                    (Some(prev), Some(n)) => {
+                        let extra = (n as i32 - 29).max(0) as usize;
+                        for _ in 0..extra {
+                            out.push(prev);
+                        }
+                        i += 2;
+                    }
+                    _ => i += 1,
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    out.iter().map(|&b| b as char).collect()
 }
 
 fn from_hex_nibble(b: u8) -> Option<u8> {
@@ -268,6 +350,101 @@ fn bp_kind_length(kind: BreakpointKind) -> u32 {
         // a future API; for now this matches `gdb`'s default.
         _ => 4,
     }
+}
+
+/// Map a register name to its `(gdb regnum, byte width)` using the `g`-packet
+/// layout order. The regnum used by the `P` write packet is the same index as
+/// in the `g`/`p` packets, so the position in [`register_layout`] is canonical.
+fn regnum_and_size(arch: crate::arch::Architecture, name: &str) -> Option<(usize, usize)> {
+    register_layout(arch)
+        .iter()
+        .enumerate()
+        .find(|(_, (n, _))| *n == name)
+        .map(|(idx, (_, size))| (idx, *size))
+}
+
+/// Build a `P<regnum>=<hex>` write-register packet. The value is encoded as the
+/// register's raw little-endian bytes, exactly `width` bytes wide — over- or
+/// under-shooting the width makes the stub reply `E`. Returns `None` for an
+/// unknown register on this architecture.
+fn build_p_packet(arch: crate::arch::Architecture, name: &str, value: u64) -> Option<String> {
+    let (regnum, size) = regnum_and_size(arch, name)?;
+    let le = value.to_le_bytes();
+    let mut hex = String::with_capacity(size * 2);
+    for &b in &le[..size] {
+        hex.push_str(&format!("{:02x}", b));
+    }
+    Some(format!("P{:x}={}", regnum, hex))
+}
+
+/// Build an `M<addr>,<len>:<hex>` write-memory packet. The data is a raw byte
+/// image (not endianness-swapped), matching what `m` returns.
+fn build_m_packet(addr: u64, data: &[u8]) -> String {
+    let mut hex = String::with_capacity(data.len() * 2);
+    for &b in data {
+        hex.push_str(&format!("{:02x}", b));
+    }
+    format!("M{:x},{:x}:{}", addr, data.len(), hex)
+}
+
+/// Read the value of an XML attribute `key="value"` from a single tag's text.
+fn attr_value(tag: &str, key: &str) -> Option<String> {
+    let needle = format!("{}=\"", key);
+    let start = tag.find(&needle)? + needle.len();
+    let end = tag[start..].find('"')? + start;
+    Some(tag[start..end].to_string())
+}
+
+/// Parse an address attribute that may be `0x`-prefixed hex or decimal.
+fn parse_addr_attr(s: &str) -> Option<u64> {
+    let t = s.trim();
+    if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        u64::from_str_radix(h, 16).ok()
+    } else {
+        t.parse().ok().or_else(|| u64::from_str_radix(t, 16).ok())
+    }
+}
+
+/// Parse a `qXfer:libraries-svr4` document into `(name, load_address)` pairs.
+///
+/// Handles the svr4 form (`<library name=... l_addr="0x..."/>`) and the older
+/// libraries form (`<library name=...><segment address="0x.."/></library>`).
+/// The container element `<library-list-svr4 …>` is skipped.
+fn parse_libraries_svr4_xml(xml: &str) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(pos) = rest.find("<library") {
+        let after = &rest[pos + "<library".len()..];
+        rest = after;
+        // Distinguish a real `<library ...>` entry from the `<library-list-…>`
+        // container by the delimiter that follows the element name.
+        if !after.starts_with([' ', '\t', '\n', '\r', '/', '>']) {
+            continue;
+        }
+        let tag_end = after.find('>').unwrap_or(after.len());
+        let tag = &after[..tag_end];
+        let Some(name) = attr_value(tag, "name") else {
+            continue;
+        };
+        let addr = attr_value(tag, "l_addr")
+            .as_deref()
+            .and_then(parse_addr_attr)
+            .or_else(|| {
+                // Older form: a nested <segment address="0x..."> after the tag.
+                let segment_region = &after[tag_end..];
+                segment_region.find("<segment").and_then(|sp| {
+                    let seg_tag = &segment_region[sp..];
+                    let seg_end = seg_tag.find('>').unwrap_or(seg_tag.len());
+                    attr_value(&seg_tag[..seg_end], "address")
+                        .as_deref()
+                        .and_then(parse_addr_attr)
+                })
+            });
+        if let Some(addr) = addr {
+            out.push((name, addr));
+        }
+    }
+    out
 }
 
 /// Parse a GDB Remote stop-reply packet into a structured [`StopReason`].
@@ -537,6 +714,78 @@ impl Debugger for GdbRemoteDebugger {
         }
         hex_to_bytes(&reply).ok_or_else(|| Error::Debugger("gdb bad memory reply".into()))
     }
+
+    fn modules(&self) -> Vec<(String, u64)> {
+        // Read the svr4 library list via qXfer, accumulating chunks until the
+        // stub signals the last one with the `l` marker. Any error / empty /
+        // unsupported reply degrades to whatever was gathered (usually none).
+        let mut xml = String::new();
+        let mut offset = 0usize;
+        for _ in 0..64 {
+            let pkt = format!("qXfer:libraries-svr4:read::{:x},{:x}", offset, 0x1000);
+            let reply = match self.send_recv(&pkt) {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+            if reply.is_empty() || reply.starts_with('E') {
+                break;
+            }
+            let (marker, chunk) = reply.split_at(1);
+            xml.push_str(chunk);
+            offset += chunk.len();
+            // `l` = last chunk; `m` = more to come; anything else is unexpected.
+            if marker != "m" {
+                break;
+            }
+        }
+        parse_libraries_svr4_xml(&xml)
+    }
+
+    fn write_register(&mut self, name: &str, value: u64) -> Result<()> {
+        let pkt = build_p_packet(self.arch, name, value)
+            .ok_or_else(|| Error::Debugger(format!("unknown register {}", name)))?;
+        let reply = self.send_recv(&pkt)?;
+        if reply == "OK" {
+            Ok(())
+        } else if reply.is_empty() {
+            // Empty reply is RSP's "packet not supported" — never report a
+            // write that did not happen as success.
+            Err(Error::Debugger(
+                "stub does not support register writes (P)".into(),
+            ))
+        } else if let Some(code) = reply.strip_prefix('E') {
+            Err(Error::Debugger(format!("write reg E{}", code)))
+        } else {
+            Err(Error::Debugger(format!(
+                "write reg unexpected reply: {}",
+                reply
+            )))
+        }
+    }
+
+    fn write_memory(&mut self, addr: u64, data: &[u8]) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let pkt = build_m_packet(addr, data);
+        let reply = self.send_recv(&pkt)?;
+        if reply == "OK" {
+            Ok(())
+        } else if reply.is_empty() {
+            // Empty reply is RSP's "packet not supported" — never report a
+            // write that did not happen as success.
+            Err(Error::Debugger(
+                "stub does not support memory writes (M)".into(),
+            ))
+        } else if let Some(code) = reply.strip_prefix('E') {
+            Err(Error::Debugger(format!("write mem E{}", code)))
+        } else {
+            Err(Error::Debugger(format!(
+                "write mem unexpected reply: {}",
+                reply
+            )))
+        }
+    }
 }
 
 impl GdbRemoteDebugger {
@@ -580,6 +829,23 @@ mod tests {
     fn format_packet_sums_body() {
         // 'OK' = 0x4F + 0x4B = 0x9A.
         assert_eq!(format_packet("OK"), "$OK#9a");
+    }
+
+    #[test]
+    fn decode_rsp_body_expands_rle() {
+        // `0* ` — the space (0x20 = 32) encodes a count of 32 - 29 = 3, so the
+        // preceding `0` is repeated three additional times: four `0`s total.
+        assert_eq!(decode_rsp_body(b"0* "), "0000");
+        // A plain payload passes through untouched.
+        assert_eq!(decode_rsp_body(b"deadbeef"), "deadbeef");
+    }
+
+    #[test]
+    fn decode_rsp_body_unescapes() {
+        // `}` + (0x23 ^ 0x20 = 0x03) yields a literal '#' (0x23).
+        assert_eq!(decode_rsp_body(b"}\x03"), "#");
+        // `}` + (0x7d ^ 0x20 = 0x5d) yields a literal '}' (0x7d).
+        assert_eq!(decode_rsp_body(b"}]"), "}");
     }
 
     #[test]
@@ -637,6 +903,72 @@ mod tests {
         assert_eq!(bp_kind_byte(BreakpointKind::WriteWatch), 2);
         assert_eq!(bp_kind_byte(BreakpointKind::ReadWatch), 3);
         assert_eq!(bp_kind_byte(BreakpointKind::AccessWatch), 4);
+    }
+
+    #[test]
+    fn regnum_maps_rip_to_16() {
+        use crate::arch::Architecture::X86_64;
+        assert_eq!(regnum_and_size(X86_64, "rip"), Some((16, 8)));
+        assert_eq!(regnum_and_size(X86_64, "rax"), Some((0, 8)));
+        assert_eq!(regnum_and_size(X86_64, "nope"), None);
+    }
+
+    #[test]
+    fn p_packet_format() {
+        use crate::arch::Architecture::X86_64;
+        // rax (regnum 0), full 8 bytes, little-endian.
+        assert_eq!(
+            build_p_packet(X86_64, "rax", 0x1122334455667788),
+            Some("P0=8877665544332211".to_string())
+        );
+    }
+
+    #[test]
+    fn eflags_writes_4_bytes() {
+        use crate::arch::Architecture::X86_64;
+        // eflags is regnum 17 (0x11) and only 4 bytes wide — the high half of
+        // the u64 must be dropped or the stub rejects the write.
+        assert_eq!(
+            build_p_packet(X86_64, "eflags", 0x246),
+            Some("P11=46020000".to_string())
+        );
+    }
+
+    #[test]
+    fn m_packet_format() {
+        assert_eq!(
+            build_m_packet(0x1000, &[0xde, 0xad, 0xbe, 0xef]),
+            "M1000,4:deadbeef"
+        );
+    }
+
+    #[test]
+    fn parse_libraries_svr4_xml_extracts_name_and_base() {
+        let xml = "<library-list-svr4 version=\"1.0\" main-lm=\"0x5\">\
+            <library name=\"/lib/x86_64-linux-gnu/libc.so.6\" lm=\"0x10\" \
+                     l_addr=\"0x7ffff7a00000\" l_ld=\"0x20\"/>\
+            <library name=\"/lib64/ld-linux-x86-64.so.2\" l_addr=\"0x7ffff7fd0000\"/>\
+            </library-list-svr4>";
+        let libs = parse_libraries_svr4_xml(xml);
+        assert_eq!(libs.len(), 2);
+        assert_eq!(libs[0].0, "/lib/x86_64-linux-gnu/libc.so.6");
+        assert_eq!(libs[0].1, 0x7ffff7a00000);
+        assert_eq!(libs[1].0, "/lib64/ld-linux-x86-64.so.2");
+        assert_eq!(libs[1].1, 0x7ffff7fd0000);
+    }
+
+    #[test]
+    fn parse_libraries_svr4_xml_handles_segment_form() {
+        let xml = "<library name=\"a.so\"><segment address=\"0x400000\"/></library>";
+        assert_eq!(
+            parse_libraries_svr4_xml(xml),
+            vec![("a.so".to_string(), 0x400000)]
+        );
+    }
+
+    #[test]
+    fn parse_libraries_svr4_xml_empty_when_unsupported() {
+        assert!(parse_libraries_svr4_xml("").is_empty());
     }
 
     #[test]

@@ -1,5 +1,4 @@
 use eframe::egui;
-use re_core::Debugger;
 
 use crate::app::SleuthreApp;
 use crate::theme::SyntaxColors;
@@ -20,6 +19,39 @@ impl SleuthreApp {
             ui.label(format!("Function: 0x{:X}", self.current_address));
         });
         ui.separator();
+
+        // Debugger affordance: when the inferior is stopped inside the function
+        // currently displayed, mark it (function-level) and surface the source
+        // location at PC if DWARF line info exists. Line-precise decompiler
+        // highlighting needs an address→line map on DecompiledCode (tracked
+        // follow-up); this honest marker ships now.
+        if self.debugger_pending.is_none()
+            && self.debugger_remote.is_some()
+            && let Some(pc) = self.debugger_pc()
+        {
+            let shown_fn = self
+                .project
+                .as_ref()
+                .and_then(|p| p.functions.find_function_containing(self.current_address));
+            let pc_fn = self
+                .project
+                .as_ref()
+                .and_then(|p| p.functions.find_function_containing(pc));
+            if shown_fn.is_some() && shown_fn == pc_fn {
+                let mut msg = format!("▶ stopped at 0x{:x} (in this function)", pc);
+                if let Some((file, line)) = self.debugger_source_at(pc) {
+                    let short = file.rsplit(['/', '\\']).next().unwrap_or(&file);
+                    msg.push_str(&format!("  —  {}:{}", short, line));
+                }
+                ui.label(
+                    egui::RichText::new(msg)
+                        .color(egui::Color32::from_rgb(255, 200, 80))
+                        .strong()
+                        .size(12.0),
+                );
+                ui.separator();
+            }
+        }
 
         let mut pending_run_to: Option<u64> = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -95,14 +127,8 @@ impl SleuthreApp {
     }
 
     fn debugger_run_to_cursor(&mut self, addr: u64) {
-        let Some(d) = self.debugger_remote.as_mut() else {
-            return;
-        };
-        match d.set_breakpoint(addr, re_core::BreakpointKind::Software) {
-            Ok(()) => {
-                self.debugger_temp_breakpoints.push(addr);
-                self.debugger_continue();
-            }
+        match self.debugger_plant_temp_breakpoint(addr) {
+            Ok(()) => self.debugger_continue(),
             Err(e) => self.add_toast(
                 crate::app::ToastKind::Error,
                 format!("Run-to-cursor BP failed: {}", e),

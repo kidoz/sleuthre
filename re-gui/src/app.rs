@@ -277,6 +277,36 @@ pub(crate) struct SleuthreApp {
     pub(crate) debugger_temp_breakpoints: Vec<u64>,
     /// When `true`, the next BP set targets only `debugger_active_thread`.
     pub(crate) debugger_bp_scope_thread: bool,
+    /// Editable mirror of `debugger_regs` (register name -> hex text), so the
+    /// user can type a new value and commit it with `P`. Repopulated on every
+    /// register refresh.
+    pub(crate) debugger_reg_edit: std::collections::HashMap<String, String>,
+    /// Hex bytes the user wants to write at `debugger_mem_addr` via `M`.
+    pub(crate) debugger_mem_write_input: String,
+    /// Transient attach PID — never persisted (PIDs are reused across runs).
+    pub(crate) debugger_attach_pid: String,
+    /// Transport selected in the connection bar / for a new profile.
+    pub(crate) debugger_transport: re_core::project::DebugTransport,
+    /// Local-launch executable path and raw argument string (whitespace-split).
+    pub(crate) debugger_launch_exe: String,
+    pub(crate) debugger_launch_args: String,
+    /// Optional architecture override; `None` uses the project's arch.
+    pub(crate) debugger_arch_override: Option<re_core::arch::Architecture>,
+    /// Name buffer for "save current connection as a profile".
+    pub(crate) debugger_profile_name: String,
+    /// When saving a profile, whether to persist launch `args` (they may carry
+    /// secrets). Defaults to on.
+    pub(crate) debugger_profile_save_args: bool,
+    /// Live `gdbserver` child spawned by a local launch; killed + reaped on
+    /// disconnect and on drop so it never outlives the session.
+    pub(crate) debugger_child: Option<std::process::Child>,
+    /// Socket-sharing interrupt handle, captured while a blocking debugger op
+    /// runs on the worker thread so the Stop button can still halt the inferior
+    /// (the debugger handle itself is moved out during that window).
+    pub(crate) debugger_interrupt: Option<re_core::debuggers::gdb_remote::InterruptHandle>,
+    /// Loaded modules `(name, base)` cached at the last refresh, so the panel
+    /// doesn't issue a `qXfer` round-trip every repaint.
+    pub(crate) debugger_modules: Vec<(String, u64)>,
 }
 
 /// Async operation in flight on the debugger.
@@ -460,6 +490,16 @@ pub(crate) enum ReanalysisProgress {
         project: Box<Project>,
         findings: std::result::Result<Vec<AnalysisFinding>, String>,
     },
+}
+
+impl Drop for SleuthreApp {
+    fn drop(&mut self) {
+        // Never orphan a gdbserver child we launched.
+        if let Some(mut child) = self.debugger_child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 impl Default for SleuthreApp {
@@ -656,6 +696,18 @@ impl Default for SleuthreApp {
             debugger_unwinder: None,
             debugger_temp_breakpoints: Vec::new(),
             debugger_bp_scope_thread: false,
+            debugger_reg_edit: std::collections::HashMap::new(),
+            debugger_mem_write_input: String::new(),
+            debugger_attach_pid: String::new(),
+            debugger_transport: re_core::project::DebugTransport::GdbRemote,
+            debugger_launch_exe: String::new(),
+            debugger_launch_args: String::new(),
+            debugger_arch_override: None,
+            debugger_profile_name: String::new(),
+            debugger_profile_save_args: true,
+            debugger_child: None,
+            debugger_interrupt: None,
+            debugger_modules: Vec::new(),
         }
     }
 }

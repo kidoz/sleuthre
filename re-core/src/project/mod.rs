@@ -100,6 +100,7 @@ pub struct Project {
     pub arch: Architecture,
     pub binary_format: BinaryFormat,
     pub struct_overlays: Vec<StructOverlay>,
+    pub debug_profiles: Vec<DebugProfile>,
 }
 
 /// Tracks which functions a cached decompilation depends on so a single edit
@@ -204,6 +205,39 @@ pub struct StructOverlay {
     pub label: String,
 }
 
+/// How a [`DebugProfile`] reaches its target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DebugTransport {
+    /// Connect to an already-running GDB Remote stub at `address`.
+    GdbRemote,
+    /// Spawn a local `gdbserver` child for `exe_path` (+ `args`) and connect to
+    /// it. Linux-only; the GUI degrades gracefully elsewhere.
+    LocalLaunch,
+}
+
+/// A saved debugger launch/attach configuration. Persisted per-project so an
+/// analyst can re-run the same target without retyping the transport details.
+///
+/// Note on safety: an attach PID is **never** stored here (PIDs are reused
+/// across runs, so persisting one is meaningless and misleading) — attach is a
+/// transient action in the UI. Command-line `args` may contain secrets, so
+/// they are only written to disk when `save_args` is set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DebugProfile {
+    pub name: String,
+    pub transport: DebugTransport,
+    /// `host:port` for [`DebugTransport::GdbRemote`].
+    pub address: String,
+    /// Executable path for [`DebugTransport::LocalLaunch`].
+    pub exe_path: String,
+    /// Launch arguments for [`DebugTransport::LocalLaunch`].
+    pub args: Vec<String>,
+    /// Optional architecture-name override; `None` uses the project's arch.
+    pub arch_override: Option<String>,
+    /// When `false`, `args` are not written to disk (treat as sensitive).
+    pub save_args: bool,
+}
+
 impl Project {
     pub fn new(name: String, path: PathBuf) -> Self {
         Self {
@@ -234,6 +268,7 @@ impl Project {
             arch: Architecture::X86_64,
             binary_format: BinaryFormat::Raw,
             struct_overlays: Vec::new(),
+            debug_profiles: Vec::new(),
         }
     }
 
@@ -562,6 +597,11 @@ impl Project {
                 db.save_class(name, info)?;
             }
 
+            // Persist debugger launch/attach profiles.
+            for profile in &self.debug_profiles {
+                db.save_debug_profile(profile)?;
+            }
+
             Ok(())
         })();
 
@@ -651,6 +691,9 @@ impl Project {
 
         // Restore class metadata.
         project.types.classes = db.load_classes()?;
+
+        // Restore debugger profiles.
+        project.debug_profiles = db.load_debug_profiles()?;
 
         project.db = Some(db);
         Ok(project)

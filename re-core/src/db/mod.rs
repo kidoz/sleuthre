@@ -152,6 +152,15 @@ impl Database {
                 vtable_label TEXT,
                 vtable_address INTEGER
             );
+            CREATE TABLE IF NOT EXISTS debug_profiles (
+                name TEXT PRIMARY KEY,
+                transport TEXT NOT NULL,
+                address TEXT NOT NULL,
+                exe_path TEXT NOT NULL,
+                args TEXT NOT NULL,
+                arch_override TEXT,
+                save_args INTEGER NOT NULL
+            );
             COMMIT;",
             )
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
@@ -381,7 +390,8 @@ impl Database {
                  DELETE FROM decompilation_cache;
                  DELETE FROM tags;
                  DELETE FROM struct_overlays;
-                 DELETE FROM classes;",
+                 DELETE FROM classes;
+                 DELETE FROM debug_profiles;",
             )
             .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
         Ok(())
@@ -714,6 +724,81 @@ impl Database {
             overlays.push(row.map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?);
         }
         Ok(overlays)
+    }
+
+    // --- Debugger profile persistence ---
+
+    pub fn save_debug_profile(&self, profile: &crate::project::DebugProfile) -> Result<()> {
+        use crate::project::DebugTransport;
+        let transport = match profile.transport {
+            DebugTransport::GdbRemote => "GdbRemote",
+            DebugTransport::LocalLaunch => "LocalLaunch",
+        };
+        // Honour the "don't persist arguments" flag — args may carry secrets.
+        let args_json = if profile.save_args {
+            serde_json::to_string(&profile.args).map_err(|e| Error::Database(e.to_string()))?
+        } else {
+            "[]".to_string()
+        };
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO debug_profiles \
+                 (name, transport, address, exe_path, args, arch_override, save_args) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    profile.name,
+                    transport,
+                    profile.address,
+                    profile.exe_path,
+                    args_json,
+                    profile.arch_override,
+                    profile.save_args as i64,
+                ],
+            )
+            .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn load_debug_profiles(&self) -> Result<Vec<crate::project::DebugProfile>> {
+        use crate::project::{DebugProfile, DebugTransport};
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT name, transport, address, exe_path, args, arch_override, save_args \
+                 FROM debug_profiles ORDER BY name",
+            )
+            .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let transport = match row.get::<_, String>(1)?.as_str() {
+                    "LocalLaunch" => DebugTransport::LocalLaunch,
+                    _ => DebugTransport::GdbRemote,
+                };
+                let args: Vec<String> =
+                    serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default();
+                Ok(DebugProfile {
+                    name: row.get::<_, String>(0)?,
+                    transport,
+                    address: row.get::<_, String>(2)?,
+                    exe_path: row.get::<_, String>(3)?,
+                    args,
+                    arch_override: row.get::<_, Option<String>>(5)?,
+                    save_args: row.get::<_, i64>(6)? != 0,
+                })
+            })
+            .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
+        let mut profiles = Vec::new();
+        for row in rows {
+            profiles.push(row.map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?);
+        }
+        Ok(profiles)
+    }
+
+    pub fn delete_debug_profile(&self, name: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM debug_profiles WHERE name = ?1", params![name])
+            .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
+        Ok(())
     }
 
     // --- ClassInfo persistence ---
@@ -1222,6 +1307,52 @@ mod tests {
         assert_eq!(loaded[0].label, "player");
         assert_eq!(loaded[1].address, 0x600000);
         assert_eq!(loaded[1].count, 32);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn round_trip_debug_profiles() {
+        use crate::project::{DebugProfile, DebugTransport};
+        let (db, path) = temp_db();
+        let remote = DebugProfile {
+            name: "qemu".into(),
+            transport: DebugTransport::GdbRemote,
+            address: "127.0.0.1:1234".into(),
+            exe_path: String::new(),
+            args: vec![],
+            arch_override: Some("Arm64".into()),
+            save_args: true,
+        };
+        // save_args = false must drop the (potentially sensitive) args on disk.
+        let launch = DebugProfile {
+            name: "local".into(),
+            transport: DebugTransport::LocalLaunch,
+            address: String::new(),
+            exe_path: "/bin/prog".into(),
+            args: vec!["--token".into(), "secret".into()],
+            arch_override: None,
+            save_args: false,
+        };
+        db.save_debug_profile(&remote).unwrap();
+        db.save_debug_profile(&launch).unwrap();
+
+        let loaded = db.load_debug_profiles().unwrap();
+        assert_eq!(loaded.len(), 2);
+        // Ordered by name: "local", "qemu".
+        assert_eq!(loaded[0].name, "local");
+        assert_eq!(loaded[0].transport, DebugTransport::LocalLaunch);
+        assert_eq!(loaded[0].exe_path, "/bin/prog");
+        assert!(
+            loaded[0].args.is_empty(),
+            "args must not persist when save_args is false"
+        );
+        assert_eq!(loaded[1].name, "qemu");
+        assert_eq!(loaded[1].transport, DebugTransport::GdbRemote);
+        assert_eq!(loaded[1].address, "127.0.0.1:1234");
+        assert_eq!(loaded[1].arch_override.as_deref(), Some("Arm64"));
+
+        db.delete_debug_profile("local").unwrap();
+        assert_eq!(db.load_debug_profiles().unwrap().len(), 1);
         let _ = std::fs::remove_file(&path);
     }
 
