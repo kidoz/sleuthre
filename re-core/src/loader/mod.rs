@@ -87,6 +87,13 @@ fn detect_elf_arch(elf: &elf::Elf) -> Result<Architecture> {
                 Ok(Architecture::Mips)
             }
         }
+        elf::header::EM_RISCV => {
+            if elf.header.e_ident[elf::header::EI_CLASS] == elf::header::ELFCLASS64 {
+                Ok(Architecture::RiscV64)
+            } else {
+                Ok(Architecture::RiscV32)
+            }
+        }
         other => Err(Error::Loader(format!(
             "Unsupported ELF architecture: e_machine=0x{:x}",
             other
@@ -663,6 +670,28 @@ mod tests {
         let loaded = load_raw_binary(&data, 0x2000, Architecture::Arm, None).unwrap();
         let read_back = loaded.memory_map.get_data(0x2000, 4).unwrap();
         assert_eq!(read_back, &[0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    /// Build a minimal 64-bit ELF header (no program/section headers) for the
+    /// given `e_machine`, so `detect_elf_arch` can be exercised directly.
+    fn minimal_elf64(machine: u16) -> Vec<u8> {
+        let mut h = vec![0u8; 64];
+        h[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        h[4] = elf::header::ELFCLASS64;
+        h[5] = elf::header::ELFDATA2LSB;
+        h[6] = elf::header::EV_CURRENT;
+        h[16..18].copy_from_slice(&elf::header::ET_EXEC.to_le_bytes());
+        h[18..20].copy_from_slice(&machine.to_le_bytes());
+        h[20..24].copy_from_slice(&(elf::header::EV_CURRENT as u32).to_le_bytes());
+        h[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        h
+    }
+
+    #[test]
+    fn detect_elf_arch_riscv64() {
+        let bytes = minimal_elf64(elf::header::EM_RISCV);
+        let elf = elf::Elf::parse(&bytes).unwrap();
+        assert_eq!(detect_elf_arch(&elf).unwrap(), Architecture::RiscV64);
     }
 
     #[test]
