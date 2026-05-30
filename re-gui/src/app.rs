@@ -99,9 +99,6 @@ pub(crate) struct SleuthreApp {
     // Toasts
     pub(crate) toasts: Vec<Toast>,
 
-    // Debugger
-    pub(crate) debugger: Box<dyn re_core::Debugger>,
-
     // Scripting
     pub(crate) script_engine: re_core::scripting::ScriptEngine,
     pub(crate) script_input: String,
@@ -582,7 +579,6 @@ impl Default for SleuthreApp {
             hex_selected_addr: None,
             hex_edit_buffer: String::new(),
             toasts: Vec::new(),
-            debugger: Box::new(re_core::MockDebugger::default()),
             script_engine: re_core::scripting::ScriptEngine::new(),
             script_input: String::new(),
             last_save_time: 0.0,

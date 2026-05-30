@@ -184,7 +184,6 @@ impl eframe::App for SleuthreApp {
             self.show_bottom_panel(ui);
         }
         self.show_left_panel(ui);
-        self.show_right_panel(ui);
         self.show_central_panel(ui);
         // Windows / areas / overlays render on the context, independent of the
         // panel layout.
@@ -200,32 +199,6 @@ impl eframe::App for SleuthreApp {
 }
 
 impl SleuthreApp {
-    fn show_right_panel(&mut self, ui: &mut egui::Ui) {
-        let state = self.debugger.state();
-        if state == re_core::DebuggerState::Detached {
-            return;
-        }
-
-        egui::Panel::right("right_panel")
-            .resizable(true)
-            .default_size(200.0)
-            .show_inside(ui, |ui| {
-                ui.heading("Registers");
-                ui.separator();
-                let regs = self.debugger.registers();
-                let mut names: Vec<_> = regs.keys().collect();
-                names.sort();
-
-                egui::Grid::new("reg_grid").striped(true).show(ui, |ui| {
-                    for name in names {
-                        ui.label(name);
-                        ui.monospace(format!("{:016X}", regs[name]));
-                        ui.end_row();
-                    }
-                });
-            });
-    }
-
     fn show_toasts(&mut self, ctx: &egui::Context) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -948,41 +921,9 @@ impl SleuthreApp {
                 }
             });
             ui.menu_button("Debugger", |ui| {
-                let state = self.debugger.state();
-                ui.label(format!("State: {:?}", state));
-                ui.separator();
-                match state {
-                    re_core::DebuggerState::Detached => {
-                        if ui.button("Attach to Process...").clicked() {
-                            let _ = self.debugger.attach(1234);
-                            self.add_toast(
-                                crate::app::ToastKind::Success,
-                                "Attached to mock process 1234".into(),
-                            );
-                            ui.close();
-                        }
-                    }
-                    re_core::DebuggerState::Paused => {
-                        if ui.button("Continue (F9)").clicked() {
-                            let _ = self.debugger.continue_exec();
-                            ui.close();
-                        }
-                        if ui.button("Step Into (F7)").clicked() {
-                            let _ = self.debugger.step();
-                            ui.close();
-                        }
-                        if ui.button("Detach").clicked() {
-                            let _ = self.debugger.detach();
-                            ui.close();
-                        }
-                    }
-                    re_core::DebuggerState::Running => {
-                        if ui.button("Pause").clicked() {
-                            // Mock pause
-                            let _ = self.debugger.attach(1234);
-                            ui.close();
-                        }
-                    }
+                if ui.button("Open debugger panel").clicked() {
+                    self.focus_or_open_tab(Tab::Debugger);
+                    ui.close();
                 }
             });
             ui.menu_button("Plugins", |ui| {
