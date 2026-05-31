@@ -98,6 +98,12 @@ impl MemoryMap {
         self.find_segment(address).is_some()
     }
 
+    /// Whether `address` lies in a segment with execute permission.
+    pub fn is_executable(&self, address: u64) -> bool {
+        self.find_segment(address)
+            .is_some_and(|i| self.segments[i].permissions.contains(Permissions::EXECUTE))
+    }
+
     /// Read a u16 value with endianness awareness
     pub fn read_u16(&self, address: u64, endian: Endianness) -> Option<u16> {
         let data = self.get_data(address, 2)?;

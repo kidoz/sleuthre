@@ -231,16 +231,18 @@ impl ControlFlowGraph {
 /// Detect jump table entries at a given table base address.
 /// Returns target addresses found in the table.
 ///
-/// Reads consecutive 8-byte little-endian pointers from `table_addr`.
-/// Stops when a pointer does not resolve to a valid address in memory
-/// or when `max_entries` is reached.
+/// Reads consecutive 8-byte little-endian pointers from `table_addr`, accepting
+/// only those that point into **executable** memory (a code target), and stops
+/// at the first entry that does not — which also bounds the scan and rejects
+/// tables that are actually data. Limitation: this assumes 8-byte absolute
+/// pointers, so 32-bit and PC-relative/offset tables are not recovered here.
 pub fn detect_jump_table(memory: &MemoryMap, table_addr: u64, max_entries: usize) -> Vec<u64> {
     let mut targets = Vec::new();
     for i in 0..max_entries {
         let addr = table_addr + (i as u64) * 8;
         if let Some(data) = memory.get_data(addr, 8) {
             let target = u64::from_le_bytes(data.try_into().unwrap_or([0u8; 8]));
-            if memory.contains_address(target) {
+            if memory.is_executable(target) {
                 targets.push(target);
             } else {
                 break;
@@ -451,6 +453,43 @@ mod tests {
         let map = MemoryMap::default();
         let targets = detect_jump_table(&map, 0x5000, 16);
         assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn jump_table_rejects_non_executable_targets() {
+        let mut map = MemoryMap::default();
+        // Executable code (valid jump target).
+        map.add_segment(MemorySegment {
+            name: "code".to_string(),
+            start: 0x2000,
+            size: 0x100,
+            data: vec![0x90u8; 0x100],
+            permissions: Permissions::READ | Permissions::EXECUTE,
+        })
+        .unwrap();
+        // Read-only data (must NOT be accepted as a code target).
+        map.add_segment(MemorySegment {
+            name: "rodata".to_string(),
+            start: 0x3000,
+            size: 0x100,
+            data: vec![0u8; 0x100],
+            permissions: Permissions::READ,
+        })
+        .unwrap();
+        // Table: [0x2000 (code, ok), 0x3000 (data, reject and stop)].
+        let mut table = Vec::new();
+        table.extend_from_slice(&0x2000u64.to_le_bytes());
+        table.extend_from_slice(&0x3000u64.to_le_bytes());
+        map.add_segment(MemorySegment {
+            name: "tbl".to_string(),
+            start: 0x4000,
+            size: table.len() as u64,
+            data: table,
+            permissions: Permissions::READ,
+        })
+        .unwrap();
+
+        assert_eq!(detect_jump_table(&map, 0x4000, 16), vec![0x2000]);
     }
 
     #[test]
