@@ -13,8 +13,50 @@
 //! ignores branch merges — callers must treat it as a single-path approximation
 //! and bail when that is not sound.
 
-use crate::il::mlil::{MlilExpr, MlilFunction, MlilStmt};
+use crate::il::mlil::{MlilExpr, MlilFunction, MlilStmt, SsaVar};
 use std::collections::HashMap;
+
+/// Make each call's ABI effects explicit in the IL so dataflow can cross call
+/// boundaries: rewrite every `Call { target }` into an assignment that
+/// **defines the return register** and whose call expression **uses the
+/// argument registers**. After this, [`DefUse`] sees a definition of `ret_reg`
+/// at the call (so the return value's uses are reachable) and uses of every
+/// `arg_regs` entry (so the passed values are linked).
+///
+/// `arg_regs` over-approximates: it lists all ABI argument registers, not the
+/// (unknown) callee arity. That is sound for a def-use index — it never invents
+/// a definition, only marks reads. Run this **before** [`crate::il::mlil::apply_ssa`]
+/// so the synthesized return-register definitions get versioned. Intended for
+/// the analysis-side MLIL only; it intentionally changes call statements, so it
+/// is not run on the decompiler's MLIL.
+pub fn model_call_effects(func: &mut MlilFunction, arg_regs: &[&str], ret_reg: &str) {
+    for inst in &mut func.instructions {
+        for stmt in &mut inst.stmts {
+            if let MlilStmt::Call { target } = stmt {
+                let target = std::mem::replace(target, MlilExpr::Const(0));
+                let args = arg_regs
+                    .iter()
+                    .map(|r| {
+                        MlilExpr::Var(SsaVar {
+                            name: (*r).to_string(),
+                            version: 0,
+                        })
+                    })
+                    .collect();
+                *stmt = MlilStmt::Assign {
+                    dest: SsaVar {
+                        name: ret_reg.to_string(),
+                        version: 0,
+                    },
+                    src: MlilExpr::Call {
+                        target: Box::new(target),
+                        args,
+                    },
+                };
+            }
+        }
+    }
+}
 
 /// A position within an [`MlilFunction`]: which instruction, which statement,
 /// and the source address of that instruction.
@@ -180,6 +222,58 @@ mod tests {
         // A register never mentioned has no defs or uses.
         assert!(du.defs_of("rcx").is_empty());
         assert!(du.uses_of("rcx").is_empty());
+    }
+
+    /// Build:
+    ///   0x1000  call 0x2000
+    ///   0x1004  rbx = rax        (consume the return value)
+    fn call_sample() -> MlilFunction {
+        MlilFunction {
+            name: "t".to_string(),
+            entry: 0x1000,
+            instructions: vec![
+                MlilInst {
+                    address: 0x1000,
+                    stmts: vec![MlilStmt::Call {
+                        target: MlilExpr::Const(0x2000),
+                    }],
+                },
+                MlilInst {
+                    address: 0x1004,
+                    stmts: vec![MlilStmt::Assign {
+                        dest: var("rbx", 1),
+                        src: MlilExpr::Var(var("rax", 0)),
+                    }],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn call_effects_define_return_and_use_args() {
+        let mut func = call_sample();
+        model_call_effects(&mut func, &["rdi", "rsi"], "rax");
+
+        // The call statement is now an assignment defining the return register.
+        match &func.instructions[0].stmts[0] {
+            MlilStmt::Assign { dest, src } => {
+                assert_eq!(dest.name, "rax");
+                assert!(matches!(src, MlilExpr::Call { .. }));
+            }
+            other => panic!("expected call rewritten to Assign, got {:?}", other),
+        }
+
+        let du = DefUse::build(&func);
+        // Return register is defined at the call site...
+        assert_eq!(du.defs_of("rax").len(), 1);
+        assert_eq!(du.defs_of("rax")[0].address, 0x1000);
+        // ...the argument registers are used there...
+        assert_eq!(du.uses_of("rdi")[0].address, 0x1000);
+        assert_eq!(du.uses_of("rsi")[0].address, 0x1000);
+        // ...and the post-call use of rax is reached by the call's definition.
+        let rax_use = du.uses_of("rax")[0];
+        assert_eq!(rax_use.address, 0x1004);
+        assert_eq!(du.reaching_def("rax", rax_use).unwrap().address, 0x1000);
     }
 
     #[test]
