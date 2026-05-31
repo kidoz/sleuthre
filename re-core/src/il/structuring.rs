@@ -2068,9 +2068,11 @@ pub fn decompile(
     }
     let llil = crate::il::lift_function(arch, name, instructions[0].address, instructions);
     let mut mlil = crate::il::mlil::lower_to_mlil(&llil);
-    crate::il::mlil::apply_ssa(&mut mlil);
-    crate::il::mlil::eliminate_dead_stores(&mut mlil);
+    // Structural cleanup first (operates on names, before versioning), then
+    // version defs and uses together so each use names its reaching definition.
     crate::il::mlil::reconstruct_stack_operations(&mut mlil);
+    crate::il::mlil::version_defs_and_uses(&mut mlil);
+    crate::il::mlil::eliminate_dead_stores(&mut mlil);
 
     let (mut info, stack_map) =
         analyze_function_signature(&mlil, instructions, arch, symbols, type_info, types);

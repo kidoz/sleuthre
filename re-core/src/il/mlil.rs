@@ -314,6 +314,94 @@ pub fn apply_ssa(func: &mut MlilFunction) {
     }
 }
 
+/// Version both definitions *and* uses so each use names its reaching definition.
+///
+/// [`apply_ssa`] versions only definitions, leaving every use at version 0 — so
+/// a register read after a redefinition rendered as the (stale) incoming value.
+/// This walks the function in program order tracking the current version of each
+/// register and rewrites each use to it, while assigning definitions the same
+/// monotonic versions `apply_ssa` would.
+///
+/// Without a full CFG this is sound only within straight-line code, so the
+/// reaching map is reset at branch targets (join points): uses there fall back
+/// to version 0 (the merged/incoming value) rather than a possibly-wrong guess.
+pub fn version_defs_and_uses(func: &mut MlilFunction) {
+    // Addresses that are jump/branch targets begin a new block (possible join).
+    let mut targets: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for inst in &func.instructions {
+        for stmt in &inst.stmts {
+            match stmt {
+                MlilStmt::Jump { target } | MlilStmt::BranchIf { target, .. } => {
+                    if let MlilExpr::Const(a) = target {
+                        targets.insert(*a);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut counters: HashMap<String, u32> = HashMap::new();
+    let mut current: HashMap<String, u32> = HashMap::new();
+    for inst in &mut func.instructions {
+        if targets.contains(&inst.address) {
+            current.clear();
+        }
+        for stmt in &mut inst.stmts {
+            match stmt {
+                MlilStmt::Assign { dest, src } => {
+                    rename_uses(src, &current);
+                    let c = counters.entry(dest.name.clone()).or_insert(0);
+                    *c += 1;
+                    dest.version = *c;
+                    current.insert(dest.name.clone(), *c);
+                }
+                MlilStmt::Store { addr, value, .. } => {
+                    rename_uses(addr, &current);
+                    rename_uses(value, &current);
+                }
+                MlilStmt::Jump { target } => rename_uses(target, &current),
+                MlilStmt::BranchIf { cond, target } => {
+                    rename_uses(cond, &current);
+                    rename_uses(target, &current);
+                }
+                MlilStmt::Call { target, args } => {
+                    rename_uses(target, &current);
+                    for a in args {
+                        rename_uses(a, &current);
+                    }
+                }
+                MlilStmt::Return | MlilStmt::Nop => {}
+            }
+        }
+    }
+}
+
+/// Point every variable in `expr` at its current reaching-definition version.
+fn rename_uses(expr: &mut MlilExpr, current: &HashMap<String, u32>) {
+    match expr {
+        MlilExpr::Var(v) => v.version = current.get(&v.name).copied().unwrap_or(0),
+        MlilExpr::Load { addr, .. } => rename_uses(addr, current),
+        MlilExpr::BinOp { left, right, .. } => {
+            rename_uses(left, current);
+            rename_uses(right, current);
+        }
+        MlilExpr::UnaryOp { operand, .. } => rename_uses(operand, current),
+        MlilExpr::Call { target, args } => {
+            rename_uses(target, current);
+            for a in args {
+                rename_uses(a, current);
+            }
+        }
+        MlilExpr::VectorOp { operands, .. } => {
+            for o in operands {
+                rename_uses(o, current);
+            }
+        }
+        MlilExpr::Phi(_) | MlilExpr::Const(_) => {}
+    }
+}
+
 /// Constant folding: simplify expressions with known constant operands.
 pub fn fold_constants(expr: &MlilExpr) -> MlilExpr {
     match expr {
@@ -1023,6 +1111,64 @@ mod tests {
             |s| matches!(s, MlilStmt::Assign { dest, .. } if is_stack_or_frame_pointer(&dest.name)),
         );
         assert!(!has_esp_add, "the add esp, 4 cleanup should be removed");
+    }
+
+    /// Version of the source variable of the `idx`-th `Assign` statement.
+    fn src_var_version(f: &MlilFunction, idx: usize) -> u32 {
+        let assigns: Vec<_> = f
+            .instructions
+            .iter()
+            .flat_map(|i| &i.stmts)
+            .filter_map(|s| match s {
+                MlilStmt::Assign {
+                    src: MlilExpr::Var(v),
+                    ..
+                } => Some(v.version),
+                _ => None,
+            })
+            .collect();
+        assigns[idx]
+    }
+
+    #[test]
+    fn uses_name_their_reaching_definition() {
+        // mov eax, 1 ; mov ebx, eax ; mov eax, 2 ; mov ecx, eax
+        // The two reads of eax must resolve to versions 1 and 2 respectively.
+        let mut m = lower_to_mlil(&lift_function(
+            "test",
+            0x1000,
+            &[
+                make_insn(0x1000, "mov", "eax, 1"),
+                make_insn(0x1005, "mov", "ebx, eax"),
+                make_insn(0x1007, "mov", "eax, 2"),
+                make_insn(0x100c, "mov", "ecx, eax"),
+            ],
+        ));
+        version_defs_and_uses(&mut m);
+        assert_eq!(src_var_version(&m, 0), 1, "first `ebx = eax` reads eax#1");
+        assert_eq!(src_var_version(&m, 1), 2, "later `ecx = eax` reads eax#2");
+    }
+
+    #[test]
+    fn reaching_defs_reset_at_branch_targets() {
+        // mov eax, 1 ; jmp L ; L: mov ebx, eax
+        // The use of eax at the join falls back to version 0 (no cross-block
+        // versioning without a CFG).
+        let mut m = lower_to_mlil(&lift_function(
+            "test",
+            0x1000,
+            &[
+                make_insn(0x1000, "mov", "eax, 1"),
+                make_insn(0x1005, "jmp", "0x100c"),
+                make_insn(0x100c, "mov", "ebx, eax"),
+            ],
+        ));
+        version_defs_and_uses(&mut m);
+        assert_eq!(
+            src_var_version(&m, 0),
+            0,
+            "use at a branch target resets to version 0"
+        );
     }
 
     #[test]
