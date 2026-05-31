@@ -61,19 +61,27 @@ impl std::fmt::Display for StackVarType {
 
 /// Analyze disassembled instructions to recover stack variables.
 /// Looks for patterns like `[rbp - 0x8]`, `[rsp + 0x10]`, `[sp, #-16]`, etc.
-pub fn recover_stack_variables(instructions: &[crate::disasm::Instruction]) -> Vec<StackVariable> {
+///
+/// `arch` sets the default access width for size-prefix-free operands so a slot
+/// touched only by, e.g., a push on a 32-bit target is sized as a word (4 bytes)
+/// rather than always 8.
+pub fn recover_stack_variables(
+    instructions: &[crate::disasm::Instruction],
+    arch: crate::arch::Architecture,
+) -> Vec<StackVariable> {
     let mut vars: BTreeMap<i64, StackVariable> = BTreeMap::new();
+    let word = arch.pointer_size() as u8;
 
     for insn in instructions {
         let op = &insn.op_str;
 
         // x86/x86_64: [rbp - 0xNN] or [ebp - 0xNN]
-        extract_frame_accesses(op, "rbp", &mut vars);
-        extract_frame_accesses(op, "ebp", &mut vars);
+        extract_frame_accesses(op, "rbp", word, &mut vars);
+        extract_frame_accesses(op, "ebp", word, &mut vars);
 
         // Also handle [rsp + 0xNN] (frame-pointer-omitted functions)
-        extract_stack_accesses(op, "rsp", &mut vars);
-        extract_stack_accesses(op, "esp", &mut vars);
+        extract_stack_accesses(op, "rsp", word, &mut vars);
+        extract_stack_accesses(op, "esp", word, &mut vars);
 
         // ARM64: [sp, #-NN] or [x29, #-NN]
         extract_arm_frame_accesses(op, &insn.mnemonic, "x29", &mut vars);
@@ -87,7 +95,7 @@ pub fn recover_stack_variables(instructions: &[crate::disasm::Instruction]) -> V
     result
 }
 
-fn extract_frame_accesses(op: &str, reg: &str, vars: &mut BTreeMap<i64, StackVariable>) {
+fn extract_frame_accesses(op: &str, reg: &str, word: u8, vars: &mut BTreeMap<i64, StackVariable>) {
     // Pattern: [rbp - 0xNN] or [rbp + 0xNN]
     if let Some(bracket_start) = op.find('[')
         && let Some(bracket_end) = op[bracket_start..].find(']')
@@ -100,7 +108,7 @@ fn extract_frame_accesses(op: &str, reg: &str, vars: &mut BTreeMap<i64, StackVar
         if let Some(minus) = inner.find(" - ") {
             let offset_str = inner[minus + 3..].trim().trim_start_matches("0x");
             if let Ok(offset) = i64::from_str_radix(offset_str, 16) {
-                let size = infer_access_size(op);
+                let size = infer_access_size(op, word);
                 let entry = vars.entry(-offset).or_insert(StackVariable {
                     offset: -offset,
                     size: size as u64,
@@ -115,7 +123,7 @@ fn extract_frame_accesses(op: &str, reg: &str, vars: &mut BTreeMap<i64, StackVar
         } else if let Some(plus) = inner.find(" + ") {
             let offset_str = inner[plus + 3..].trim().trim_start_matches("0x");
             if let Ok(offset) = i64::from_str_radix(offset_str, 16) {
-                let size = infer_access_size(op);
+                let size = infer_access_size(op, word);
                 vars.entry(offset).or_insert(StackVariable {
                     offset,
                     size: size as u64,
@@ -127,7 +135,7 @@ fn extract_frame_accesses(op: &str, reg: &str, vars: &mut BTreeMap<i64, StackVar
     }
 }
 
-fn extract_stack_accesses(op: &str, reg: &str, vars: &mut BTreeMap<i64, StackVariable>) {
+fn extract_stack_accesses(op: &str, reg: &str, word: u8, vars: &mut BTreeMap<i64, StackVariable>) {
     // Same as frame but for stack pointer
     if let Some(bracket_start) = op.find('[')
         && let Some(bracket_end) = op[bracket_start..].find(']')
@@ -140,7 +148,7 @@ fn extract_stack_accesses(op: &str, reg: &str, vars: &mut BTreeMap<i64, StackVar
         if let Some(plus) = inner.find(" + ") {
             let offset_str = inner[plus + 3..].trim().trim_start_matches("0x");
             if let Ok(offset) = i64::from_str_radix(offset_str, 16) {
-                let size = infer_access_size(op);
+                let size = infer_access_size(op, word);
                 vars.entry(offset).or_insert(StackVariable {
                     offset,
                     size: size as u64,
@@ -216,7 +224,7 @@ fn extract_arm_frame_accesses(
     }
 }
 
-fn infer_access_size(op: &str) -> u8 {
+fn infer_access_size(op: &str, word: u8) -> u8 {
     if op.contains("byte ptr") || op.contains("BYTE") {
         1
     } else if op.contains("qword ptr") || op.contains("QWORD") {
@@ -227,7 +235,7 @@ fn infer_access_size(op: &str) -> u8 {
     } else if op.contains("word ptr") || op.contains("WORD") {
         2
     } else {
-        8 // default to 64-bit
+        word // default to the target word size
     }
 }
 
@@ -283,7 +291,7 @@ mod tests {
             make_insn("mov", "dword ptr [rbp - 0x10], esi"),
             make_insn("mov", "qword ptr [rbp - 0x18], rdx"),
         ];
-        let vars = recover_stack_variables(&insns);
+        let vars = recover_stack_variables(&insns, crate::arch::Architecture::X86_64);
         assert_eq!(vars.len(), 3);
 
         // Variables should be sorted by offset (BTreeMap order: -0x18, -0x10, -0x8)
@@ -305,7 +313,7 @@ mod tests {
             make_insn("mov", "qword ptr [rsp + 0x8], rax"),
             make_insn("mov", "dword ptr [rsp + 0x10], ecx"),
         ];
-        let vars = recover_stack_variables(&insns);
+        let vars = recover_stack_variables(&insns, crate::arch::Architecture::X86_64);
         assert_eq!(vars.len(), 2);
         // Both are positive offsets (args or rsp-relative locals)
         assert_eq!(vars[0].offset, 0x8);
@@ -318,7 +326,7 @@ mod tests {
             make_insn("mov", "qword ptr [rbp + 0x10], rdi"),
             make_insn("mov", "qword ptr [rbp + 0x18], rsi"),
         ];
-        let vars = recover_stack_variables(&insns);
+        let vars = recover_stack_variables(&insns, crate::arch::Architecture::X86_64);
         assert_eq!(vars.len(), 2);
         assert!(vars[0].name.starts_with("arg_"));
         assert!(vars[1].name.starts_with("arg_"));
@@ -330,7 +338,7 @@ mod tests {
             make_insn("str", "x0, [x29, #-8]"),
             make_insn("ldr", "x1, [x29, #-16]"),
         ];
-        let vars = recover_stack_variables(&insns);
+        let vars = recover_stack_variables(&insns, crate::arch::Architecture::Arm64);
         assert_eq!(vars.len(), 2);
         assert_eq!(vars[0].offset, -16);
         assert_eq!(vars[1].offset, -8);
@@ -342,16 +350,30 @@ mod tests {
             make_insn("mov", "dword ptr [rbp - 0x8], eax"),
             make_insn("mov", "qword ptr [rbp - 0x8], rax"),
         ];
-        let vars = recover_stack_variables(&insns);
+        let vars = recover_stack_variables(&insns, crate::arch::Architecture::X86_64);
         assert_eq!(vars.len(), 1);
         // Should be upgraded to 8 bytes (qword)
         assert_eq!(vars[0].size, 8);
     }
 
     #[test]
+    fn size_prefixless_access_defaults_to_word_size() {
+        // No `dword/qword ptr` prefix: the slot is sized by the target word.
+        let insns = vec![make_insn("mov", "[ebp - 0x8], eax")];
+
+        let x86 = recover_stack_variables(&insns, crate::arch::Architecture::X86);
+        assert_eq!(x86[0].size, 4);
+        assert_eq!(x86[0].type_hint, StackVarType::Int32);
+
+        let x64 = recover_stack_variables(&insns, crate::arch::Architecture::X86_64);
+        assert_eq!(x64[0].size, 8);
+        assert_eq!(x64[0].type_hint, StackVarType::Int64);
+    }
+
+    #[test]
     fn byte_locals_detected_as_buffer() {
         let insns = vec![make_insn("mov", "byte ptr [rbp - 0x20], al")];
-        let vars = recover_stack_variables(&insns);
+        let vars = recover_stack_variables(&insns, crate::arch::Architecture::X86_64);
         assert_eq!(vars.len(), 1);
         assert_eq!(vars[0].type_hint, StackVarType::Buffer);
         assert!(vars[0].name.starts_with("buf_"));
@@ -359,7 +381,7 @@ mod tests {
 
     #[test]
     fn empty_instructions_yields_no_vars() {
-        let vars = recover_stack_variables(&[]);
+        let vars = recover_stack_variables(&[], crate::arch::Architecture::X86_64);
         assert!(vars.is_empty());
     }
 

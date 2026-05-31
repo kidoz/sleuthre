@@ -44,6 +44,19 @@ const X86_ARG_REGS: &[&str] = &["ecx", "edx"];
 /// Registers that hold the return value on ARM64.
 const ARM64_RETURN_REGS: &[&str] = &["x0"];
 
+/// The default integer C type for a target's natural word size: `int32_t` on
+/// 32-bit targets (x86, ARM, MIPS32, RISC-V32), `int64_t` on 64-bit ones. Used
+/// for register-derived locals, parameters, and return values when no more
+/// specific type is known, so 32-bit binaries don't render everything as
+/// `int64_t`.
+fn default_word_type(arch: crate::arch::Architecture) -> &'static str {
+    if arch.pointer_size() == 8 {
+        "int64_t"
+    } else {
+        "int32_t"
+    }
+}
+
 /// Return `true` if any expression in the MLIL function is a `VectorOp`.
 fn mlil_uses_vector_ops(mlil: &MlilFunction) -> bool {
     fn expr_has_vector(expr: &crate::il::mlil::MlilExpr) -> bool {
@@ -125,7 +138,7 @@ fn analyze_function_signature(
         }
     }
 
-    let stack_vars = recover_locals(instructions);
+    let stack_vars = recover_locals(instructions, arch);
 
     let locals: Vec<(String, String)> = stack_vars
         .iter()
@@ -234,7 +247,7 @@ fn detect_parameters(
     param_regs
         .iter()
         .enumerate()
-        .map(|(i, _)| ("int64_t".to_string(), format!("arg{}", i + 1)))
+        .map(|(i, _)| (default_word_type(arch).to_string(), format!("arg{}", i + 1)))
         .collect()
 }
 
@@ -313,7 +326,7 @@ fn detect_return_type(mlil: &MlilFunction, arch: crate::arch::Architecture) -> S
                     if is_zero_const(&assign_value) {
                         continue;
                     }
-                    return "int64_t".to_string();
+                    return default_word_type(arch).to_string();
                 }
             }
         }
@@ -349,8 +362,11 @@ fn is_zero_const(expr: &MlilExpr) -> bool {
 }
 
 /// Recover stack-local variable declarations from raw instructions.
-fn recover_locals(instructions: &[crate::disasm::Instruction]) -> Vec<StackVariable> {
-    crate::analysis::stack::recover_stack_variables(instructions)
+fn recover_locals(
+    instructions: &[crate::disasm::Instruction],
+    arch: crate::arch::Architecture,
+) -> Vec<StackVariable> {
+    crate::analysis::stack::recover_stack_variables(instructions, arch)
 }
 
 fn remove_unused_labels(stmts: &mut Vec<HlilStmt>) {
@@ -1003,6 +1019,7 @@ fn collect_ssa_vars_in_hlil(
     known_vars: &HashSet<&str>,
     type_info: Option<&FunctionTypeInfo>,
     inferred_types: &HashMap<String, TypeRef>,
+    arch: crate::arch::Architecture,
 ) -> Vec<(String, String)> {
     let mut found = HashSet::new();
     collect_ssa_vars_stmts(stmts, &mut found);
@@ -1018,7 +1035,7 @@ fn collect_ssa_vars_in_hlil(
                         .and_then(|ti| ti.var_types.get(&name))
                         .map(|t| t.display_name())
                 })
-                .unwrap_or_else(|| "int64_t".to_string());
+                .unwrap_or_else(|| default_word_type(arch).to_string());
             result.push((ty, name));
         }
     }
@@ -1612,7 +1629,11 @@ fn get_expr_type(
     types: &TypeManager,
 ) -> Option<TypeRef> {
     match expr {
-        HlilExpr::Const(_) => Some(TypeRef::Primitive(PrimitiveType::U64)),
+        // A bare integer literal doesn't pin a variable's width — inferring
+        // `uint64_t` here made every constant-initialized local 64-bit even on
+        // 32-bit targets. Let such variables fall through to the word-size
+        // default instead.
+        HlilExpr::Const(_) => None,
         HlilExpr::Var(name) => inferred_types.get(name).cloned(),
         HlilExpr::Global(addr, _) => types
             .global_variables
@@ -2089,7 +2110,8 @@ pub fn decompile(
         known_vars.insert(name);
     }
 
-    let ssa_locals = collect_ssa_vars_in_hlil(&hlil_stmts, &known_vars, type_info, &inferred_types);
+    let ssa_locals =
+        collect_ssa_vars_in_hlil(&hlil_stmts, &known_vars, type_info, &inferred_types, arch);
     for (_ty, name) in &ssa_locals {
         // Also track types from SSA locals
         if let Some(tref) = type_info.and_then(|ti| ti.var_types.get(name)) {
@@ -2912,6 +2934,65 @@ mod tests {
         ]);
         let ret = detect_return_type(&func, crate::arch::Architecture::X86_64);
         assert_eq!(ret, "int64_t");
+    }
+
+    #[test]
+    fn widths_follow_target_word_size() {
+        // The same function decodes its register-derived return value as 32-bit
+        // on x86 and 64-bit on x86-64 — registers are the target word width.
+        let make = || {
+            make_mlil_func(vec![
+                MlilInst {
+                    address: 0x1000,
+                    stmts: vec![MlilStmt::Assign {
+                        dest: SsaVar {
+                            name: "eax".into(),
+                            version: 1,
+                        },
+                        src: MlilExpr::Const(42),
+                    }],
+                },
+                MlilInst {
+                    address: 0x1004,
+                    stmts: vec![MlilStmt::Return],
+                },
+            ])
+        };
+        assert_eq!(
+            detect_return_type(&make(), crate::arch::Architecture::X86),
+            "int32_t"
+        );
+        assert_eq!(
+            detect_return_type(&make(), crate::arch::Architecture::X86_64),
+            "int64_t"
+        );
+    }
+
+    #[test]
+    fn detect_params_default_to_word_type() {
+        // ecx is read before being written -> a parameter, sized by the word.
+        let func = make_mlil_func(vec![
+            MlilInst {
+                address: 0x1000,
+                stmts: vec![MlilStmt::Assign {
+                    dest: SsaVar {
+                        name: "eax".into(),
+                        version: 1,
+                    },
+                    src: MlilExpr::Var(SsaVar {
+                        name: "ecx".into(),
+                        version: 0,
+                    }),
+                }],
+            },
+            MlilInst {
+                address: 0x1004,
+                stmts: vec![MlilStmt::Return],
+            },
+        ]);
+        let params = detect_parameters(&func, crate::arch::Architecture::X86);
+        assert_eq!(params.len(), 1, "expected 1 param, got {:?}", params);
+        assert_eq!(params[0], ("int32_t".to_string(), "arg1".to_string()));
     }
 
     #[test]
