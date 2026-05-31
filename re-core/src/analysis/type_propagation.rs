@@ -4,8 +4,8 @@ use crate::analysis::xrefs::{XrefManager, XrefType};
 use crate::arch::Architecture;
 use crate::debuginfo::DebugInfo;
 use crate::disasm::Disassembler;
-use crate::il::mlil::{MlilFunction, apply_ssa, lower_to_mlil};
-use crate::il::ssa::{DefUse, model_call_effects};
+use crate::il::mlil::{MlilExpr, MlilFunction, MlilStmt, apply_ssa, lower_to_mlil};
+use crate::il::ssa::{DefUse, Site, model_call_effects};
 use crate::loader::{BinaryFormat, Import};
 use crate::memory::MemoryMap;
 use crate::typelib::TypeLibraryManager;
@@ -182,27 +182,114 @@ impl<'a> TypePropagator<'a> {
             }
         }
 
-        // === Pass 3: Backward propagation ===
-        // If a function is called and its return value is passed to another
-        // function with a known signature, we can infer the return type.
-        for &addr in self.functions.functions.keys() {
+        // === Pass 3: Backward return-type inference (IL-based) ===
+        // When an untyped function's return value flows into a typed callee's
+        // argument, that argument's type is the untyped function's return type.
+        // Requires per-function IL (`with_il`); a no-op otherwise.
+        for (addr, ret_type) in self.infer_return_types(&result) {
             if result
                 .get(&addr)
                 .and_then(|i| i.signature.as_ref())
                 .is_some()
             {
-                continue; // Already has a signature
+                continue; // never override a seeded/forward signature
             }
-
-            // Look at where this function's return value is used
-            if let Some(from_xrefs) = self.xrefs.from_address_xrefs.get(&addr) {
-                // Not easily done without IL analysis — skip for now
-                // This is a placeholder for future IL-based backward propagation
-                let _ = from_xrefs;
-            }
+            let name = self
+                .functions
+                .functions
+                .get(&addr)
+                .map(|f| f.name.clone())
+                .unwrap_or_else(|| format!("sub_{:x}", addr));
+            result.entry(addr).or_default().signature = Some(FunctionSignature {
+                name,
+                return_type: ret_type,
+                parameters: Vec::new(),
+                calling_convention: String::new(),
+                is_variadic: false,
+            });
         }
 
         result
+    }
+
+    /// Backward return-type inference over the attached IL.
+    ///
+    /// For each caller's IL, find the pattern `g_ret = call G; arg = g_ret;
+    /// call H(arg, …)` where `H` already has a signature: the return value of
+    /// the (untyped) `G` is passed into a typed parameter of `H`, so `G`'s
+    /// return type is that parameter's type. Candidates are unified across all
+    /// call sites — a value is committed only when every site agrees.
+    ///
+    /// Uses [`DefUse::reaching_def`], a single-path approximation, so the
+    /// cross-site unification is the safeguard against control-flow surprises.
+    fn infer_return_types(
+        &self,
+        result: &BTreeMap<u64, FunctionTypeInfo>,
+    ) -> BTreeMap<u64, TypeRef> {
+        let Some(il_map) = self.il else {
+            return BTreeMap::new();
+        };
+        let mut candidates: BTreeMap<u64, Vec<TypeRef>> = BTreeMap::new();
+
+        for il in il_map.values() {
+            let ret_reg = il.abi.ret_reg;
+            let arg_regs = il.abi.arg_regs;
+            for (inst_index, inst) in il.mlil.instructions.iter().enumerate() {
+                for (stmt_index, stmt) in inst.stmts.iter().enumerate() {
+                    // A call to a function H that already has a signature.
+                    let Some(h_addr) = call_target(stmt) else {
+                        continue;
+                    };
+                    let Some(h_sig) = result.get(&h_addr).and_then(|i| i.signature.as_ref()) else {
+                        continue;
+                    };
+                    let call_site = Site {
+                        inst_index,
+                        stmt_index,
+                        address: inst.address,
+                    };
+                    for (k, param) in h_sig.parameters.iter().enumerate() {
+                        let Some(&arg_reg) = arg_regs.get(k) else {
+                            break; // beyond register-passed arguments
+                        };
+                        // The value in arg_reg at this call came from a copy of
+                        // the return register, which was defined by a call to G.
+                        let Some(def_site) = il.defuse.reaching_def(arg_reg, call_site) else {
+                            continue;
+                        };
+                        if !is_copy_from(stmt_at(il, def_site), arg_reg, ret_reg) {
+                            continue;
+                        }
+                        let Some(call_g_site) = il.defuse.reaching_def(ret_reg, def_site) else {
+                            continue;
+                        };
+                        if let Some(g_addr) = call_defining(stmt_at(il, call_g_site), ret_reg) {
+                            candidates
+                                .entry(g_addr)
+                                .or_default()
+                                .push(param.type_ref.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Commit only callees that are untyped and whose evidence is unanimous.
+        let mut inferred = BTreeMap::new();
+        for (g_addr, types) in candidates {
+            if result
+                .get(&g_addr)
+                .and_then(|i| i.signature.as_ref())
+                .is_some()
+            {
+                continue;
+            }
+            let first = &types[0];
+            if types.iter().all(|t| t == first) {
+                inferred.insert(g_addr, first.clone());
+            }
+        }
+        inferred
     }
 
     /// Find the import name for a given address, if any.
@@ -229,6 +316,48 @@ impl<'a> TypePropagator<'a> {
         }
         None
     }
+}
+
+/// The statement at `site` within a function's IL.
+fn stmt_at(il: &FunctionIl, site: Site) -> Option<&MlilStmt> {
+    il.mlil
+        .instructions
+        .get(site.inst_index)?
+        .stmts
+        .get(site.stmt_index)
+}
+
+/// If `stmt` is a (modelled) call to a direct target, return that address.
+/// Calls are `Assign { src: Call { target: Const(addr), .. }, .. }` after
+/// [`model_call_effects`].
+fn call_target(stmt: &MlilStmt) -> Option<u64> {
+    if let MlilStmt::Assign { src, .. } = stmt
+        && let MlilExpr::Call { target, .. } = src
+        && let MlilExpr::Const(addr) = target.as_ref()
+    {
+        return Some(*addr);
+    }
+    None
+}
+
+/// If `stmt` is a direct call that defines `ret_reg`, return the call target.
+fn call_defining(stmt: Option<&MlilStmt>, ret_reg: &str) -> Option<u64> {
+    let stmt = stmt?;
+    if let MlilStmt::Assign { dest, .. } = stmt
+        && dest.name == ret_reg
+    {
+        return call_target(stmt);
+    }
+    None
+}
+
+/// Whether `stmt` is `dest_reg = src_reg` (a plain register copy).
+fn is_copy_from(stmt: Option<&MlilStmt>, dest_reg: &str, src_reg: &str) -> bool {
+    matches!(
+        stmt,
+        Some(MlilStmt::Assign { dest, src: MlilExpr::Var(v) })
+            if dest.name == dest_reg && v.name == src_reg
+    )
 }
 
 #[cfg(test)]
@@ -457,5 +586,106 @@ mod tests {
             TypePropagator::new(&functions, &xrefs, &type_libs, &imports).with_il(&il_map);
         assert!(propagator.function_il(0x1000).is_some());
         assert!(propagator.function_il(0x9999).is_none());
+    }
+
+    #[test]
+    fn backward_infers_return_type_from_typed_arg() {
+        use crate::analysis::abi::abi_registers;
+        use crate::analysis::functions::CallingConvention;
+        use crate::arch::Architecture;
+        use crate::il::mlil::{MlilExpr, MlilInst, MlilStmt, SsaVar};
+        use crate::il::ssa::DefUse;
+
+        let var = |n: &str| SsaVar {
+            name: n.to_string(),
+            version: 0,
+        };
+        let call = |addr: u64, args: Vec<MlilExpr>| MlilExpr::Call {
+            target: Box::new(MlilExpr::Const(addr)),
+            args,
+        };
+
+        // Caller C @0x1000:
+        //   rax = G()        ; G @0x4000 (untyped)
+        //   rdi = rax        ; move return value into the first arg register
+        //   rax = H(rdi)     ; H @0x5000 (typed: param0 = char*)
+        let mlil = MlilFunction {
+            name: "C".to_string(),
+            entry: 0x1000,
+            instructions: vec![
+                MlilInst {
+                    address: 0x1000,
+                    stmts: vec![MlilStmt::Assign {
+                        dest: var("rax"),
+                        src: call(0x4000, vec![]),
+                    }],
+                },
+                MlilInst {
+                    address: 0x1004,
+                    stmts: vec![MlilStmt::Assign {
+                        dest: var("rdi"),
+                        src: MlilExpr::Var(var("rax")),
+                    }],
+                },
+                MlilInst {
+                    address: 0x1008,
+                    stmts: vec![MlilStmt::Assign {
+                        dest: var("rax"),
+                        src: call(0x5000, vec![MlilExpr::Var(var("rdi"))]),
+                    }],
+                },
+            ],
+        };
+        let abi = abi_registers(
+            Architecture::X86_64,
+            CallingConvention::SysVAmd64,
+            BinaryFormat::Elf,
+        )
+        .unwrap();
+        let defuse = DefUse::build(&mlil);
+        let mut il_map = BTreeMap::new();
+        il_map.insert(0x1000, FunctionIl { mlil, defuse, abi });
+
+        let mut functions = FunctionManager::default();
+        for (a, name) in [(0x1000u64, "C"), (0x4000, "sub_4000"), (0x5000, "use_str")] {
+            functions.add_function(Function {
+                name: name.to_string(),
+                start_address: a,
+                end_address: None,
+                calling_convention: CallingConvention::SysVAmd64,
+                stack_frame_size: 0,
+            });
+        }
+        let xrefs = XrefManager::new();
+        let type_libs = TypeLibraryManager::default();
+        let imports: Vec<Import> = vec![];
+
+        let char_ptr = TypeRef::Pointer(Box::new(TypeRef::Primitive(PrimitiveType::Char)));
+        let mut debug_info = DebugInfo::default();
+        debug_info.function_signatures.insert(
+            0x5000,
+            FunctionSignature {
+                name: "use_str".to_string(),
+                return_type: TypeRef::Primitive(PrimitiveType::I32),
+                parameters: vec![FunctionParameter {
+                    name: "s".to_string(),
+                    type_ref: char_ptr.clone(),
+                }],
+                calling_convention: String::new(),
+                is_variadic: false,
+            },
+        );
+        let types = TypeManager::default();
+
+        let propagator =
+            TypePropagator::new(&functions, &xrefs, &type_libs, &imports).with_il(&il_map);
+        let result = propagator.propagate(&debug_info, &types);
+
+        let g = result
+            .get(&0x4000)
+            .and_then(|i| i.signature.as_ref())
+            .expect("G's return type should be inferred from the typed argument");
+        assert_eq!(g.return_type, char_ptr);
+        assert_eq!(g.name, "sub_4000");
     }
 }

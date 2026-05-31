@@ -8,7 +8,7 @@ use std::sync::{
 use crate::Result;
 use crate::analysis::passes::{HeuristicNamePass, SignaturePass, SuspiciousNamePass};
 use crate::analysis::struct_inference::StructInferencePass;
-use crate::analysis::type_propagation::TypePropagator;
+use crate::analysis::type_propagation::{FunctionIl, TypePropagator};
 use crate::arch::Architecture;
 use crate::debuginfo;
 use crate::disasm::Disassembler;
@@ -388,12 +388,27 @@ fn analyze_loaded_with_bytes(
     if config.type_propagation {
         check_cancelled(cancellation)?;
         on_progress(AnalysisStage::TypePropagation);
+        // Lift each function to IL (with call ABI effects + def-use) so the
+        // propagator can run backward inference across calls. Cancellation-aware;
+        // functions whose arch ABI is unmodelled or that fail to lift are skipped.
+        let mut il_map = std::collections::BTreeMap::new();
+        if let Some(ref d) = disasm {
+            for func in project.functions.functions.values() {
+                check_cancelled(cancellation)?;
+                if let Some(il) =
+                    FunctionIl::build(&project.memory_map, d, loaded.arch, loaded.format, func)
+                {
+                    il_map.insert(func.start_address, il);
+                }
+            }
+        }
         let propagator = TypePropagator::new(
             &project.functions,
             &project.xrefs,
             &project.type_libs,
             &project.imports,
-        );
+        )
+        .with_il(&il_map);
         let type_info = propagator.propagate(&debug_info, &project.types);
         for (&addr, info) in &type_info {
             if let Some(ref sig) = info.signature {
