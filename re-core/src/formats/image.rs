@@ -1,5 +1,18 @@
 use std::collections::HashMap;
 
+/// Upper bound on a single decoded-image buffer, so a malformed header cannot
+/// drive a huge allocation (16384×16384 RGBA would be ~1 GB; this caps it).
+const MAX_IMAGE_BYTES: u64 = 128 * 1024 * 1024;
+
+/// RGBA byte length for `width`×`height`, rejecting empty or oversized images.
+fn rgba_len(width: u32, height: u32) -> Result<usize, String> {
+    let bytes = (width as u64) * (height as u64) * 4;
+    if bytes == 0 || bytes > MAX_IMAGE_BYTES {
+        return Err(format!("image dimensions too large: {width}x{height}"));
+    }
+    Ok(bytes as usize)
+}
+
 /// A decoded image ready for display.
 #[derive(Debug, Clone)]
 pub struct DecodedImage {
@@ -103,7 +116,7 @@ impl ImageDecoder for BmpDecoder {
             return Err(format!("Invalid BMP height: {}", height));
         }
 
-        let mut pixels = vec![0u8; (width * height * 4) as usize];
+        let mut pixels = vec![0u8; rgba_len(width, height)?];
         let row_size = ((bits_per_pixel as u32 * width).div_ceil(32) * 4) as usize;
 
         match bits_per_pixel {
@@ -230,7 +243,7 @@ impl ImageDecoder for TgaDecoder {
         }
         let top_to_bottom = (descriptor & 0x20) != 0;
 
-        let mut pixels = vec![0u8; (width * height * 4) as usize];
+        let mut pixels = vec![0u8; rgba_len(width, height)?];
         for y in 0..height {
             let dst_y = if top_to_bottom { y } else { height - 1 - y };
             for x in 0..width {
@@ -303,8 +316,13 @@ impl ImageDecoder for PcxDecoder {
             return Err(format!("Unsupported PCX bpp: {}", bpp));
         }
 
-        // Decode RLE pixel data
-        let mut indices = vec![0u8; (height as usize) * bytes_per_line];
+        // Decode RLE pixel data. Cap the scanline buffer (height × bytes_per_line)
+        // so a malformed bytes_per_line can't drive a huge allocation.
+        let index_len = (height as u64) * (bytes_per_line as u64);
+        if index_len > MAX_IMAGE_BYTES {
+            return Err("PCX scanline buffer too large".to_string());
+        }
+        let mut indices = vec![0u8; index_len as usize];
         let mut src = 128usize;
         let mut dst = 0usize;
 
@@ -347,7 +365,7 @@ impl ImageDecoder for PcxDecoder {
             }
         }
 
-        let mut pixels = vec![0u8; (width * height * 4) as usize];
+        let mut pixels = vec![0u8; rgba_len(width, height)?];
         for y in 0..height {
             for x in 0..width {
                 // Guard the row index: a malformed `bytes_per_line` smaller than
@@ -417,6 +435,31 @@ mod tests {
         data[0] = 0x0A;
         data[3] = 8;
         data[4..6].copy_from_slice(&10u16.to_le_bytes()); // xmin = 10, xmax = 0
+        assert!(d.decode(&data).is_err());
+    }
+
+    #[test]
+    fn bmp_rejects_oversized_dimensions() {
+        // 16384×16384 passes the per-dimension cap but the RGBA buffer (~1 GB)
+        // must be rejected rather than allocated.
+        let d = BmpDecoder;
+        let mut data = vec![0u8; 54];
+        data[18..22].copy_from_slice(&16384i32.to_le_bytes());
+        data[22..26].copy_from_slice(&16384i32.to_le_bytes());
+        data[28..30].copy_from_slice(&24u16.to_le_bytes());
+        let err = d.decode(&data).unwrap_err();
+        assert!(err.contains("too large"), "got: {err}");
+    }
+
+    #[test]
+    fn pcx_rejects_oversized_scanline_buffer() {
+        // height 16384 × bytes_per_line 65535 ≈ 1 GB scanline buffer → reject.
+        let d = PcxDecoder;
+        let mut data = vec![0u8; 130];
+        data[0] = 0x0A;
+        data[3] = 8;
+        data[10..12].copy_from_slice(&16383u16.to_le_bytes()); // ymax → height 16384
+        data[68..70].copy_from_slice(&65535u16.to_le_bytes()); // bytes_per_line
         assert!(d.decode(&data).is_err());
     }
 

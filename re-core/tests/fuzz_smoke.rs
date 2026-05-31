@@ -44,12 +44,7 @@ fn exercise(data: &[u8]) {
     }
 }
 
-// `#[ignore]`: this sweep is intentionally heavy (some crafted headers drive
-// large-but-bounded allocations in the loaders/decoders), so it is excluded
-// from the default `cargo test` and run on demand with
-// `cargo test -p re-core --test fuzz_smoke -- --ignored`.
 #[test]
-#[ignore = "slow fuzz sweep; run explicitly with --ignored"]
 fn parsers_never_panic_on_random_or_mutated_input() {
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
 
@@ -64,7 +59,7 @@ fn parsers_never_panic_on_random_or_mutated_input() {
         &[0x4C, 0x4F, 0x44, 0x00], // "LOD\0"
     ];
 
-    for _ in 0..1000 {
+    for _ in 0..4000 {
         // (1) Pure random buffer of random length.
         let len = rng.below(512);
         let random: Vec<u8> = (0..len).map(|_| rng.byte()).collect();

@@ -235,12 +235,16 @@ fn detect_elf_endianness(elf: &elf::Elf) -> Endianness {
 
 /// Maximum virtual segment size we'll allocate (256 MB).
 const MAX_SEGMENT_SIZE: u64 = 256 * 1024 * 1024;
+/// Cumulative allocation cap across all of a binary's segments, so that many
+/// individually-capped segments still can't exhaust memory on a crafted file.
+const MAX_TOTAL_SEGMENT_SIZE: u64 = 1024 * 1024 * 1024;
 
 fn load_elf(elf: elf::Elf, bytes: &[u8]) -> Result<LoadedBinary> {
     let arch = detect_elf_arch(&elf)?;
     let endianness = detect_elf_endianness(&elf);
     let mut memory_map = MemoryMap::default();
 
+    let mut total_allocated: u64 = 0;
     for header in elf.program_headers.iter() {
         if header.p_type == elf::program_header::PT_LOAD {
             let mut perms = Permissions::empty();
@@ -266,6 +270,12 @@ fn load_elf(elf: elf::Elf, bytes: &[u8]) -> Result<LoadedBinary> {
                 )));
             }
 
+            total_allocated = total_allocated.saturating_add(size);
+            if total_allocated > MAX_TOTAL_SEGMENT_SIZE {
+                return Err(Error::Loader(
+                    "ELF total segment allocation exceeds limit".into(),
+                ));
+            }
             let mut data = vec![0u8; size as usize];
             let end_offset = file_offset.saturating_add(file_size);
             if end_offset <= bytes.len() {
@@ -306,6 +316,7 @@ fn load_pe(pe: pe::PE, bytes: &[u8]) -> Result<LoadedBinary> {
     let mut memory_map = MemoryMap::default();
     let image_base = pe.image_base;
 
+    let mut total_allocated: u64 = 0;
     for section in pe.sections.iter() {
         let mut perms = Permissions::empty();
         let characteristics = section.characteristics;
@@ -330,6 +341,12 @@ fn load_pe(pe: pe::PE, bytes: &[u8]) -> Result<LoadedBinary> {
                 "PE section at 0x{:x} has size 0x{:x} exceeding limit",
                 start, buf_size,
             )));
+        }
+        total_allocated = total_allocated.saturating_add(buf_size as u64);
+        if total_allocated > MAX_TOTAL_SEGMENT_SIZE {
+            return Err(Error::Loader(
+                "PE total section allocation exceeds limit".into(),
+            ));
         }
         let mut buffer = vec![0u8; buf_size];
 
@@ -462,6 +479,7 @@ fn load_macho_single(macho: mach::MachO, bytes: &[u8]) -> Result<LoadedBinary> {
     let mut memory_map = MemoryMap::default();
 
     // Load segments from load commands
+    let mut total_allocated: u64 = 0;
     for seg in &macho.segments {
         let name = seg.name().unwrap_or("unknown").to_string();
         let vm_addr = seg.vmaddr;
@@ -492,6 +510,12 @@ fn load_macho_single(macho: mach::MachO, bytes: &[u8]) -> Result<LoadedBinary> {
             )));
         }
 
+        total_allocated = total_allocated.saturating_add(vm_size);
+        if total_allocated > MAX_TOTAL_SEGMENT_SIZE {
+            return Err(Error::Loader(
+                "Mach-O total segment allocation exceeds limit".into(),
+            ));
+        }
         let mut data = vec![0u8; vm_size as usize];
         let copy_size = file_size.min(bytes.len().saturating_sub(file_off));
         if copy_size > 0 && file_off < bytes.len() {
