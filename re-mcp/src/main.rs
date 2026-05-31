@@ -153,7 +153,12 @@ fn collect_ssa_vars(func: &re_core::il::mlil::MlilFunction) -> Vec<serde_json::V
                     walk_expr(cond, inst.address, &mut map);
                     walk_expr(target, inst.address, &mut map);
                 }
-                MlilStmt::Call { target } => walk_expr(target, inst.address, &mut map),
+                MlilStmt::Call { target, args } => {
+                    walk_expr(target, inst.address, &mut map);
+                    for a in args {
+                        walk_expr(a, inst.address, &mut map);
+                    }
+                }
                 MlilStmt::Return | MlilStmt::Nop => {}
             }
         }

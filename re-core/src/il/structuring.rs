@@ -84,7 +84,9 @@ fn mlil_uses_vector_ops(mlil: &MlilFunction) -> bool {
                 MlilStmt::BranchIf { cond, target } => {
                     expr_has_vector(cond) || expr_has_vector(target)
                 }
-                MlilStmt::Call { target } => expr_has_vector(target),
+                MlilStmt::Call { target, args } => {
+                    expr_has_vector(target) || args.iter().any(expr_has_vector)
+                }
                 _ => false,
             };
             if hit {
@@ -266,7 +268,13 @@ fn collect_reads_from_stmt(stmt: &MlilStmt) -> Vec<String> {
             reads
         }
         MlilStmt::Jump { target } => collect_reads_from_expr(target),
-        MlilStmt::Call { target } => collect_reads_from_expr(target),
+        MlilStmt::Call { target, args } => {
+            let mut reads = collect_reads_from_expr(target);
+            for a in args {
+                reads.extend(collect_reads_from_expr(a));
+            }
+            reads
+        }
         MlilStmt::Return | MlilStmt::Nop => vec![],
     }
 }
@@ -1999,10 +2007,10 @@ fn lower_mlil_stmts(
                     value: hlil::mlil_to_hlil_expr(value),
                 });
             }
-            MlilStmt::Call { target } => {
+            MlilStmt::Call { target, args } => {
                 result.push(HlilStmt::Expr(HlilExpr::Call {
                     target: Box::new(hlil::mlil_to_hlil_expr(target)),
-                    args: vec![],
+                    args: args.iter().map(hlil::mlil_to_hlil_expr).collect(),
                 }));
             }
             MlilStmt::Return => {
@@ -2062,7 +2070,7 @@ pub fn decompile(
     let mut mlil = crate::il::mlil::lower_to_mlil(&llil);
     crate::il::mlil::apply_ssa(&mut mlil);
     crate::il::mlil::eliminate_dead_stores(&mut mlil);
-    crate::il::mlil::eliminate_callee_saved_spills(&mut mlil);
+    crate::il::mlil::reconstruct_stack_operations(&mut mlil);
 
     let (mut info, stack_map) =
         analyze_function_signature(&mlil, instructions, arch, symbols, type_info, types);
@@ -2786,6 +2794,7 @@ mod tests {
                 stmts: vec![
                     MlilStmt::Call {
                         target: MlilExpr::Const(0x2000),
+                        args: vec![],
                     },
                     MlilStmt::Assign {
                         dest: SsaVar {

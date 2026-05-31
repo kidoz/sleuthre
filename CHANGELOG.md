@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **Decompiler quality on 32-bit x86.** Conditional branches are folded back into
+  relational expressions (`cmp a,b; jl` → `a < b`; `test eax,eax; je` → `eax == 0`)
+  instead of leaking opaque `flag_*` pseudo-variables. Registers, parameters, and
+  return values are typed by the target word size (`int32_t` on 32-bit) rather
+  than always `int64_t`, and a bare integer literal no longer forces `uint64_t`.
+  A LIFO stack simulation reconstructs stack operations: callee-saved
+  save/restore boilerplate is elided (removing the `*(sp - 8) = ...` prologue
+  noise and its uninitialized reads), `push x; pop reg` materialization folds to
+  `reg = x`, and stack-passed (cdecl/stdcall) call arguments are recovered so
+  calls render as `f(a, b, c)` instead of orphaned `push` statements.
+
 ## [0.6.0] - 2026-05-31
 
 ### Added

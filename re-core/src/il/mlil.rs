@@ -77,6 +77,10 @@ pub enum MlilStmt {
     },
     Call {
         target: MlilExpr,
+        /// Reconstructed call arguments in left-to-right source order. Empty
+        /// until [`reconstruct_stack_operations`] runs (e.g. stack-passed cdecl
+        /// arguments recovered from the preceding `push` sequence).
+        args: Vec<MlilExpr>,
     },
     Return,
     Nop,
@@ -275,6 +279,7 @@ pub fn lower_to_mlil(llil_func: &LlilFunction) -> MlilFunction {
                 LlilStmt::Call { target } => {
                     stmts.push(MlilStmt::Call {
                         target: lower_expr(llil_func, *target),
+                        args: Vec::new(),
                     });
                 }
                 LlilStmt::Return => stmts.push(MlilStmt::Return),
@@ -455,14 +460,27 @@ fn collect_used_vars_stmt(stmt: &MlilStmt, used: &mut std::collections::HashSet<
             collect_used_vars_expr(cond, used);
             collect_used_vars_expr(target, used);
         }
-        MlilStmt::Call { target } => collect_used_vars_expr(target, used),
+        MlilStmt::Call { target, args } => {
+            collect_used_vars_expr(target, used);
+            for a in args {
+                collect_used_vars_expr(a, used);
+            }
+        }
         MlilStmt::Return | MlilStmt::Nop => {}
     }
 }
 
-/// Names of the stack and frame pointer registers across the x86 family.
+/// Names of the stack and frame pointer registers across the x86 family. Used
+/// for *addressing* (`[ebp - 8]` is stack-relative).
 fn is_stack_or_frame_pointer(name: &str) -> bool {
     matches!(name, "rsp" | "esp" | "sp" | "rbp" | "ebp" | "bp")
+}
+
+/// The actual stack pointer (never the frame pointer). `push`/`pop` adjust this,
+/// so detecting their mechanics — and distinguishing a `pop ebp` (ebp is a
+/// general/frame register here) from a stack-pointer update — must use this.
+fn is_stack_pointer(name: &str) -> bool {
+    matches!(name, "rsp" | "esp" | "sp" | "spl")
 }
 
 /// Whether `name` is a callee-saved general-purpose register on the x86 family
@@ -515,52 +533,240 @@ fn is_stack_relative_addr(addr: &MlilExpr) -> bool {
 /// deliberately narrow so it never matches a real frame-relative local load.
 fn is_pop_load(src: &MlilExpr) -> bool {
     matches!(src, MlilExpr::Load { addr, .. }
-        if matches!(&**addr, MlilExpr::Var(v) if is_stack_or_frame_pointer(&v.name)))
+        if matches!(&**addr, MlilExpr::Var(v) if is_stack_pointer(&v.name)))
 }
 
-/// Remove callee-saved register spill boilerplate: prologue saves
-/// (`*(sp - k) = reg` for the register's *incoming* value) and the matching
-/// epilogue restores (`reg = *(sp)`).
+/// If `inst` is a `pop reg` — a load of the top-of-stack into `reg` paired with
+/// a stack-pointer increment — return the destination register name.
+fn pop_target(inst: &MlilInst) -> Option<String> {
+    let mut dest_reg: Option<String> = None;
+    let mut increments_sp = false;
+    for stmt in &inst.stmts {
+        match stmt {
+            MlilStmt::Assign { dest, src } if is_pop_load(src) && !is_stack_pointer(&dest.name) => {
+                dest_reg = Some(dest.name.clone());
+            }
+            MlilStmt::Assign {
+                dest,
+                src:
+                    MlilExpr::BinOp {
+                        op: BinOp::Add,
+                        left,
+                        ..
+                    },
+            } if is_stack_pointer(&dest.name) && is_stack_pointer_var(left) => {
+                increments_sp = true;
+            }
+            _ => {}
+        }
+    }
+    if increments_sp { dest_reg } else { None }
+}
+
+/// Whether `expr` is a bare stack-pointer register read (for `sp ± k` detection).
+fn is_stack_pointer_var(expr: &MlilExpr) -> bool {
+    matches!(expr, MlilExpr::Var(v) if is_stack_pointer(&v.name))
+}
+
+/// If `inst` is a `push` — a stack-pointer decrement paired with a store to the
+/// decremented slot — return the pushed value. The decrement gate distinguishes
+/// a real push from an ordinary frame-relative store (`mov [ebp-8], eax`).
+fn push_value(inst: &MlilInst) -> Option<MlilExpr> {
+    let mut decrements_sp = false;
+    let mut stored: Option<MlilExpr> = None;
+    for stmt in &inst.stmts {
+        match stmt {
+            MlilStmt::Assign {
+                dest,
+                src:
+                    MlilExpr::BinOp {
+                        op: BinOp::Sub,
+                        left,
+                        ..
+                    },
+            } if is_stack_pointer(&dest.name) && is_stack_pointer_var(left) => {
+                decrements_sp = true;
+            }
+            MlilStmt::Store { addr, value, .. } if is_stack_relative_addr(addr) => {
+                stored = Some(value.clone());
+            }
+            _ => {}
+        }
+    }
+    if decrements_sp { stored } else { None }
+}
+
+/// Whether `inst` is a caller-side stack cleanup (`add esp, N`) — a stack
+/// pointer increment by a constant, emitted after a cdecl call to pop arguments.
+fn is_sp_cleanup(inst: &MlilInst) -> bool {
+    inst.stmts.iter().all(|stmt| {
+        matches!(stmt, MlilStmt::Assign { dest, src: MlilExpr::BinOp { op: BinOp::Add, left, right } }
+            if is_stack_pointer(&dest.name)
+                && is_stack_pointer_var(left)
+                && matches!(&**right, MlilExpr::Const(_)))
+    }) && !inst.stmts.is_empty()
+}
+
+/// Index of the first `Call` statement in `inst`, if any.
+fn call_stmt_index(inst: &MlilInst) -> Option<usize> {
+    inst.stmts
+        .iter()
+        .position(|s| matches!(s, MlilStmt::Call { .. }))
+}
+
+/// A pending `push` during the stack simulation.
+struct PushedItem {
+    /// Instruction index of the push.
+    inst: usize,
+    /// The value pushed.
+    value: MlilExpr,
+    /// `Some(reg)` if this is a prologue save of callee-saved register `reg`'s
+    /// incoming value (eligible to be elided against a matching restore).
+    save_reg: Option<String>,
+}
+
+/// Reconstruct x86 stack operations by simulating the push/pop stack, turning
+/// the implicit stack discipline into explicit data flow. In one LIFO pass this:
 ///
-/// For decompiler output this is semantics-preserving: preserving caller
-/// registers is an ABI/codegen obligation with no bearing on the function's
-/// logic, so the save/restore churn is pure noise (and the saved value reads as
-/// an uninitialized register otherwise). The save is gated on the register not
-/// having been defined yet, so a genuine mid-function spill of a *computed*
-/// value into a stack local is left untouched.
-pub fn eliminate_callee_saved_spills(func: &mut MlilFunction) {
+/// - **elides callee-saved save/restore pairs** — a prologue `push reg` of the
+///   register's incoming value balanced by an epilogue `pop reg` (preserving
+///   caller registers is an ABI obligation, not part of the function's logic);
+/// - **folds `push x; pop reg` into `reg = x`** — the constant/value
+///   materialization idiom (e.g. `push 3; pop ebp`);
+/// - **recovers stack-passed call arguments** — cdecl/stdcall arguments pushed
+///   right-to-left before a `call` become its argument list (left-to-right),
+///   and the caller-side `add esp, N` cleanup is dropped.
+///
+/// Register-passed conventions (x86-64) push nothing, so their calls keep empty
+/// argument lists — unchanged. The simulation is per-basic-block: control-flow
+/// statements reset the pending stack so nothing is paired across a branch.
+pub fn reconstruct_stack_operations(func: &mut MlilFunction) {
     use std::collections::HashSet;
 
+    let n = func.instructions.len();
+    let mut remove = vec![false; n];
+    let mut rewrite: Vec<Option<MlilStmt>> = (0..n).map(|_| None).collect();
+    let mut stack: Vec<PushedItem> = Vec::new();
     let mut defined: HashSet<String> = HashSet::new();
-    for inst in &mut func.instructions {
-        inst.stmts.retain(|stmt| match stmt {
-            // Prologue save: store an as-yet-undefined callee-saved register to
-            // a stack slot.
-            MlilStmt::Store {
-                addr,
-                value: MlilExpr::Var(v),
-                ..
-            } if is_stack_relative_addr(addr)
-                && is_callee_saved_register(&v.name)
-                && !defined.contains(&v.name) =>
-            {
-                false
+    let mut expect_cleanup = false;
+
+    for i in 0..n {
+        // A cdecl caller pops arguments with `add esp, N` right after the call.
+        if expect_cleanup {
+            expect_cleanup = false;
+            if is_sp_cleanup(&func.instructions[i]) {
+                remove[i] = true;
+                continue;
             }
-            // Epilogue restore: reload a callee-saved register from the top of
-            // stack (a `pop`).
-            MlilStmt::Assign { dest, src }
-                if is_callee_saved_register(&dest.name) && is_pop_load(src) =>
-            {
-                false
+        }
+
+        if let Some(value) = push_value(&func.instructions[i]) {
+            let save_reg = match &value {
+                MlilExpr::Var(v)
+                    if is_callee_saved_register(&v.name) && !defined.contains(&v.name) =>
+                {
+                    Some(v.name.clone())
+                }
+                _ => None,
+            };
+            stack.push(PushedItem {
+                inst: i,
+                value,
+                save_reg,
+            });
+            continue;
+        }
+
+        if let Some(reg) = pop_target(&func.instructions[i]) {
+            match stack.pop() {
+                Some(item) => {
+                    remove[item.inst] = true; // the matching push is consumed
+                    match &item.save_reg {
+                        // Balanced save/restore of the same register: pure ABI churn.
+                        Some(saved) if *saved == reg => remove[i] = true,
+                        // Otherwise the pop materializes the pushed value: `reg = x`.
+                        _ => {
+                            rewrite[i] = Some(MlilStmt::Assign {
+                                dest: SsaVar {
+                                    name: reg.clone(),
+                                    version: 0,
+                                },
+                                src: item.value,
+                            });
+                            defined.insert(reg);
+                        }
+                    }
+                }
+                // No matching push in view (the prologue save is out of the
+                // decoded window): a `pop` of a callee-saved register is an
+                // epilogue restore — drop it as boilerplate.
+                None if is_callee_saved_register(&reg) => remove[i] = true,
+                None => {}
             }
-            // Any other assignment marks its destination as defined.
-            MlilStmt::Assign { dest, .. } => {
-                defined.insert(dest.name.clone());
-                true
+            continue;
+        }
+
+        if let Some(sidx) = call_stmt_index(&func.instructions[i]) {
+            // Consume the trailing run of non-save pushes as arguments. Stack top
+            // is the last value pushed = the leftmost (first) cdecl argument, so
+            // popping yields left-to-right order directly.
+            let mut args = Vec::new();
+            while let Some(top) = stack.last() {
+                if top.save_reg.is_some() {
+                    break;
+                }
+                let item = stack.pop().unwrap();
+                remove[item.inst] = true;
+                args.push(item.value);
             }
-            _ => true,
-        });
+            if let MlilStmt::Call { args: slot, .. } = &mut func.instructions[i].stmts[sidx] {
+                *slot = args;
+            }
+            expect_cleanup = true;
+            continue;
+        }
+
+        // Track definitions for the incoming-value gate. At a basic-block
+        // boundary, drop pending *data* pushes (args/temporaries are consumed
+        // within a block) but keep prologue register saves — they legitimately
+        // span the whole function and are matched against the epilogue pops.
+        let mut control_flow = false;
+        for stmt in &func.instructions[i].stmts {
+            match stmt {
+                MlilStmt::Assign { dest, .. } => {
+                    defined.insert(dest.name.clone());
+                }
+                MlilStmt::Jump { .. } | MlilStmt::BranchIf { .. } | MlilStmt::Return => {
+                    control_flow = true
+                }
+                _ => {}
+            }
+        }
+        if control_flow {
+            stack.retain(|item| item.save_reg.is_some());
+        }
     }
+
+    // Any prologue saves never matched by a restore — because the epilogue pop is
+    // outside the decoded window — are still ABI boilerplate; elide their stores.
+    for item in &stack {
+        if item.save_reg.is_some() {
+            remove[item.inst] = true;
+        }
+    }
+
+    for (i, stmt) in rewrite.into_iter().enumerate() {
+        if let Some(stmt) = stmt {
+            func.instructions[i].stmts = vec![stmt];
+        }
+    }
+
+    let mut idx = 0;
+    func.instructions.retain(|_| {
+        let keep = !remove[idx];
+        idx += 1;
+        keep
+    });
 }
 
 #[cfg(test)]
@@ -716,8 +922,19 @@ mod tests {
 
     fn lowered(insns: &[crate::disasm::Instruction]) -> MlilFunction {
         let mut m = lower_to_mlil(&lift_function("test", 0x1000, insns));
-        eliminate_callee_saved_spills(&mut m);
+        reconstruct_stack_operations(&mut m);
         m
+    }
+
+    fn first_call_args(f: &MlilFunction) -> Vec<MlilExpr> {
+        f.instructions
+            .iter()
+            .flat_map(|i| &i.stmts)
+            .find_map(|s| match s {
+                MlilStmt::Call { args, .. } => Some(args.clone()),
+                _ => None,
+            })
+            .expect("expected a Call statement")
     }
 
     #[test]
@@ -752,17 +969,60 @@ mod tests {
     }
 
     #[test]
-    fn keeps_constant_argument_push() {
-        // `push 3` is a call argument, not a register save.
+    fn keeps_unconsumed_constant_push() {
+        // A `push 3` with no matching pop or call stays as-is.
         let m = lowered(&[make_insn(0x1000, "push", "3")]);
         assert_eq!(count_stores(&m), 1);
     }
 
     #[test]
-    fn keeps_caller_saved_push() {
-        // eax is caller-saved; pushing it isn't prologue boilerplate.
-        let m = lowered(&[make_insn(0x1000, "push", "eax")]);
-        assert_eq!(count_stores(&m), 1);
+    fn folds_push_immediate_pop_into_assignment() {
+        // `push 3; pop ebp` materializes a constant: `ebp = 3` (no stack store).
+        // This pop must NOT be mistaken for a callee-saved restore.
+        let m = lowered(&[
+            make_insn(0x1000, "push", "3"),
+            make_insn(0x1002, "pop", "ebp"),
+        ]);
+        assert_eq!(count_stores(&m), 0, "the push store should be consumed");
+        let assigns: Vec<_> = m
+            .instructions
+            .iter()
+            .flat_map(|i| &i.stmts)
+            .filter_map(|s| match s {
+                MlilStmt::Assign { dest, src } if dest.name == "ebp" => Some(src.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(assigns, vec![MlilExpr::Const(3)], "expected ebp = 3");
+    }
+
+    #[test]
+    fn reconstructs_cdecl_call_arguments() {
+        // cdecl pushes right-to-left: `push 2; push 1; call f` → f(1, 2).
+        let m = lowered(&[
+            make_insn(0x1000, "push", "2"),
+            make_insn(0x1002, "push", "1"),
+            make_insn(0x1004, "call", "0x2000"),
+        ]);
+        assert_eq!(count_stores(&m), 0, "argument pushes should be consumed");
+        assert_eq!(
+            first_call_args(&m),
+            vec![MlilExpr::Const(1), MlilExpr::Const(2)]
+        );
+    }
+
+    #[test]
+    fn drops_caller_side_argument_cleanup() {
+        // `add esp, 4` after a call pops the pushed argument — pure bookkeeping.
+        let m = lowered(&[
+            make_insn(0x1000, "push", "1"),
+            make_insn(0x1002, "call", "0x2000"),
+            make_insn(0x1007, "add", "esp, 4"),
+        ]);
+        let has_esp_add = m.instructions.iter().flat_map(|i| &i.stmts).any(
+            |s| matches!(s, MlilStmt::Assign { dest, .. } if is_stack_or_frame_pointer(&dest.name)),
+        );
+        assert!(!has_esp_add, "the add esp, 4 cleanup should be removed");
     }
 
     #[test]

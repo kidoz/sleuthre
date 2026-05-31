@@ -32,7 +32,7 @@ use std::collections::HashMap;
 pub fn model_call_effects(func: &mut MlilFunction, arg_regs: &[&str], ret_reg: &str) {
     for inst in &mut func.instructions {
         for stmt in &mut inst.stmts {
-            if let MlilStmt::Call { target } = stmt {
+            if let MlilStmt::Call { target, .. } = stmt {
                 let target = std::mem::replace(target, MlilExpr::Const(0));
                 let args = arg_regs
                     .iter()
@@ -106,7 +106,12 @@ impl DefUse {
                         idx.collect_uses(cond, site);
                         idx.collect_uses(target, site);
                     }
-                    MlilStmt::Call { target } => idx.collect_uses(target, site),
+                    MlilStmt::Call { target, args } => {
+                        idx.collect_uses(target, site);
+                        for a in args {
+                            idx.collect_uses(a, site);
+                        }
+                    }
                     MlilStmt::Return | MlilStmt::Nop => {}
                 }
             }
@@ -236,6 +241,7 @@ mod tests {
                     address: 0x1000,
                     stmts: vec![MlilStmt::Call {
                         target: MlilExpr::Const(0x2000),
+                        args: vec![],
                     }],
                 },
                 MlilInst {
