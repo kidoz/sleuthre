@@ -219,6 +219,30 @@ impl Database {
         Ok(())
     }
 
+    /// Store a small key/value in the `metadata` table (e.g. project arch).
+    pub fn set_metadata(&self, key: &str, value: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES (?1, ?2)",
+                params![key, value],
+            )
+            .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Read a `metadata` value, or `None` if the key is absent.
+    pub fn get_metadata(&self, key: &str) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        self.conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = ?1",
+                params![key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))
+    }
+
     pub fn save_segment(&self, seg: &MemorySegment) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO segments (name, start, size, data, permissions) VALUES (?1, ?2, ?3, ?4, ?5)",

@@ -602,6 +602,18 @@ impl Project {
                 db.save_debug_profile(profile)?;
             }
 
+            // Persist the binary's architecture and format so a reopened project
+            // disassembles/decompiles correctly (otherwise it defaults to x86_64).
+            db.set_metadata(
+                "arch",
+                &serde_json::to_string(&self.arch).map_err(|e| Error::Database(e.to_string()))?,
+            )?;
+            db.set_metadata(
+                "binary_format",
+                &serde_json::to_string(&self.binary_format)
+                    .map_err(|e| Error::Database(e.to_string()))?,
+            )?;
+
             Ok(())
         })();
 
@@ -694,6 +706,19 @@ impl Project {
 
         // Restore debugger profiles.
         project.debug_profiles = db.load_debug_profiles()?;
+
+        // Restore architecture / format (absent in pre-provenance project files,
+        // which keep the defaults).
+        if let Some(v) = db.get_metadata("arch")?
+            && let Ok(arch) = serde_json::from_str(&v)
+        {
+            project.arch = arch;
+        }
+        if let Some(v) = db.get_metadata("binary_format")?
+            && let Ok(format) = serde_json::from_str(&v)
+        {
+            project.binary_format = format;
+        }
 
         project.db = Some(db);
         Ok(project)
@@ -1462,5 +1487,24 @@ mod tests {
         let msg = p.redo().unwrap();
         assert!(msg.contains("Patched"));
         assert_eq!(p.memory_map.get_data(0x1000, 2).unwrap(), &[0xCC, 0xCC]);
+    }
+
+    #[test]
+    fn save_load_preserves_arch_and_format() {
+        use crate::arch::Architecture;
+        use crate::loader::BinaryFormat;
+
+        let path =
+            std::env::temp_dir().join(format!("sleuthre_arch_{}.slre", uuid::Uuid::new_v4()));
+        let mut p = Project::new("t".into(), PathBuf::from("/tmp/t"));
+        // Non-default values: load must not silently fall back to x86_64 / Raw.
+        p.arch = Architecture::Arm64;
+        p.binary_format = BinaryFormat::Elf;
+        p.save(&path).unwrap();
+
+        let loaded = Project::load(&path).unwrap();
+        assert_eq!(loaded.arch, Architecture::Arm64);
+        assert_eq!(loaded.binary_format, BinaryFormat::Elf);
+        let _ = std::fs::remove_file(&path);
     }
 }
