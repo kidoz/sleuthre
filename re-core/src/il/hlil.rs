@@ -138,12 +138,10 @@ impl DecompiledCode {
                 AnnotationKind::Function(addr) => {
                     callees.insert(*addr);
                 }
-                AnnotationKind::Type(name) => {
-                    // Skip plain stdint primitives — they never trigger
-                    // user-driven invalidation.
-                    if !is_primitive_type_name(name) {
-                        types.insert(name.clone());
-                    }
+                // Skip plain stdint primitives — they never trigger
+                // user-driven invalidation.
+                AnnotationKind::Type(name) if !is_primitive_type_name(name) => {
+                    types.insert(name.clone());
                 }
                 _ => {}
             }

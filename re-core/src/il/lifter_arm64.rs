@@ -488,13 +488,10 @@ fn lift_neon_instruction(
             .find(|op| NEON_ARRANGEMENTS.iter().any(|arr| op.contains(arr)))
             .map(|op| parse_neon_arrangement(op))
             .unwrap_or((VectorElementType::Int32, 128))
-    } else if let Some(et_w) = parse_element_index_type(ops) {
-        // Element-index notation: v0.s[2], v0.b[3], etc.
-        et_w
     } else {
-        // For always-NEON instructions without arrangement or index, return
-        // None to let them fall through to Unimplemented.
-        return None;
+        // Element-index notation (e.g. v0.s[2]); always-NEON instructions with
+        // neither an arrangement nor an index fall through to Unimplemented.
+        parse_element_index_type(ops)?
     };
 
     match mnemonic {
