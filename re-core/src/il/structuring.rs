@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use crate::analysis::stack::StackVariable;
 use crate::analysis::type_propagation::FunctionTypeInfo;
 use crate::il::hlil::{self, HlilExpr, HlilStmt};
-use crate::il::mlil::{MlilExpr, MlilFunction, MlilStmt};
+use crate::il::mlil::{MlilExpr, MlilFunction, MlilStmt, SsaVar};
 use crate::types::{PrimitiveType, TypeManager, TypeRef};
 
 /// Information recovered about a function's signature: return type, parameters,
@@ -367,6 +367,68 @@ fn find_return_assign(
 /// Check whether an MLIL expression is a zero constant (from xor reg, reg).
 fn is_zero_const(expr: &MlilExpr) -> bool {
     matches!(expr, MlilExpr::Const(0))
+}
+
+/// Recover register-passed call arguments (x86-64 SysV, ARM64 AAPCS).
+///
+/// At each call with no already-recovered (stack) arguments, takes the maximal
+/// ABI-order prefix of argument registers (`rdi, rsi, …` / `x0, x1, …`) that
+/// were assigned earlier in the same basic block, in their current reaching-def
+/// version. This is the standard first-pass heuristic: without callee prototypes
+/// it can over- or under-count, and it only considers definitions in the call's
+/// own block (reset at branch targets). Must run after [`version_defs_and_uses`]
+/// so the injected argument variables name their reaching definitions.
+fn recover_register_call_args(func: &mut MlilFunction, arch: crate::arch::Architecture) {
+    let arg_regs: &[&str] = match arch {
+        crate::arch::Architecture::X86_64 => X86_64_ARG_REGS,
+        crate::arch::Architecture::Arm64 => ARM64_ARG_REGS,
+        // x86 (cdecl/stdcall) passes on the stack — handled during MLIL stack
+        // reconstruction. Other targets are not modeled here.
+        _ => return,
+    };
+
+    let mut targets: HashSet<u64> = HashSet::new();
+    for inst in &func.instructions {
+        for stmt in &inst.stmts {
+            match stmt {
+                MlilStmt::Jump { target } | MlilStmt::BranchIf { target, .. } => {
+                    if let MlilExpr::Const(a) = target {
+                        targets.insert(*a);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Latest version of each argument register defined in the current block.
+    let mut defined: HashMap<String, u32> = HashMap::new();
+    for inst in &mut func.instructions {
+        if targets.contains(&inst.address) {
+            defined.clear();
+        }
+        for stmt in &mut inst.stmts {
+            match stmt {
+                MlilStmt::Call { args, .. } if args.is_empty() => {
+                    let mut recovered = Vec::new();
+                    for reg in arg_regs {
+                        match defined.get(*reg) {
+                            Some(&version) => recovered.push(MlilExpr::Var(SsaVar {
+                                name: (*reg).to_string(),
+                                version,
+                            })),
+                            None => break,
+                        }
+                    }
+                    *args = recovered;
+                }
+                MlilStmt::Assign { dest, .. } => {
+                    defined.insert(dest.name.clone(), dest.version);
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 /// Recover stack-local variable declarations from raw instructions.
@@ -2121,6 +2183,7 @@ pub fn decompile(
     // version defs and uses together so each use names its reaching definition.
     crate::il::mlil::reconstruct_stack_operations(&mut mlil);
     crate::il::mlil::version_defs_and_uses(&mut mlil);
+    recover_register_call_args(&mut mlil, arch);
     crate::il::mlil::propagate_values(&mut mlil);
     crate::il::mlil::eliminate_dead_stores_ssa(&mut mlil);
 
@@ -2580,6 +2643,65 @@ impl HlilStmt {
 mod tests {
     use super::*;
     use crate::disasm::Instruction;
+
+    #[test]
+    fn recovers_x86_64_register_call_args() {
+        // mov rdi, 5 ; mov rsi, rax ; call 0x2000  →  f(rdi, rsi)
+        let insns = [
+            make_insn(0x1000, "mov", "rdi, 5"),
+            make_insn(0x1005, "mov", "rsi, rax"),
+            make_insn(0x1008, "call", "0x2000"),
+        ];
+        let llil = crate::il::lift_function(crate::arch::Architecture::X86_64, "t", 0x1000, &insns);
+        let mut m = crate::il::mlil::lower_to_mlil(&llil);
+        crate::il::mlil::version_defs_and_uses(&mut m);
+        recover_register_call_args(&mut m, crate::arch::Architecture::X86_64);
+
+        let args = m
+            .instructions
+            .iter()
+            .flat_map(|i| &i.stmts)
+            .find_map(|s| match s {
+                MlilStmt::Call { args, .. } => Some(args.clone()),
+                _ => None,
+            })
+            .expect("a call statement");
+        let names: Vec<&str> = args
+            .iter()
+            .filter_map(|a| match a {
+                MlilExpr::Var(v) => Some(v.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec!["rdi", "rsi"],
+            "two leading arg registers recovered"
+        );
+    }
+
+    #[test]
+    fn register_args_not_recovered_for_x86() {
+        // 32-bit cdecl passes on the stack; this pass must leave x86 calls alone.
+        let insns = [
+            make_insn(0x1000, "mov", "ecx, 5"),
+            make_insn(0x1005, "call", "0x2000"),
+        ];
+        let llil = crate::il::lift_function(crate::arch::Architecture::X86, "t", 0x1000, &insns);
+        let mut m = crate::il::mlil::lower_to_mlil(&llil);
+        crate::il::mlil::version_defs_and_uses(&mut m);
+        recover_register_call_args(&mut m, crate::arch::Architecture::X86);
+        let args = m
+            .instructions
+            .iter()
+            .flat_map(|i| &i.stmts)
+            .find_map(|s| match s {
+                MlilStmt::Call { args, .. } => Some(args.clone()),
+                _ => None,
+            })
+            .expect("a call statement");
+        assert!(args.is_empty(), "x86 register-arg recovery is a no-op");
+    }
 
     #[test]
     fn prune_drops_dead_code_after_return_but_keeps_labeled() {

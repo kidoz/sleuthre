@@ -17,7 +17,9 @@
   versioned to their reaching definition (a redefined register reads its current
   value, not the stale incoming one); constant/copy propagation with constant
   folding and version-aware dead-store elimination collapse register churn; and
-  unreachable code after a `return`/`goto` is pruned.
+  unreachable code after a `return`/`goto` is pruned. Register-passed call
+  arguments are recovered for x86-64 (SysV) and ARM64 (AAPCS), so calls render
+  as `f(a, b)` from the argument registers.
 
 ## [0.6.0] - 2026-05-31
 
