@@ -559,6 +559,20 @@ fn detect_calling_convention(
         }
     }
 
+    // x86 stack-cleanup convention: a `ret <imm>` means the callee pops the
+    // arguments (the stdcall family); a bare `ret` leaves cleanup to the caller
+    // (cdecl). The register heuristic above already promotes ecx/edx-passing
+    // functions to thiscall/fastcall, so only refine the plain cdecl default.
+    if arch == Architecture::X86 && default_cc == CallingConvention::Cdecl {
+        let callee_cleanup = insns.iter().any(|insn| {
+            let mn = insn.mnemonic.to_lowercase();
+            (mn == "ret" || mn == "retn") && !insn.op_str.trim().is_empty()
+        });
+        if callee_cleanup {
+            default_cc = CallingConvention::Stdcall;
+        }
+    }
+
     (default_cc, frame_size)
 }
 
@@ -626,5 +640,41 @@ mod tests {
         assert_eq!(CallingConvention::SysVAmd64.to_string(), "sysv_amd64");
         assert_eq!(CallingConvention::Win64.to_string(), "win64");
         assert_eq!(CallingConvention::ArmAapcs.to_string(), "arm_aapcs");
+    }
+
+    fn detected_cc(code: &[u8], arch: Architecture) -> CallingConvention {
+        use crate::memory::MemorySegment;
+        // detect_calling_convention reads a fixed 100-byte window, so pad past it.
+        let mut data = code.to_vec();
+        data.resize(128, 0x00);
+        let mut map = MemoryMap::default();
+        map.add_segment(MemorySegment {
+            name: "code".to_string(),
+            start: 0x1000,
+            size: data.len() as u64,
+            data,
+            permissions: Permissions::READ | Permissions::EXECUTE,
+        })
+        .unwrap();
+        let disasm = Disassembler::new(arch).unwrap();
+        detect_calling_convention(&map, &disasm, arch, 0x1000).0
+    }
+
+    #[test]
+    fn x86_ret_imm_detected_as_stdcall() {
+        // `ret 8` (C2 08 00): callee pops the arguments → stdcall.
+        assert_eq!(
+            detected_cc(&[0xC2, 0x08, 0x00], Architecture::X86),
+            CallingConvention::Stdcall
+        );
+    }
+
+    #[test]
+    fn x86_plain_ret_stays_cdecl() {
+        // `ret` (C3): caller cleans the stack → cdecl.
+        assert_eq!(
+            detected_cc(&[0xC3], Architecture::X86),
+            CallingConvention::Cdecl
+        );
     }
 }
