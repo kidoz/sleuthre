@@ -280,32 +280,38 @@ pub fn fold_constants(expr: &MlilExpr) -> MlilExpr {
     }
 }
 
-/// Eliminate dead stores: remove assignments to SSA variables that are never read.
+/// Eliminate dead stores: remove assignments to registers that are never read.
+///
+/// Liveness is keyed by register **name**, not by SSA version, because
+/// [`apply_ssa`] versions definitions but does not rename uses (so a use would
+/// never match its versioned definition). Name-keying makes this conservative —
+/// an assignment is removed only when its destination register is read *nowhere*
+/// in the function — which guarantees live code is never deleted (it may retain
+/// some genuinely-dead stores; correctness over aggressiveness).
 pub fn eliminate_dead_stores(func: &mut MlilFunction) {
     use std::collections::HashSet;
 
-    // Phase 1: Collect all SSA vars that are READ
-    let mut used: HashSet<(String, u32)> = HashSet::new();
+    // Phase 1: collect the names of every register that is read.
+    let mut used: HashSet<String> = HashSet::new();
     for inst in &func.instructions {
         for stmt in &inst.stmts {
             collect_used_vars_stmt(stmt, &mut used);
         }
     }
 
-    // Phase 2: Remove assignments to unused vars (but keep side-effectful ones)
+    // Phase 2: drop assignments to never-read registers (keep side-effectful ones).
     for inst in &mut func.instructions {
         inst.stmts.retain(|stmt| {
             if let MlilStmt::Assign { dest, .. } = stmt {
-                // Keep if the dest is used somewhere, or if dest is a "return" register
-                // (rax, eax, x0) since those may be the return value
+                // Keep return registers (may hold the function's return value)…
                 if dest.name == "rax" || dest.name == "eax" || dest.name == "x0" {
                     return true;
                 }
-                // Keep flag assignments (they affect control flow)
+                // …and flag/synthetic registers (affect control flow).
                 if dest.name.starts_with("flag_") || dest.name.starts_with("__") {
                     return true;
                 }
-                used.contains(&(dest.name.clone(), dest.version))
+                used.contains(&dest.name)
             } else {
                 true // keep all non-Assign statements
             }
@@ -313,10 +319,10 @@ pub fn eliminate_dead_stores(func: &mut MlilFunction) {
     }
 }
 
-fn collect_used_vars_expr(expr: &MlilExpr, used: &mut std::collections::HashSet<(String, u32)>) {
+fn collect_used_vars_expr(expr: &MlilExpr, used: &mut std::collections::HashSet<String>) {
     match expr {
         MlilExpr::Var(ssa) => {
-            used.insert((ssa.name.clone(), ssa.version));
+            used.insert(ssa.name.clone());
         }
         MlilExpr::Load { addr, .. } => collect_used_vars_expr(addr, used),
         MlilExpr::BinOp { left, right, .. } => {
@@ -326,7 +332,7 @@ fn collect_used_vars_expr(expr: &MlilExpr, used: &mut std::collections::HashSet<
         MlilExpr::UnaryOp { operand, .. } => collect_used_vars_expr(operand, used),
         MlilExpr::Phi(vars) => {
             for v in vars {
-                used.insert((v.name.clone(), v.version));
+                used.insert(v.name.clone());
             }
         }
         MlilExpr::Call { target, args } => {
@@ -344,7 +350,7 @@ fn collect_used_vars_expr(expr: &MlilExpr, used: &mut std::collections::HashSet<
     }
 }
 
-fn collect_used_vars_stmt(stmt: &MlilStmt, used: &mut std::collections::HashSet<(String, u32)>) {
+fn collect_used_vars_stmt(stmt: &MlilStmt, used: &mut std::collections::HashSet<String>) {
     match stmt {
         MlilStmt::Assign { src, .. } => collect_used_vars_expr(src, used),
         MlilStmt::Store { addr, value, .. } => {
@@ -526,5 +532,40 @@ mod tests {
 
         // Both assignments should be kept: rcx#1 is used by rax#1's source
         assert_eq!(func.instructions[0].stmts.len(), 2);
+    }
+
+    #[test]
+    fn dead_store_elimination_survives_real_ssa_pipeline() {
+        // Regression: `apply_ssa` versions definitions but not uses, so the old
+        // version-keyed liveness deleted live code once run on real lifted IL.
+        // Run the actual pipeline and confirm a live def-use chain through
+        // non-return registers survives.
+        let insns = [
+            make_insn(0x1000, "mov", "rcx, 5"),
+            make_insn(0x1004, "add", "rdx, rcx"), // reads rcx
+            make_insn(0x1008, "mov", "rax, rdx"), // reads rdx (rax is the return reg)
+        ];
+        let llil = lift_function("test", 0x1000, &insns);
+        let mut mlil = lower_to_mlil(&llil);
+        apply_ssa(&mut mlil);
+        eliminate_dead_stores(&mut mlil);
+
+        let assigned: Vec<&str> = mlil
+            .instructions
+            .iter()
+            .flat_map(|i| &i.stmts)
+            .filter_map(|s| match s {
+                MlilStmt::Assign { dest, .. } => Some(dest.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            assigned.contains(&"rcx"),
+            "live rcx assignment was deleted: {assigned:?}"
+        );
+        assert!(
+            assigned.contains(&"rdx"),
+            "live rdx assignment was deleted: {assigned:?}"
+        );
     }
 }
