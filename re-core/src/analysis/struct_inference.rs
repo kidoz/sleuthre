@@ -45,18 +45,7 @@ impl AnalysisPass for StructInferencePass {
                 continue;
             };
 
-            let llil = match self.arch {
-                Architecture::Arm64 => {
-                    crate::il::lifter_arm64::lift_function(&func.name, func.start_address, &insns)
-                }
-                Architecture::Mips | Architecture::Mips64 => {
-                    crate::il::lifter_mips::lift_function(&func.name, func.start_address, &insns)
-                }
-                Architecture::RiscV32 | Architecture::RiscV64 => {
-                    crate::il::lifter_riscv::lift_function(&func.name, func.start_address, &insns)
-                }
-                _ => crate::il::lifter_x86::lift_function(&func.name, func.start_address, &insns),
-            };
+            let llil = crate::il::lift_function(self.arch, &func.name, func.start_address, &insns);
 
             // Analyze LLIL for memory accesses: [reg + offset]
             let mut reg_max_offsets: HashMap<String, u64> = HashMap::new();

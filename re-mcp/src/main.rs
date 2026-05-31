@@ -1056,7 +1056,8 @@ impl McpServer {
                         return json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32002, "message": e.to_string() } });
                     }
                 };
-                let llil = re_core::il::lifter_x86::lift_function(
+                let llil = re_core::il::lift_function(
+                    disasm.arch,
                     &func.name,
                     func.start_address,
                     &instructions,
@@ -1094,7 +1095,8 @@ impl McpServer {
                         return json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32002, "message": e.to_string() } });
                     }
                 };
-                let llil = re_core::il::lifter_x86::lift_function(
+                let llil = re_core::il::lift_function(
+                    disasm.arch,
                     &func.name,
                     func.start_address,
                     &instructions,
@@ -1171,7 +1173,8 @@ impl McpServer {
                         return json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32002, "message": e.to_string() } });
                     }
                 };
-                let llil = re_core::il::lifter_x86::lift_function(
+                let llil = re_core::il::lift_function(
+                    disasm.arch,
                     &func.name,
                     func.start_address,
                     &instructions,

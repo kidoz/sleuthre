@@ -2037,18 +2037,7 @@ pub fn decompile(
             annotations: Vec::new(),
         };
     }
-    let llil = match arch {
-        crate::arch::Architecture::Arm64 => {
-            crate::il::lifter_arm64::lift_function(name, instructions[0].address, instructions)
-        }
-        crate::arch::Architecture::Mips | crate::arch::Architecture::Mips64 => {
-            crate::il::lifter_mips::lift_function(name, instructions[0].address, instructions)
-        }
-        crate::arch::Architecture::RiscV32 | crate::arch::Architecture::RiscV64 => {
-            crate::il::lifter_riscv::lift_function(name, instructions[0].address, instructions)
-        }
-        _ => crate::il::lifter_x86::lift_function(name, instructions[0].address, instructions),
-    };
+    let llil = crate::il::lift_function(arch, name, instructions[0].address, instructions);
     let mut mlil = crate::il::mlil::lower_to_mlil(&llil);
     crate::il::mlil::apply_ssa(&mut mlil);
     crate::il::mlil::eliminate_dead_stores(&mut mlil);
