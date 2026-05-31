@@ -618,6 +618,7 @@ impl Project {
                     .map_err(|e| Error::Database(e.to_string()))?,
             )?;
             db.set_metadata("image_base", &self.image_base.to_string())?;
+            db.set_metadata("schema_version", &Database::SCHEMA_VERSION.to_string())?;
 
             Ok(())
         })();
@@ -633,6 +634,20 @@ impl Project {
 
     pub fn load(db_path: &std::path::Path) -> Result<Self> {
         let db = Database::open(db_path)?;
+
+        // Reject project files written by a newer, incompatible schema rather
+        // than silently misreading them. Absent (legacy) version = compatible.
+        if let Some(v) = db.get_metadata("schema_version")?
+            && let Ok(version) = v.parse::<u32>()
+            && version > Database::SCHEMA_VERSION
+        {
+            return Err(crate::error::Error::Database(format!(
+                "project schema version {} is newer than supported version {}",
+                version,
+                Database::SCHEMA_VERSION
+            )));
+        }
+
         let mut project = Project::new(
             db_path
                 .file_stem()
@@ -1517,6 +1532,31 @@ mod tests {
         assert_eq!(loaded.arch, Architecture::Arm64);
         assert_eq!(loaded.binary_format, BinaryFormat::Elf);
         assert_eq!(loaded.image_base, 0x1_4000_0000);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_rejects_newer_schema_version() {
+        let path =
+            std::env::temp_dir().join(format!("sleuthre_schema_{}.slre", uuid::Uuid::new_v4()));
+        let mut p = Project::new("t".into(), PathBuf::from("/tmp/t"));
+        p.save(&path).unwrap();
+        // Saved at the current version → loads fine.
+        assert!(Project::load(&path).is_ok());
+
+        // Stamp a future schema version; load must now refuse it.
+        {
+            let db = crate::db::Database::open(&path).unwrap();
+            db.set_metadata("schema_version", "9999").unwrap();
+        }
+        let err = match Project::load(&path) {
+            Ok(_) => panic!("a newer schema version should be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("newer than supported"),
+            "got: {err}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

@@ -34,6 +34,12 @@ pub struct Database {
 }
 
 impl Database {
+    /// On-disk project schema version. Bump on any non-additive schema change
+    /// (additive columns are handled idempotently by `ensure_column`). Stored in
+    /// `metadata` on save and checked on load so a newer project file is
+    /// rejected rather than silently misread.
+    pub const SCHEMA_VERSION: u32 = 1;
+
     pub fn open(path: &Path) -> Result<Self> {
         let conn =
             Connection::open(path).map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
