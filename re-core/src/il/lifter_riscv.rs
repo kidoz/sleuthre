@@ -166,8 +166,13 @@ fn lift_instruction(func: &mut LlilFunction, insn: &Instruction) -> Vec<LlilStmt
         "tail" => lift_jump(func, &ops),
         "call" => lift_call(func, &ops),
 
-        // Anything else: unimplemented
-        _ => vec![],
+        // Preserve unhandled instructions as an explicit Unimplemented marker
+        // rather than silently dropping them, so downstream IL/decompilation
+        // reflects the missing semantics instead of treating them as no-ops.
+        _ => vec![LlilStmt::Unimplemented {
+            mnemonic: insn.mnemonic.clone(),
+            op_str: insn.op_str.clone(),
+        }],
     }
 }
 
@@ -459,6 +464,18 @@ mod tests {
         assert!(
             matches!(&func.instructions[0].stmts[0], LlilStmt::SetReg { dest, .. } if dest == "a0")
         );
+    }
+
+    #[test]
+    fn unknown_instruction_is_unimplemented_not_dropped() {
+        // `csrr` is not lifted; it must surface as Unimplemented, not vanish.
+        let insns = [make_insn(0x1000, "csrr", "a0, mstatus")];
+        let func = lift_function("test", 0x1000, &insns);
+        assert!(matches!(
+            func.instructions[0].stmts.as_slice(),
+            [LlilStmt::Unimplemented { mnemonic, op_str }]
+                if mnemonic == "csrr" && op_str == "a0, mstatus"
+        ));
     }
 
     #[test]
