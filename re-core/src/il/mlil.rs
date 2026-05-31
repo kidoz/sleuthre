@@ -7,7 +7,8 @@ use std::collections::HashMap;
 use std::fmt;
 
 use crate::il::llil::{
-    self, BinOp, ExprId, LlilFunction, LlilStmt, UnaryOp, VectorElementType, VectorOpKind,
+    self, BinOp, ExprId, FlagCondition, LlilFunction, LlilStmt, UnaryOp, VectorElementType,
+    VectorOpKind,
 };
 
 /// An SSA variable: a register name with a version number.
@@ -144,21 +145,104 @@ fn lower_expr(llil_func: &LlilFunction, id: ExprId) -> MlilExpr {
     }
 }
 
+/// Map a CPU [`FlagCondition`] to the relational [`BinOp`] that recovers it.
+///
+/// Returns `None` for conditions that don't correspond to a simple two-operand
+/// relational comparison (`Neg`/`Overflow`), so the caller falls back to the
+/// opaque `flag_*` variable rather than synthesizing a misleading expression.
+fn flag_condition_to_binop(cond: FlagCondition) -> Option<BinOp> {
+    Some(match cond {
+        FlagCondition::E => BinOp::CmpEq,
+        FlagCondition::Ne => BinOp::CmpNe,
+        FlagCondition::Slt => BinOp::CmpLt,
+        FlagCondition::Sle => BinOp::CmpLe,
+        FlagCondition::Sgt => BinOp::CmpGt,
+        FlagCondition::Sge => BinOp::CmpGe,
+        FlagCondition::Ult => BinOp::CmpUlt,
+        FlagCondition::Ule => BinOp::CmpUle,
+        FlagCondition::Ugt => BinOp::CmpUgt,
+        FlagCondition::Uge => BinOp::CmpUge,
+        FlagCondition::Neg | FlagCondition::Overflow => return None,
+    })
+}
+
+/// Reconstruct a relational condition from the most recent flag-setting
+/// expression and the branch's [`FlagCondition`].
+///
+/// The x86 lifter models `cmp a, b` as `__flags = a - b` and `test a, b` as
+/// `__flags = a & b` (see `lifter_x86::lift_cmp`/`lift_test`), then emits the
+/// branch as an opaque `Flag(cond)`. This folds the two back together:
+/// - `cmp a, b` + `jl`  → `a < b`
+/// - `test eax, eax` + `je` → `eax == 0`
+/// - `test a, b` + `jne` → `(a & b) != 0`
+///
+/// Returns `None` (caller falls back to the `flag_*` variable) when the flag
+/// source isn't a recognized `cmp`/`test` shape or the condition isn't
+/// relational.
+fn synthesize_condition(cond: FlagCondition, flag_src: &MlilExpr) -> Option<MlilExpr> {
+    let op = flag_condition_to_binop(cond)?;
+    match flag_src {
+        // `cmp a, b` → compare a against b directly.
+        MlilExpr::BinOp {
+            op: BinOp::Sub,
+            left,
+            right,
+        } => Some(MlilExpr::BinOp {
+            op,
+            left: left.clone(),
+            right: right.clone(),
+        }),
+        // `test a, b` → compare the bitwise-and against zero. The common
+        // self-test `test eax, eax` collapses to `eax <op> 0`.
+        MlilExpr::BinOp {
+            op: BinOp::And,
+            left,
+            right,
+        } => {
+            let lhs = if left == right {
+                left.clone()
+            } else {
+                Box::new(MlilExpr::BinOp {
+                    op: BinOp::And,
+                    left: left.clone(),
+                    right: right.clone(),
+                })
+            };
+            Some(MlilExpr::BinOp {
+                op,
+                left: lhs,
+                right: Box::new(MlilExpr::Const(0)),
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Lower an LLIL function to MLIL (pre-SSA: all versions are 0).
 pub fn lower_to_mlil(llil_func: &LlilFunction) -> MlilFunction {
     let mut instructions = Vec::new();
+
+    // Tracks the source expression of the most recent `__flags` assignment so a
+    // following conditional branch can be folded into a relational expression.
+    // This is a straight-line approximation: the lifter only sets `__flags` for
+    // `cmp`/`test`, which compilers place immediately before the branch.
+    let mut last_flag: Option<MlilExpr> = None;
 
     for inst in &llil_func.instructions {
         let mut stmts = Vec::new();
         for stmt in &inst.stmts {
             match stmt {
                 LlilStmt::SetReg { dest, src } => {
+                    let src = lower_expr(llil_func, *src);
+                    if dest == "__flags" {
+                        last_flag = Some(src.clone());
+                    }
                     stmts.push(MlilStmt::Assign {
                         dest: SsaVar {
                             name: dest.clone(),
                             version: 0,
                         },
-                        src: lower_expr(llil_func, *src),
+                        src,
                     });
                 }
                 LlilStmt::Store { addr, value, size } => {
@@ -174,8 +258,17 @@ pub fn lower_to_mlil(llil_func: &LlilFunction) -> MlilFunction {
                     });
                 }
                 LlilStmt::BranchIf { cond, target } => {
+                    // Fold `cmp/test` + `Jcc` into a relational expression when
+                    // possible; otherwise keep the opaque `flag_*` variable.
+                    let cond = match &llil_func.exprs[*cond] {
+                        llil::LlilExpr::Flag(fc) => last_flag
+                            .as_ref()
+                            .and_then(|src| synthesize_condition(*fc, src))
+                            .unwrap_or_else(|| lower_expr(llil_func, *cond)),
+                        _ => lower_expr(llil_func, *cond),
+                    };
                     stmts.push(MlilStmt::BranchIf {
-                        cond: lower_expr(llil_func, *cond),
+                        cond,
                         target: lower_expr(llil_func, *target),
                     });
                 }
@@ -392,6 +485,122 @@ mod tests {
         let llil = lift_function("test", 0x1000, &insns);
         let mlil = lower_to_mlil(&llil);
         assert_eq!(mlil.instructions.len(), 3);
+    }
+
+    /// Return the condition of the first `BranchIf` in the lowered function.
+    fn first_branch_cond(insns: &[crate::disasm::Instruction]) -> MlilExpr {
+        let llil = lift_function("test", 0x1000, insns);
+        let mlil = lower_to_mlil(&llil);
+        mlil.instructions
+            .iter()
+            .flat_map(|i| &i.stmts)
+            .find_map(|s| match s {
+                MlilStmt::BranchIf { cond, .. } => Some(cond.clone()),
+                _ => None,
+            })
+            .expect("expected a BranchIf statement")
+    }
+
+    fn var(name: &str) -> MlilExpr {
+        MlilExpr::Var(SsaVar {
+            name: name.into(),
+            version: 0,
+        })
+    }
+
+    #[test]
+    fn cmp_jl_synthesizes_signed_less_than() {
+        let cond = first_branch_cond(&[
+            make_insn(0x1000, "cmp", "eax, ebx"),
+            make_insn(0x1002, "jl", "0x1010"),
+        ]);
+        assert_eq!(
+            cond,
+            MlilExpr::BinOp {
+                op: BinOp::CmpLt,
+                left: Box::new(var("eax")),
+                right: Box::new(var("ebx")),
+            }
+        );
+    }
+
+    #[test]
+    fn cmp_jb_synthesizes_unsigned_less_than() {
+        let cond = first_branch_cond(&[
+            make_insn(0x1000, "cmp", "eax, ebx"),
+            make_insn(0x1002, "jb", "0x1010"),
+        ]);
+        assert!(matches!(
+            cond,
+            MlilExpr::BinOp {
+                op: BinOp::CmpUlt,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn self_test_collapses_to_compare_against_zero() {
+        // `test eax, eax; je` is the canonical "is eax zero?" idiom.
+        let cond = first_branch_cond(&[
+            make_insn(0x1000, "test", "eax, eax"),
+            make_insn(0x1002, "je", "0x1010"),
+        ]);
+        assert_eq!(
+            cond,
+            MlilExpr::BinOp {
+                op: BinOp::CmpEq,
+                left: Box::new(var("eax")),
+                right: Box::new(MlilExpr::Const(0)),
+            }
+        );
+    }
+
+    #[test]
+    fn test_with_mask_compares_bitand_against_zero() {
+        // `test al, 1; jne` → `(al & 1) != 0`.
+        let cond = first_branch_cond(&[
+            make_insn(0x1000, "test", "al, 1"),
+            make_insn(0x1002, "jne", "0x1010"),
+        ]);
+        assert_eq!(
+            cond,
+            MlilExpr::BinOp {
+                op: BinOp::CmpNe,
+                left: Box::new(MlilExpr::BinOp {
+                    op: BinOp::And,
+                    left: Box::new(var("al")),
+                    right: Box::new(MlilExpr::Const(1)),
+                }),
+                right: Box::new(MlilExpr::Const(0)),
+            }
+        );
+    }
+
+    #[test]
+    fn no_flag_var_leaks_into_output() {
+        // Whatever the synthesized shape, it must not be an opaque `flag_*` var.
+        let cond = first_branch_cond(&[
+            make_insn(0x1000, "cmp", "eax, ebx"),
+            make_insn(0x1002, "jne", "0x1010"),
+        ]);
+        let mut names = std::collections::HashSet::new();
+        collect_used_vars_expr(&cond, &mut names);
+        assert!(
+            !names.iter().any(|n| n.starts_with("flag_")),
+            "condition still references a flag pseudo-variable: {cond:?}"
+        );
+    }
+
+    #[test]
+    fn unrecoverable_condition_falls_back_to_flag_var() {
+        // `js` (sign flag) has no two-operand relational form here, and there is
+        // no preceding `cmp`/`test`, so we keep the opaque flag variable.
+        let cond = first_branch_cond(&[make_insn(0x1000, "js", "0x1010")]);
+        match cond {
+            MlilExpr::Var(v) => assert!(v.name.starts_with("flag_"), "got {}", v.name),
+            other => panic!("expected fallback flag var, got {other:?}"),
+        }
     }
 
     #[test]
