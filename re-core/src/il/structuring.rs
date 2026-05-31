@@ -431,6 +431,79 @@ fn recover_register_call_args(func: &mut MlilFunction, arch: crate::arch::Archit
     }
 }
 
+/// Recover the implicit register arguments of x86 `thiscall`/`fastcall` calls.
+///
+/// `thiscall` (C++ member functions) passes the object pointer in `ecx`;
+/// `fastcall` passes the first two integer arguments in `ecx`, `edx`. These are
+/// *prepended* to any stack arguments already recovered, so a member call reads
+/// `Method(this, a, b)`. The callee's convention comes from `conventions` (keyed
+/// by call-target address); indirect calls and other conventions are untouched.
+/// Must run after [`version_defs_and_uses`] so the register names its reaching
+/// definition.
+fn recover_x86_this_arguments(
+    func: &mut MlilFunction,
+    arch: crate::arch::Architecture,
+    conventions: &HashMap<u64, crate::analysis::functions::CallingConvention>,
+) {
+    use crate::analysis::functions::CallingConvention;
+    if arch != crate::arch::Architecture::X86 {
+        return;
+    }
+
+    let mut targets: HashSet<u64> = HashSet::new();
+    for inst in &func.instructions {
+        for stmt in &inst.stmts {
+            match stmt {
+                MlilStmt::Jump { target } | MlilStmt::BranchIf { target, .. } => {
+                    if let MlilExpr::Const(a) = target {
+                        targets.insert(*a);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Latest in-block version of each register, for naming the reaching def.
+    let mut defined: HashMap<String, u32> = HashMap::new();
+    for inst in &mut func.instructions {
+        if targets.contains(&inst.address) {
+            defined.clear();
+        }
+        for stmt in &mut inst.stmts {
+            match stmt {
+                MlilStmt::Call { target, args } => {
+                    let regs: &[&str] = match target {
+                        MlilExpr::Const(addr) => match conventions.get(addr) {
+                            Some(CallingConvention::Thiscall) => &["ecx"],
+                            Some(CallingConvention::Fastcall) => &["ecx", "edx"],
+                            _ => &[],
+                        },
+                        _ => &[],
+                    };
+                    if !regs.is_empty() {
+                        let mut prepended: Vec<MlilExpr> = regs
+                            .iter()
+                            .map(|r| {
+                                MlilExpr::Var(SsaVar {
+                                    name: (*r).to_string(),
+                                    version: defined.get(*r).copied().unwrap_or(0),
+                                })
+                            })
+                            .collect();
+                        prepended.append(args);
+                        *args = prepended;
+                    }
+                }
+                MlilStmt::Assign { dest, .. } => {
+                    defined.insert(dest.name.clone(), dest.version);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 /// Recover stack-local variable declarations from raw instructions.
 fn recover_locals(
     instructions: &[crate::disasm::Instruction],
@@ -2162,6 +2235,7 @@ fn lower_mlil_stmts(
 }
 
 /// Full decompilation pipeline: LLIL → MLIL → SSA → fold → structure → pseudocode.
+#[allow(clippy::too_many_arguments)]
 pub fn decompile(
     name: &str,
     instructions: &[crate::disasm::Instruction],
@@ -2170,6 +2244,7 @@ pub fn decompile(
     type_info: Option<&FunctionTypeInfo>,
     types: &TypeManager,
     memory: &crate::memory::MemoryMap,
+    conventions: &HashMap<u64, crate::analysis::functions::CallingConvention>,
 ) -> hlil::DecompiledCode {
     if instructions.is_empty() {
         return hlil::DecompiledCode {
@@ -2184,6 +2259,7 @@ pub fn decompile(
     crate::il::mlil::reconstruct_stack_operations(&mut mlil);
     crate::il::mlil::version_defs_and_uses(&mut mlil);
     recover_register_call_args(&mut mlil, arch);
+    recover_x86_this_arguments(&mut mlil, arch, conventions);
     crate::il::mlil::propagate_values(&mut mlil);
     crate::il::mlil::eliminate_dead_stores_ssa(&mut mlil);
 
@@ -2681,6 +2757,61 @@ mod tests {
     }
 
     #[test]
+    fn recovers_thiscall_this_pointer() {
+        use crate::analysis::functions::CallingConvention;
+        // mov ecx, esi ; call 0x2000  (0x2000 is thiscall)  →  f(this=ecx)
+        let insns = [
+            make_insn(0x1000, "mov", "ecx, esi"),
+            make_insn(0x1005, "call", "0x2000"),
+        ];
+        let llil = crate::il::lift_function(crate::arch::Architecture::X86, "t", 0x1000, &insns);
+        let mut m = crate::il::mlil::lower_to_mlil(&llil);
+        crate::il::mlil::version_defs_and_uses(&mut m);
+        let mut conv = HashMap::new();
+        conv.insert(0x2000u64, CallingConvention::Thiscall);
+        recover_x86_this_arguments(&mut m, crate::arch::Architecture::X86, &conv);
+
+        let args = m
+            .instructions
+            .iter()
+            .flat_map(|i| &i.stmts)
+            .find_map(|s| match s {
+                MlilStmt::Call { args, .. } => Some(args.clone()),
+                _ => None,
+            })
+            .expect("a call statement");
+        assert!(
+            matches!(args.first(), Some(MlilExpr::Var(v)) if v.name == "ecx"),
+            "thiscall `this` (ecx) should be the first argument, got {args:?}"
+        );
+    }
+
+    #[test]
+    fn cdecl_callee_gets_no_this_pointer() {
+        use crate::analysis::functions::CallingConvention;
+        let insns = [
+            make_insn(0x1000, "mov", "ecx, esi"),
+            make_insn(0x1005, "call", "0x2000"),
+        ];
+        let llil = crate::il::lift_function(crate::arch::Architecture::X86, "t", 0x1000, &insns);
+        let mut m = crate::il::mlil::lower_to_mlil(&llil);
+        crate::il::mlil::version_defs_and_uses(&mut m);
+        let mut conv = HashMap::new();
+        conv.insert(0x2000u64, CallingConvention::Cdecl);
+        recover_x86_this_arguments(&mut m, crate::arch::Architecture::X86, &conv);
+        let args = m
+            .instructions
+            .iter()
+            .flat_map(|i| &i.stmts)
+            .find_map(|s| match s {
+                MlilStmt::Call { args, .. } => Some(args.clone()),
+                _ => None,
+            })
+            .expect("a call statement");
+        assert!(args.is_empty(), "cdecl call must not gain a this pointer");
+    }
+
+    #[test]
     fn register_args_not_recovered_for_x86() {
         // 32-bit cdecl passes on the stack; this pass must leave x86 calls alone.
         let insns = [
@@ -2757,6 +2888,7 @@ mod tests {
             None,
             &TypeManager::default(),
             &crate::memory::MemoryMap::default(),
+            &HashMap::new(),
         );
         // xor eax,eax is the "return 0" idiom — detected as void.
         assert!(
@@ -2789,6 +2921,7 @@ mod tests {
             None,
             &TypeManager::default(),
             &crate::memory::MemoryMap::default(),
+            &HashMap::new(),
         );
         // Raw-address calls emit through a function-pointer cast to parse as C.
         assert!(code.text.contains("((void (*)(void))0x2000)()"));
@@ -2813,6 +2946,7 @@ mod tests {
             None,
             &TypeManager::default(),
             &crate::memory::MemoryMap::default(),
+            &HashMap::new(),
         );
         // Stack/frame operations should be filtered out; meaningful value is
         // folded into the return statement (result_1 = 42 + return → return 42).
@@ -3322,6 +3456,7 @@ mod tests {
             None,
             &TypeManager::default(),
             &crate::memory::MemoryMap::default(),
+            &HashMap::new(),
         );
         // Should detect edi (mapped from rdi) as param and eax assignment as return.
         assert!(
@@ -3352,6 +3487,7 @@ mod tests {
             None,
             &TypeManager::default(),
             &crate::memory::MemoryMap::default(),
+            &HashMap::new(),
         );
         // Should have local variable declarations.
         assert!(

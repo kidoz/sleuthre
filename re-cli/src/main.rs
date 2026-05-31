@@ -397,6 +397,16 @@ fn cmd_decompile(path: &Path, address: u64) -> Result<()> {
             symbols.insert(imp.address, imp.name.clone());
         }
 
+        // Per-function calling conventions, for recovering implicit register
+        // arguments (x86 thiscall `this`, fastcall ecx/edx) at call sites.
+        let conventions: HashMap<u64, re_core::analysis::functions::CallingConvention> = result
+            .project
+            .functions
+            .functions
+            .values()
+            .map(|f| (f.start_address, f.calling_convention))
+            .collect();
+
         let code = re_core::il::structuring::decompile(
             &func.name,
             &instructions,
@@ -405,6 +415,7 @@ fn cmd_decompile(path: &Path, address: u64) -> Result<()> {
             result.type_info.get(&address),
             &re_core::types::TypeManager::default(),
             &result.project.memory_map,
+            &conventions,
         );
 
         println!("{}", code.text);

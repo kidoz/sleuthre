@@ -781,6 +781,15 @@ impl McpServer {
                                         }
                                     });
 
+                                let conventions: std::collections::HashMap<
+                                    u64,
+                                    re_core::analysis::functions::CallingConvention,
+                                > = project
+                                    .functions
+                                    .functions
+                                    .values()
+                                    .map(|f| (f.start_address, f.calling_convention))
+                                    .collect();
                                 let pseudocode = decompile(
                                     &func.name,
                                     &instructions,
@@ -789,6 +798,7 @@ impl McpServer {
                                     type_info.as_ref(),
                                     &project.types,
                                     &project.memory_map,
+                                    &conventions,
                                 );
                                 let response = tool_text_result(&id, &pseudocode.text);
                                 // Cache + record dependencies so a later
@@ -1236,6 +1246,15 @@ impl McpServer {
                 for f in project.functions.functions.values() {
                     symbols.insert(f.start_address, f.name.clone());
                 }
+                let conventions: std::collections::HashMap<
+                    u64,
+                    re_core::analysis::functions::CallingConvention,
+                > = project
+                    .functions
+                    .functions
+                    .values()
+                    .map(|f| (f.start_address, f.calling_convention))
+                    .collect();
                 let pseudocode = decompile(
                     &func.name,
                     &original,
@@ -1244,6 +1263,7 @@ impl McpServer {
                     None,
                     &project.types,
                     &project.memory_map,
+                    &conventions,
                 );
                 match re_core::analysis::recompile_diff::recompile_and_diff(
                     &func.name,

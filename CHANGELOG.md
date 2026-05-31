@@ -19,7 +19,9 @@
   folding and version-aware dead-store elimination collapse register churn; and
   unreachable code after a `return`/`goto` is pruned. Register-passed call
   arguments are recovered for x86-64 (SysV) and ARM64 (AAPCS), so calls render
-  as `f(a, b)` from the argument registers.
+  as `f(a, b)` from the argument registers; x86 `thiscall`/`fastcall` callees get
+  their implicit `ecx` (`this`) / `ecx`,`edx` arguments recovered from the
+  detected calling convention.
 
 ## [0.6.0] - 2026-05-31
 

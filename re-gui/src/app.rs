@@ -1033,6 +1033,16 @@ impl SleuthreApp {
                     var_types: Default::default(),
                 });
 
+            let conventions: std::collections::HashMap<
+                u64,
+                re_core::analysis::functions::CallingConvention,
+            > = project
+                .functions
+                .functions
+                .values()
+                .map(|f| (f.start_address, f.calling_convention))
+                .collect();
+
             let code = re_core::il::structuring::decompile(
                 func_name,
                 &insns,
@@ -1041,6 +1051,7 @@ impl SleuthreApp {
                 type_info.as_ref(),
                 &project.types,
                 &project.memory_map,
+                &conventions,
             );
 
             // Cache it and record what it referenced so a future rename or
