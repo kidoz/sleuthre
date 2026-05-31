@@ -463,15 +463,18 @@ fn parse_stop_reply(reply: &str) -> StopReason {
     let bytes = reply.as_bytes();
     match bytes[0] {
         b'W' => {
-            let code = u32::from_str_radix(&reply[1..reply.len().min(3)], 16).unwrap_or(0);
+            let code = u32::from_str_radix(reply.get(1..reply.len().min(3)).unwrap_or(""), 16)
+                .unwrap_or(0);
             StopReason::Exited(code as i32)
         }
         b'X' => {
-            let sig = u32::from_str_radix(&reply[1..reply.len().min(3)], 16).unwrap_or(0);
+            let sig = u32::from_str_radix(reply.get(1..reply.len().min(3)).unwrap_or(""), 16)
+                .unwrap_or(0);
             StopReason::Terminated(sig)
         }
         b'S' => {
-            let sig = u32::from_str_radix(&reply[1..reply.len().min(3)], 16).unwrap_or(0);
+            let sig = u32::from_str_radix(reply.get(1..reply.len().min(3)).unwrap_or(""), 16)
+                .unwrap_or(0);
             StopReason::Signal(sig)
         }
         b'T' => {
@@ -894,6 +897,25 @@ mod tests {
             parse_stop_reply("?weird"),
             StopReason::Other("?weird".to_string())
         );
+    }
+
+    #[test]
+    fn stop_reply_tolerates_non_ascii_bytes() {
+        // A malformed reply whose decoded bytes put a multi-byte char across the
+        // signal-code slice must not panic (regression for char-boundary
+        // slicing of the W/X/S signal codes).
+        assert!(matches!(
+            parse_stop_reply("SA\u{80}"),
+            StopReason::Signal(_)
+        ));
+        assert!(matches!(
+            parse_stop_reply("WA\u{80}"),
+            StopReason::Exited(_)
+        ));
+        assert!(matches!(
+            parse_stop_reply("XA\u{80}"),
+            StopReason::Terminated(_)
+        ));
     }
 
     #[test]

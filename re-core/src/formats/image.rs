@@ -287,6 +287,11 @@ impl ImageDecoder for PcxDecoder {
         let ymax = u16::from_le_bytes(data[10..12].try_into().unwrap()) as u32;
         let bytes_per_line = u16::from_le_bytes(data[68..70].try_into().unwrap()) as usize;
 
+        // Guard the subtraction: a malformed header with xmax<xmin would
+        // underflow (panic in debug, wrap in release).
+        if xmax < xmin || ymax < ymin {
+            return Err("Invalid PCX dimensions".to_string());
+        }
         let width = xmax - xmin + 1;
         let height = ymax - ymin + 1;
 
@@ -345,7 +350,12 @@ impl ImageDecoder for PcxDecoder {
         let mut pixels = vec![0u8; (width * height * 4) as usize];
         for y in 0..height {
             for x in 0..width {
-                let idx = indices[y as usize * bytes_per_line + x as usize] as usize;
+                // Guard the row index: a malformed `bytes_per_line` smaller than
+                // `width` would otherwise read out of bounds.
+                let idx = indices
+                    .get(y as usize * bytes_per_line + x as usize)
+                    .copied()
+                    .unwrap_or(0) as usize;
                 let pdst = (y * width + x) as usize * 4;
                 if pdst + 4 <= pixels.len() {
                     let c = palette.get(idx).copied().unwrap_or([0, 0, 0]);
@@ -383,6 +393,31 @@ mod tests {
         let d = PcxDecoder;
         assert!(d.matches(&[0x0A, 5, 1, 8], "image.pcx"));
         assert!(!d.matches(&[0x00, 5, 1, 8], "image.dat"));
+    }
+
+    #[test]
+    fn pcx_does_not_panic_when_width_exceeds_bytes_per_line() {
+        // Malformed: width (101) > bytes_per_line (1) would index out of the
+        // decoded scanline buffer. Must not panic.
+        let d = PcxDecoder;
+        let mut data = vec![0u8; 130];
+        data[0] = 0x0A; // signature
+        data[2] = 1; // RLE encoding
+        data[3] = 8; // bpp
+        data[8..10].copy_from_slice(&100u16.to_le_bytes()); // xmax → width 101
+        data[68..70].copy_from_slice(&1u16.to_le_bytes()); // bytes_per_line = 1
+        let _ = d.decode(&data); // result irrelevant; the point is no panic
+    }
+
+    #[test]
+    fn pcx_rejects_inverted_dimensions_without_panicking() {
+        // xmax < xmin would underflow `xmax - xmin`.
+        let d = PcxDecoder;
+        let mut data = vec![0u8; 130];
+        data[0] = 0x0A;
+        data[3] = 8;
+        data[4..6].copy_from_slice(&10u16.to_le_bytes()); // xmin = 10, xmax = 0
+        assert!(d.decode(&data).is_err());
     }
 
     #[test]
