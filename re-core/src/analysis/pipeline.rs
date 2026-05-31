@@ -281,6 +281,19 @@ fn analyze_loaded_with_bytes(
             .discover_functions_recursive(&project.memory_map, ds);
     }
 
+    // --- Calling conventions + stack frame sizes ---
+    // Format-aware so x86-64 PE functions get the Microsoft x64 convention
+    // (and SysV elsewhere); feeds the ABI used by backward type inference.
+    if let Some(ref ds) = disasm {
+        check_cancelled(cancellation)?;
+        project.functions.analyze_calling_conventions(
+            &project.memory_map,
+            ds,
+            loaded.arch,
+            loaded.format,
+        );
+    }
+
     // --- Strings (scan before xrefs so we can do a single unified pass) ---
     if config.scan_strings {
         check_cancelled(cancellation)?;

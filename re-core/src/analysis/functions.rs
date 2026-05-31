@@ -1,7 +1,7 @@
 use crate::Result;
 use crate::arch::Architecture;
 use crate::disasm::Disassembler;
-use crate::loader::{Symbol, SymbolKind};
+use crate::loader::{BinaryFormat, Symbol, SymbolKind};
 use crate::memory::{MemoryMap, Permissions};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet, VecDeque};
@@ -459,10 +459,11 @@ impl FunctionManager {
         memory: &MemoryMap,
         disasm: &Disassembler,
         arch: Architecture,
+        format: BinaryFormat,
     ) {
         let addrs: Vec<u64> = self.functions.keys().copied().collect();
         for addr in addrs {
-            let (cc, frame_size) = detect_calling_convention(memory, disasm, arch, addr);
+            let (cc, frame_size) = detect_calling_convention(memory, disasm, arch, format, addr);
             if let Some(func) = self.functions.get_mut(&addr) {
                 func.calling_convention = cc;
                 func.stack_frame_size = frame_size;
@@ -476,12 +477,15 @@ fn detect_calling_convention(
     memory: &MemoryMap,
     disasm: &Disassembler,
     arch: Architecture,
+    format: BinaryFormat,
     addr: u64,
 ) -> (CallingConvention, u64) {
     let mut frame_size: u64 = 0;
 
-    // Default convention based on architecture
+    // Default convention based on architecture (and OS/ABI for x86-64, where
+    // Windows uses the Microsoft x64 convention and everyone else SysV).
     let mut default_cc = match arch {
+        Architecture::X86_64 if format == BinaryFormat::Pe => CallingConvention::Win64,
         Architecture::X86_64 => CallingConvention::SysVAmd64,
         Architecture::X86 => CallingConvention::Cdecl,
         Architecture::Arm | Architecture::Arm64 => CallingConvention::ArmAapcs,
@@ -657,7 +661,31 @@ mod tests {
         })
         .unwrap();
         let disasm = Disassembler::new(arch).unwrap();
-        detect_calling_convention(&map, &disasm, arch, 0x1000).0
+        // Format only affects the x86-64 default; irrelevant for these x86 tests.
+        detect_calling_convention(&map, &disasm, arch, BinaryFormat::Elf, 0x1000).0
+    }
+
+    #[test]
+    fn x86_64_default_is_win64_on_pe_and_sysv_elsewhere() {
+        use crate::memory::MemorySegment;
+        // A bare `ret` so the prologue scan finds no register hints.
+        let make = |format: BinaryFormat| {
+            let mut data = vec![0xC3u8];
+            data.resize(128, 0x00);
+            let mut map = MemoryMap::default();
+            map.add_segment(MemorySegment {
+                name: "code".to_string(),
+                start: 0x1000,
+                size: data.len() as u64,
+                data,
+                permissions: Permissions::READ | Permissions::EXECUTE,
+            })
+            .unwrap();
+            let disasm = Disassembler::new(Architecture::X86_64).unwrap();
+            detect_calling_convention(&map, &disasm, Architecture::X86_64, format, 0x1000).0
+        };
+        assert_eq!(make(BinaryFormat::Pe), CallingConvention::Win64);
+        assert_eq!(make(BinaryFormat::Elf), CallingConvention::SysVAmd64);
     }
 
     #[test]
