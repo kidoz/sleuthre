@@ -9,7 +9,7 @@ use crate::il::ssa::{DefUse, Site, model_call_effects};
 use crate::loader::{BinaryFormat, Import};
 use crate::memory::MemoryMap;
 use crate::typelib::TypeLibraryManager;
-use crate::types::{FunctionSignature, TypeManager, TypeRef};
+use crate::types::{FunctionParameter, FunctionSignature, PrimitiveType, TypeManager, TypeRef};
 use std::collections::BTreeMap;
 
 /// Type information inferred for a single function.
@@ -182,11 +182,19 @@ impl<'a> TypePropagator<'a> {
             }
         }
 
-        // === Pass 3: Backward return-type inference (IL-based) ===
-        // When an untyped function's return value flows into a typed callee's
-        // argument, that argument's type is the untyped function's return type.
-        // Requires per-function IL (`with_il`); a no-op otherwise.
-        for (addr, ret_type) in self.infer_return_types(&result) {
+        // === Pass 3: Backward IL-based inference (return + parameter types) ===
+        // Following values across calls, infer an untyped function's return
+        // type (its result flows into a typed callee's argument) and its
+        // parameter types (a typed value flows into its arguments). Requires
+        // per-function IL (`with_il`); a no-op otherwise.
+        let ret_types = self.infer_return_types(&result);
+        let param_types = self.infer_param_types(&result);
+        let targets: std::collections::BTreeSet<u64> = ret_types
+            .keys()
+            .chain(param_types.keys())
+            .copied()
+            .collect();
+        for addr in targets {
             if result
                 .get(&addr)
                 .and_then(|i| i.signature.as_ref())
@@ -194,16 +202,31 @@ impl<'a> TypePropagator<'a> {
             {
                 continue; // never override a seeded/forward signature
             }
+            let ret = ret_types.get(&addr).cloned();
+            let params = param_types.get(&addr).cloned().unwrap_or_default();
+            if ret.is_none() && params.is_empty() {
+                continue;
+            }
             let name = self
                 .functions
                 .functions
                 .get(&addr)
                 .map(|f| f.name.clone())
                 .unwrap_or_else(|| format!("sub_{:x}", addr));
+            let parameters = params
+                .into_iter()
+                .enumerate()
+                .map(|(i, type_ref)| FunctionParameter {
+                    name: format!("arg{}", i),
+                    type_ref,
+                })
+                .collect();
             result.entry(addr).or_default().signature = Some(FunctionSignature {
                 name,
-                return_type: ret_type,
-                parameters: Vec::new(),
+                // `Void` is this codebase's "unknown" placeholder when only the
+                // parameters could be recovered.
+                return_type: ret.unwrap_or(TypeRef::Primitive(PrimitiveType::Void)),
+                parameters,
                 calling_convention: String::new(),
                 is_variadic: false,
             });
@@ -290,6 +313,87 @@ impl<'a> TypePropagator<'a> {
             }
         }
         inferred
+    }
+
+    /// Backward parameter-type inference over the attached IL.
+    ///
+    /// The mirror of [`Self::infer_return_types`]: when a typed value (here, the
+    /// return value of a call to an already-typed function `H`) is moved into an
+    /// argument register and passed to an untyped function `G`, that register's
+    /// slot gives `G`'s parameter type. Candidates are unified per `(callee,
+    /// slot)`; only a contiguous prefix of agreed-upon slots (arg0, arg1, …) is
+    /// emitted, so no placeholder parameters are invented for gaps.
+    fn infer_param_types(
+        &self,
+        result: &BTreeMap<u64, FunctionTypeInfo>,
+    ) -> BTreeMap<u64, Vec<TypeRef>> {
+        let Some(il_map) = self.il else {
+            return BTreeMap::new();
+        };
+        // (callee addr, arg slot) -> candidate types.
+        let mut candidates: BTreeMap<(u64, usize), Vec<TypeRef>> = BTreeMap::new();
+
+        for il in il_map.values() {
+            let ret_reg = il.abi.ret_reg;
+            let arg_regs = il.abi.arg_regs;
+            for (inst_index, inst) in il.mlil.instructions.iter().enumerate() {
+                for (stmt_index, stmt) in inst.stmts.iter().enumerate() {
+                    let Some(g_addr) = call_target(stmt) else {
+                        continue;
+                    };
+                    let call_site = Site {
+                        inst_index,
+                        stmt_index,
+                        address: inst.address,
+                    };
+                    for (k, &arg_reg) in arg_regs.iter().enumerate() {
+                        let Some(def_site) = il.defuse.reaching_def(arg_reg, call_site) else {
+                            continue;
+                        };
+                        if !is_copy_from(stmt_at(il, def_site), arg_reg, ret_reg) {
+                            continue;
+                        }
+                        let Some(prod_site) = il.defuse.reaching_def(ret_reg, def_site) else {
+                            continue;
+                        };
+                        if let Some(h_addr) = call_defining(stmt_at(il, prod_site), ret_reg)
+                            && let Some(h_sig) =
+                                result.get(&h_addr).and_then(|i| i.signature.as_ref())
+                        {
+                            candidates
+                                .entry((g_addr, k))
+                                .or_default()
+                                .push(h_sig.return_type.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Unify each slot, then keep the contiguous prefix arg0, arg1, … .
+        let mut per_slot: BTreeMap<u64, BTreeMap<usize, TypeRef>> = BTreeMap::new();
+        for ((g_addr, slot), types) in candidates {
+            let first = &types[0];
+            if types.iter().all(|t| t == first) {
+                per_slot
+                    .entry(g_addr)
+                    .or_default()
+                    .insert(slot, first.clone());
+            }
+        }
+        let mut out = BTreeMap::new();
+        for (g_addr, slots) in per_slot {
+            let mut params = Vec::new();
+            let mut k = 0;
+            while let Some(t) = slots.get(&k) {
+                params.push(t.clone());
+                k += 1;
+            }
+            if !params.is_empty() {
+                out.insert(g_addr, params);
+            }
+        }
+        out
     }
 
     /// Find the import name for a given address, if any.
@@ -687,5 +791,103 @@ mod tests {
             .expect("G's return type should be inferred from the typed argument");
         assert_eq!(g.return_type, char_ptr);
         assert_eq!(g.name, "sub_4000");
+    }
+
+    #[test]
+    fn backward_infers_param_type_from_typed_producer() {
+        use crate::analysis::abi::abi_registers;
+        use crate::analysis::functions::CallingConvention;
+        use crate::arch::Architecture;
+        use crate::il::mlil::{MlilExpr, MlilInst, MlilStmt, SsaVar};
+        use crate::il::ssa::DefUse;
+
+        let var = |n: &str| SsaVar {
+            name: n.to_string(),
+            version: 0,
+        };
+        let call = |addr: u64, args: Vec<MlilExpr>| MlilExpr::Call {
+            target: Box::new(MlilExpr::Const(addr)),
+            args,
+        };
+
+        // Caller C @0x1000:
+        //   rax = H()        ; H @0x5000 (typed: returns char*)
+        //   rdi = rax        ; move the typed value into the first arg register
+        //   rax = G(rdi)     ; G @0x4000 (untyped) — its param0 is char*
+        let mlil = MlilFunction {
+            name: "C".to_string(),
+            entry: 0x1000,
+            instructions: vec![
+                MlilInst {
+                    address: 0x1000,
+                    stmts: vec![MlilStmt::Assign {
+                        dest: var("rax"),
+                        src: call(0x5000, vec![]),
+                    }],
+                },
+                MlilInst {
+                    address: 0x1004,
+                    stmts: vec![MlilStmt::Assign {
+                        dest: var("rdi"),
+                        src: MlilExpr::Var(var("rax")),
+                    }],
+                },
+                MlilInst {
+                    address: 0x1008,
+                    stmts: vec![MlilStmt::Assign {
+                        dest: var("rax"),
+                        src: call(0x4000, vec![MlilExpr::Var(var("rdi"))]),
+                    }],
+                },
+            ],
+        };
+        let abi = abi_registers(
+            Architecture::X86_64,
+            CallingConvention::SysVAmd64,
+            BinaryFormat::Elf,
+        )
+        .unwrap();
+        let defuse = DefUse::build(&mlil);
+        let mut il_map = BTreeMap::new();
+        il_map.insert(0x1000, FunctionIl { mlil, defuse, abi });
+
+        let mut functions = FunctionManager::default();
+        for (a, name) in [(0x1000u64, "C"), (0x4000, "sub_4000"), (0x5000, "make_str")] {
+            functions.add_function(Function {
+                name: name.to_string(),
+                start_address: a,
+                end_address: None,
+                calling_convention: CallingConvention::SysVAmd64,
+                stack_frame_size: 0,
+            });
+        }
+        let xrefs = XrefManager::new();
+        let type_libs = TypeLibraryManager::default();
+        let imports: Vec<Import> = vec![];
+
+        let char_ptr = TypeRef::Pointer(Box::new(TypeRef::Primitive(PrimitiveType::Char)));
+        let mut debug_info = DebugInfo::default();
+        debug_info.function_signatures.insert(
+            0x5000,
+            FunctionSignature {
+                name: "make_str".to_string(),
+                return_type: char_ptr.clone(),
+                parameters: vec![],
+                calling_convention: String::new(),
+                is_variadic: false,
+            },
+        );
+        let types = TypeManager::default();
+
+        let propagator =
+            TypePropagator::new(&functions, &xrefs, &type_libs, &imports).with_il(&il_map);
+        let result = propagator.propagate(&debug_info, &types);
+
+        let g = result
+            .get(&0x4000)
+            .and_then(|i| i.signature.as_ref())
+            .expect("G's parameter type should be inferred from the typed producer");
+        assert_eq!(g.parameters.len(), 1);
+        assert_eq!(g.parameters[0].type_ref, char_ptr);
     }
 }
