@@ -341,6 +341,18 @@ pub fn version_defs_and_uses(func: &mut MlilFunction) {
         }
     }
 
+    // Count definitions per register so single-assignment registers keep their
+    // bare name (no `_1` suffix) — versioning only earns its keep when a register
+    // is actually reassigned.
+    let mut def_counts: HashMap<String, u32> = HashMap::new();
+    for inst in &func.instructions {
+        for stmt in &inst.stmts {
+            if let MlilStmt::Assign { dest, .. } = stmt {
+                *def_counts.entry(dest.name.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+
     let mut counters: HashMap<String, u32> = HashMap::new();
     let mut current: HashMap<String, u32> = HashMap::new();
     for inst in &mut func.instructions {
@@ -351,6 +363,16 @@ pub fn version_defs_and_uses(func: &mut MlilFunction) {
             match stmt {
                 MlilStmt::Assign { dest, src } => {
                     rename_uses(src, &current);
+                    // Stack/frame pointers and single-def registers stay at
+                    // version 0: the former are elided pseudo-registers, the
+                    // latter need no disambiguation.
+                    if is_stack_or_frame_pointer(&dest.name)
+                        || def_counts.get(dest.name.as_str()).copied().unwrap_or(0) <= 1
+                    {
+                        dest.version = 0;
+                        current.insert(dest.name.clone(), 0);
+                        continue;
+                    }
                     let c = counters.entry(dest.name.clone()).or_insert(0);
                     *c += 1;
                     dest.version = *c;
@@ -1151,16 +1173,17 @@ mod tests {
 
     #[test]
     fn reaching_defs_reset_at_branch_targets() {
-        // mov eax, 1 ; jmp L ; L: mov ebx, eax
-        // The use of eax at the join falls back to version 0 (no cross-block
-        // versioning without a CFG).
+        // eax is reassigned (so it *would* be versioned), then a jump lands on a
+        // block whose first instruction reads eax: the reaching map resets at the
+        // join, so the use falls back to version 0 rather than a wrong guess.
         let mut m = lower_to_mlil(&lift_function(
             "test",
             0x1000,
             &[
                 make_insn(0x1000, "mov", "eax, 1"),
-                make_insn(0x1005, "jmp", "0x100c"),
-                make_insn(0x100c, "mov", "ebx, eax"),
+                make_insn(0x1005, "mov", "eax, 2"),
+                make_insn(0x100a, "jmp", "0x1010"),
+                make_insn(0x1010, "mov", "ebx, eax"),
             ],
         ));
         version_defs_and_uses(&mut m);
@@ -1169,6 +1192,22 @@ mod tests {
             0,
             "use at a branch target resets to version 0"
         );
+    }
+
+    #[test]
+    fn single_def_registers_stay_unversioned() {
+        // ecx is assigned once; its use keeps the bare name (version 0).
+        let mut m = lower_to_mlil(&lift_function(
+            "test",
+            0x1000,
+            &[
+                make_insn(0x1000, "mov", "ecx, 7"),
+                make_insn(0x1005, "mov", "ebx, ecx"),
+            ],
+        ));
+        version_defs_and_uses(&mut m);
+        // The `ecx = 7` def is version 0, and `ebx = ecx` reads ecx#0.
+        assert_eq!(src_var_version(&m, 0), 0);
     }
 
     #[test]
