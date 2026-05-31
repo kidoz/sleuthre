@@ -163,6 +163,7 @@ fn parse_subprogram<'a>(
         parameters,
         calling_convention: String::new(),
         is_variadic,
+        source: crate::types::SignatureSource::DebugInfo,
     };
 
     info.function_signatures.insert(addr, sig);

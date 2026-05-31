@@ -118,6 +118,7 @@ pub fn extract_pdb_info(
                                         parameters: params,
                                         calling_convention: String::new(),
                                         is_variadic: false,
+                                        source: crate::types::SignatureSource::DebugInfo,
                                     },
                                 );
                             }
@@ -161,6 +162,7 @@ pub fn extract_pdb_info(
                             parameters: Vec::new(),
                             calling_convention: String::new(),
                             is_variadic: false,
+                            source: crate::types::SignatureSource::DebugInfo,
                         },
                     );
                 }

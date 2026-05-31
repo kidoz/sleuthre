@@ -1311,11 +1311,17 @@ mod tests {
             }],
             calling_convention: "cdecl".to_string(),
             is_variadic: false,
+            source: crate::types::SignatureSource::DebugInfo,
         };
         db.save_function_signature(0x401000, &sig).unwrap();
         let loaded = db.load_function_signatures().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[&0x401000].name, "main");
+        // Provenance round-trips through the JSON blob.
+        assert_eq!(
+            loaded[&0x401000].source,
+            crate::types::SignatureSource::DebugInfo
+        );
         let _ = std::fs::remove_file(path);
     }
 

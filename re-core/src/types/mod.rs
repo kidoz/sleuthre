@@ -186,6 +186,31 @@ pub struct TypeAnnotation {
     pub name: String,
 }
 
+/// Where a function signature came from — used to gauge confidence and to keep
+/// heuristic results from masquerading as authoritative ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SignatureSource {
+    /// User-provided, or pre-existing data with no recorded source (the default
+    /// for project files written before provenance was tracked).
+    #[default]
+    Manual,
+    /// Recovered from DWARF/PDB debug information.
+    DebugInfo,
+    /// Resolved from a bundled type library (a known API).
+    TypeLibrary,
+    /// Inferred heuristically by analysis (e.g. backward type propagation).
+    /// Lower confidence — surfaced as such and never overrides other sources.
+    Inferred,
+}
+
+impl SignatureSource {
+    /// Whether the signature was derived heuristically rather than from an
+    /// authoritative source.
+    pub fn is_inferred(self) -> bool {
+        matches!(self, SignatureSource::Inferred)
+    }
+}
+
 /// A function signature with full type information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionSignature {
@@ -194,6 +219,10 @@ pub struct FunctionSignature {
     pub parameters: Vec<FunctionParameter>,
     pub calling_convention: String,
     pub is_variadic: bool,
+    /// Provenance of this signature. Defaults to [`SignatureSource::Manual`]
+    /// when absent (older project files), so persistence stays compatible.
+    #[serde(default)]
+    pub source: SignatureSource,
 }
 
 /// A named, typed function parameter
@@ -480,6 +509,7 @@ mod tests {
                 ],
                 calling_convention: "cdecl".to_string(),
                 is_variadic: false,
+                source: SignatureSource::Manual,
             },
         );
         let sig = mgr.function_signatures.get(&0x1000).unwrap();

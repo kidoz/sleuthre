@@ -48,6 +48,7 @@ fn sig(
                 .collect(),
             calling_convention: String::new(),
             is_variadic,
+            source: crate::types::SignatureSource::TypeLibrary,
         },
     )
 }

@@ -9,7 +9,9 @@ use crate::il::ssa::{DefUse, Site, model_call_effects};
 use crate::loader::{BinaryFormat, Import};
 use crate::memory::MemoryMap;
 use crate::typelib::TypeLibraryManager;
-use crate::types::{FunctionParameter, FunctionSignature, PrimitiveType, TypeManager, TypeRef};
+use crate::types::{
+    FunctionParameter, FunctionSignature, PrimitiveType, SignatureSource, TypeManager, TypeRef,
+};
 use std::collections::BTreeMap;
 
 /// Backstop on backward-inference rounds. Inference is monotonic and converges
@@ -239,6 +241,7 @@ impl<'a> TypePropagator<'a> {
                     parameters,
                     calling_convention: String::new(),
                     is_variadic: false,
+                    source: SignatureSource::Inferred,
                 });
                 changed = true;
             }
@@ -513,6 +516,7 @@ mod tests {
                 }],
                 calling_convention: String::new(),
                 is_variadic: false,
+                source: SignatureSource::DebugInfo,
             },
         );
 
@@ -792,6 +796,7 @@ mod tests {
                 }],
                 calling_convention: String::new(),
                 is_variadic: false,
+                source: SignatureSource::DebugInfo,
             },
         );
         let types = TypeManager::default();
@@ -890,6 +895,7 @@ mod tests {
                 parameters: vec![],
                 calling_convention: String::new(),
                 is_variadic: false,
+                source: SignatureSource::DebugInfo,
             },
         );
         let types = TypeManager::default();
@@ -993,6 +999,7 @@ mod tests {
                 parameters: vec![],
                 calling_convention: String::new(),
                 is_variadic: false,
+                source: SignatureSource::DebugInfo,
             },
         );
         let types = TypeManager::default();
