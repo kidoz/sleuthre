@@ -192,7 +192,7 @@ impl McpServer {
                         "tools": {},
                         "resources": {}
                     },
-                    "serverInfo": { "name": "sleuthre-core", "version": "0.3.0" }
+                    "serverInfo": { "name": "sleuthre-core", "version": env!("CARGO_PKG_VERSION") }
                 }
             }),
 

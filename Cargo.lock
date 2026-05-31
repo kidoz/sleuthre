@@ -3012,7 +3012,7 @@ dependencies = [
 
 [[package]]
 name = "re-cli"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3023,7 +3023,7 @@ dependencies = [
 
 [[package]]
 name = "re-core"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "bitflags 2.11.0",
@@ -3047,7 +3047,7 @@ dependencies = [
 
 [[package]]
 name = "re-gui"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "eframe",
@@ -3066,7 +3066,7 @@ dependencies = [
 
 [[package]]
 name = "re-mcp"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "capstone",

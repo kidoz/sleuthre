@@ -505,11 +505,15 @@ impl Default for SleuthreApp {
             project: None,
             disasm: None,
             current_cfg: None,
-            output: "Sleuthre v0.3.0 started.\n\
-                     Analysis subsystem has been initialized.\n\
-                     Hotkeys: F5 decompile, Space graph, N rename, ; comment, X xrefs,\n\
-                     Ctrl+G goto, Ctrl+D bookmark, Ctrl+F search, Alt+Left/Right navigate.\n"
-                .to_owned(),
+            output: concat!(
+                "Sleuthre v",
+                env!("CARGO_PKG_VERSION"),
+                " started.\n\
+                 Analysis subsystem has been initialized.\n\
+                 Hotkeys: F5 decompile, Space graph, N rename, ; comment, X xrefs,\n\
+                 Ctrl+G goto, Ctrl+D bookmark, Ctrl+F search, Alt+Left/Right navigate.\n"
+            )
+            .to_owned(),
             function_filter: String::new(),
             string_filter: String::new(),
             active_tab: Tab::Disassembly,

@@ -2,37 +2,71 @@
 
 ## [Unreleased]
 
-### Added — Debugger completion (roadmap 0.6)
+## [0.6.0] - 2026-05-31
 
-- Launch/attach debug profiles persisted per-project (`debug_profiles` table) with
-  GdbRemote and local-launch transports, optional arch override, and a "save args"
-  toggle so sensitive command lines stay off disk; attach PIDs are never persisted
-- Local launch: sleuthre spawns a `gdbserver` child (free-port pick + retry-connect),
-  owns it, and kills/reaps it on disconnect and on app drop (Linux; clearly gated elsewhere)
-- Attach-to-PID wired into the GUI connection bar
-- Register editing via the `P` packet (per-register width honoured, e.g. 4-byte eflags)
-- Memory writing via the `M` packet, with an editable hex field in the memory inspector
-- Shared-library/module enumeration via `qXfer:libraries-svr4:read`, listed in the panel
-- Clickable backtrace frames (resolve enclosing function name, navigate disassembly)
-- Step Over (call-aware temp breakpoint), Step Out (return-address temp breakpoint),
-  and Step Into; a working Stop button that interrupts via a socket-sharing handle even
-  while a blocking continue runs on the worker thread
-- Source location (`file:line`) readout at PC and a function-level "stopped here" marker
-  in the decompiler when debug info is present
-- RSP reply decoding now handles run-length encoding (`x*`) and `}`-escapes, so register
-  dumps and `qXfer` payloads are no longer truncated
+### Added
 
-### Changed — Dependency upgrades
+- **GDB Remote debugger (roadmap 0.6).** Register and memory writes (`P`/`M`,
+  honouring per-register width), shared-library/module enumeration
+  (`qXfer:libraries-svr4`), Step Into / Step Over (call-aware) / Step Out, and a
+  Stop button that interrupts a running inferior via a socket-sharing handle even
+  while a blocking continue runs on a worker thread. Attach-to-PID, local launch
+  (spawns and owns a `gdbserver` child on Linux), clickable backtrace frames, and
+  a `file:line` source readout at the PC. Per-project saved debug profiles
+  (sensitive launch args optionally kept off disk; attach PIDs never persisted).
+  RSP reply decoding handles run-length encoding and `}`-escapes.
+- **Backward (interprocedural) type inference.** Recovers untyped functions'
+  return and parameter types by following values across calls — built on a new IL
+  substrate (arch-dispatched lifting, an ABI register model, MLIL call-effect
+  modelling, and a def-use index) — iterated to a fixpoint across call chains.
+  Inferred signatures are provenance-tagged and shown as lower-confidence in the
+  decompiler.
+- **CFG switch/jump-table recovery:** indirect `jmp [reg*scale + base]` now yields
+  `Switch` edges to recovered (executable) case targets.
+- **x86 calling-convention detection** in the pipeline (stdcall via callee
+  stack-cleanup; Microsoft x64 vs SysV by binary format), persisted per function.
+- **RISC-V (rv32/rv64) ELF loading.**
+- Background re-analysis with a cancel button, quick/normal/deep mode presets, and
+  command-palette actions.
+- A deterministic no-panic fuzz-smoke harness for the untrusted-input parsers.
 
-- Bumped direct dependencies to current releases and migrated to their new APIs:
-  egui/eframe 0.33 → 0.34 and egui_dock 0.18 → 0.19 (unified `Panel` API with
-  `show_inside`, `App::ui` replacing `App::update`); gimli 0.31 → 0.33 (newtype
-  `UnitSectionOffset`, `attr_value` returns `Option`, `next_dfs`/CFI `register`
-  signature changes); rusqlite 0.33 → 0.40 (explicit `u64 <-> i64` casts at the DB
-  boundary now that the lossy `u64` `ToSql`/`FromSql` impls were removed)
-- Bumped goblin 0.9 → 0.10, capstone 0.13 → 0.14, object 0.36 → 0.39,
-  petgraph 0.7 → 0.8, rfd 0.15 → 0.17, and refreshed the lockfile (clap, uuid,
-  bitflags, rhai, etc.) to their latest compatible versions
+### Changed
+
+- **Dependency upgrades with API migrations:** egui/eframe 0.33 → 0.34 and
+  egui_dock 0.18 → 0.19 (unified `Panel` API, `App::ui` replacing `App::update`);
+  gimli 0.31 → 0.33; rusqlite 0.33 → 0.40 (explicit `u64 <-> i64` at the DB
+  boundary); plus goblin 0.10, capstone 0.14, object 0.39, petgraph 0.8, rfd 0.17.
+- Project files now persist the binary architecture/format, image base, and each
+  function's calling convention and stack-frame size; a stamped schema version is
+  checked on load and newer files are rejected.
+- Removed the legacy mock-debugger UI surfaces; the menu opens the real debugger
+  panel. Removed orphaned source files. The CFG is rebuilt with leader-based basic
+  blocks so mid-block branch targets split correctly.
+
+### Fixed
+
+- **Decompiler dropped live code:** dead-store elimination keyed on SSA versions
+  the (definition-only) SSA pass never matched; it is now name-based.
+- **Reopened projects decoded as x86_64:** the architecture/format were not
+  persisted.
+- PDB symbol addresses were section-relative offsets; they are now mapped to
+  virtual addresses via the PDB address map + image base.
+- Lifters silently dropped unhandled instructions (MIPS, RISC-V) — now surfaced as
+  `Unimplemented`. MIPS `addi`/`addiu` and negative immediates now lift (stack
+  prologues), and ARM `movs`/`muls`/`bics`/`lsls` are no longer mangled away.
+- Jump-table recovery is restricted to executable targets, and backward type
+  inference requires straight-line flow to avoid branch-induced mis-links.
+- The `cargo clippy -- -D warnings` gate is green.
+
+### Security
+
+- Hardened untrusted-input parsing (the project's primary safety rule):
+  - Fixed an RSP stop-reply char-boundary panic and a PCX out-of-bounds index on
+    malformed input.
+  - Capped image (`width * height * 4`) and binary-segment allocations, and bounded
+    RSP packet size and thread-enumeration rounds against a hostile stub.
+  - Validated TGA bit-depth/pixel bounds and segment ordering on load; capped the
+    MCP `get_disasm` request count.
 
 ## [0.4.0] - 2026-04-20
 

@@ -1045,7 +1045,7 @@ impl SleuthreApp {
                 }
             });
             ui.menu_button("Help", |ui| {
-                ui.label("sleuthre v0.3.0");
+                ui.label(concat!("sleuthre v", env!("CARGO_PKG_VERSION")));
                 ui.label("Open-source reverse engineering tool");
                 ui.separator();
                 ui.label("Keyboard shortcuts:");
