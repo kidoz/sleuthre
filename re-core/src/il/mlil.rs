@@ -462,6 +462,18 @@ pub fn fold_constants(expr: &MlilExpr) -> MlilExpr {
                 {
                     return MlilExpr::Const(0);
                 }
+                // `x | 0`, `x ^ 0`, `x << 0`, `x >> 0` → x
+                BinOp::Or | BinOp::Xor | BinOp::Shl | BinOp::Shr | BinOp::Sar
+                    if right == MlilExpr::Const(0) =>
+                {
+                    return left;
+                }
+                // `0 | x`, `0 ^ x` → x
+                BinOp::Or | BinOp::Xor if left == MlilExpr::Const(0) => return right,
+                // `x & 0`, `0 & x` → 0
+                BinOp::And if right == MlilExpr::Const(0) || left == MlilExpr::Const(0) => {
+                    return MlilExpr::Const(0);
+                }
                 _ => {}
             }
             MlilExpr::BinOp {
@@ -479,12 +491,224 @@ pub fn fold_constants(expr: &MlilExpr) -> MlilExpr {
                 };
                 return MlilExpr::Const(result);
             }
+            // Involution: `-(-x)` → x and `~(~x)` → x.
+            if let MlilExpr::UnaryOp {
+                op: inner_op,
+                operand: inner,
+            } = &operand
+                && inner_op == op
+            {
+                return (**inner).clone();
+            }
             MlilExpr::UnaryOp {
                 op: *op,
                 operand: Box::new(operand),
             }
         }
         other => other.clone(),
+    }
+}
+
+/// Collect every SSA variable read in an expression (uses, by name+version).
+fn collect_ssavars_in_expr(expr: &MlilExpr, used: &mut std::collections::HashSet<SsaVar>) {
+    match expr {
+        MlilExpr::Var(v) => {
+            used.insert(v.clone());
+        }
+        MlilExpr::Load { addr, .. } => collect_ssavars_in_expr(addr, used),
+        MlilExpr::BinOp { left, right, .. } => {
+            collect_ssavars_in_expr(left, used);
+            collect_ssavars_in_expr(right, used);
+        }
+        MlilExpr::UnaryOp { operand, .. } => collect_ssavars_in_expr(operand, used),
+        MlilExpr::Call { target, args } => {
+            collect_ssavars_in_expr(target, used);
+            for a in args {
+                collect_ssavars_in_expr(a, used);
+            }
+        }
+        MlilExpr::VectorOp { operands, .. } => {
+            for o in operands {
+                collect_ssavars_in_expr(o, used);
+            }
+        }
+        MlilExpr::Phi(vars) => {
+            for v in vars {
+                used.insert(v.clone());
+            }
+        }
+        MlilExpr::Const(_) => {}
+    }
+}
+
+/// Version-aware dead-store elimination: drop an assignment whose exact SSA
+/// variable (name + version) is never read.
+///
+/// Unlike [`eliminate_dead_stores`] (conservative, name-keyed), this requires
+/// uses to have been versioned by [`version_defs_and_uses`] — it is sound only
+/// then, because the decompiler renders each `(name, version)` as a distinct
+/// variable. Return registers and synthetic registers are always kept (the
+/// return value is consumed implicitly, not by a statement).
+pub fn eliminate_dead_stores_ssa(func: &mut MlilFunction) {
+    use std::collections::HashSet;
+
+    let mut used: HashSet<SsaVar> = HashSet::new();
+    for inst in &func.instructions {
+        for stmt in &inst.stmts {
+            match stmt {
+                MlilStmt::Assign { src, .. } => collect_ssavars_in_expr(src, &mut used),
+                MlilStmt::Store { addr, value, .. } => {
+                    collect_ssavars_in_expr(addr, &mut used);
+                    collect_ssavars_in_expr(value, &mut used);
+                }
+                MlilStmt::Jump { target } => collect_ssavars_in_expr(target, &mut used),
+                MlilStmt::BranchIf { cond, target } => {
+                    collect_ssavars_in_expr(cond, &mut used);
+                    collect_ssavars_in_expr(target, &mut used);
+                }
+                MlilStmt::Call { target, args } => {
+                    collect_ssavars_in_expr(target, &mut used);
+                    for a in args {
+                        collect_ssavars_in_expr(a, &mut used);
+                    }
+                }
+                MlilStmt::Return | MlilStmt::Nop => {}
+            }
+        }
+    }
+
+    for inst in &mut func.instructions {
+        inst.stmts.retain(|stmt| match stmt {
+            MlilStmt::Assign { dest, .. } => {
+                // Return registers (value consumed by the implicit return) and
+                // synthetic/flag registers are always kept.
+                dest.name == "rax"
+                    || dest.name == "eax"
+                    || dest.name == "x0"
+                    || dest.name.starts_with("flag_")
+                    || dest.name.starts_with("__")
+                    || used.contains(dest)
+            }
+            _ => true,
+        });
+    }
+}
+
+/// Apply `f` to every *use*-position expression of a statement (i.e. not the
+/// destination of an assignment).
+fn for_each_use_expr_mut(stmt: &mut MlilStmt, mut f: impl FnMut(&mut MlilExpr)) {
+    match stmt {
+        MlilStmt::Assign { src, .. } => f(src),
+        MlilStmt::Store { addr, value, .. } => {
+            f(addr);
+            f(value);
+        }
+        MlilStmt::Jump { target } => f(target),
+        MlilStmt::BranchIf { cond, target } => {
+            f(cond);
+            f(target);
+        }
+        MlilStmt::Call { target, args } => {
+            f(target);
+            for a in args {
+                f(a);
+            }
+        }
+        MlilStmt::Return | MlilStmt::Nop => {}
+    }
+}
+
+/// Resolve a variable through chains of constant/copy definitions, e.g. given
+/// `a = 0; b = a`, `resolve(b)` yields `0`. Returns `None` if `v` has no tracked
+/// constant/copy definition.
+fn resolve_value(v: &SsaVar, values: &HashMap<SsaVar, MlilExpr>, depth: u32) -> Option<MlilExpr> {
+    if depth > 32 {
+        return None;
+    }
+    match values.get(v)? {
+        MlilExpr::Const(c) => Some(MlilExpr::Const(*c)),
+        MlilExpr::Var(w) => {
+            Some(resolve_value(w, values, depth + 1).unwrap_or(MlilExpr::Var(w.clone())))
+        }
+        other => Some(other.clone()),
+    }
+}
+
+/// Substitute resolved constant/copy values into every variable leaf of `expr`.
+fn substitute_values(expr: &mut MlilExpr, values: &HashMap<SsaVar, MlilExpr>, changed: &mut bool) {
+    match expr {
+        MlilExpr::Var(v) => {
+            if let Some(resolved) = resolve_value(v, values, 0)
+                && resolved != *expr
+            {
+                *expr = resolved;
+                *changed = true;
+            }
+        }
+        MlilExpr::Load { addr, .. } => substitute_values(addr, values, changed),
+        MlilExpr::BinOp { left, right, .. } => {
+            substitute_values(left, values, changed);
+            substitute_values(right, values, changed);
+        }
+        MlilExpr::UnaryOp { operand, .. } => substitute_values(operand, values, changed),
+        MlilExpr::Call { target, args } => {
+            substitute_values(target, values, changed);
+            for a in args {
+                substitute_values(a, values, changed);
+            }
+        }
+        MlilExpr::VectorOp { operands, .. } => {
+            for o in operands {
+                substitute_values(o, values, changed);
+            }
+        }
+        MlilExpr::Phi(_) | MlilExpr::Const(_) => {}
+    }
+}
+
+/// Constant- and copy-propagation with constant folding, to a fixpoint.
+///
+/// Replaces uses of a register whose reaching definition is a constant or a
+/// plain copy with that value, then folds. Keyed on the exact SSA variable
+/// (name + version), this is sound given [`version_defs_and_uses`]: only a
+/// register's unique reaching definition is propagated. Iterates so chains like
+/// `a = 0; b = a | c; d = b | e` collapse. The now-dead definitions are cleaned
+/// up by [`eliminate_dead_stores`].
+pub fn propagate_values(func: &mut MlilFunction) {
+    const MAX_ROUNDS: usize = 16;
+    for _ in 0..MAX_ROUNDS {
+        // Fold first so freshly-simplified constants become propagatable.
+        for inst in &mut func.instructions {
+            for stmt in &mut inst.stmts {
+                for_each_use_expr_mut(stmt, |e| *e = fold_constants(e));
+            }
+        }
+
+        // Collect constant/copy definitions.
+        let mut values: HashMap<SsaVar, MlilExpr> = HashMap::new();
+        for inst in &func.instructions {
+            for stmt in &inst.stmts {
+                if let MlilStmt::Assign { dest, src } = stmt
+                    && matches!(src, MlilExpr::Const(_) | MlilExpr::Var(_))
+                    && !matches!(src, MlilExpr::Var(v) if v == dest)
+                {
+                    values.insert(dest.clone(), src.clone());
+                }
+            }
+        }
+        if values.is_empty() {
+            break;
+        }
+
+        let mut changed = false;
+        for inst in &mut func.instructions {
+            for stmt in &mut inst.stmts {
+                for_each_use_expr_mut(stmt, |e| substitute_values(e, &values, &mut changed));
+            }
+        }
+        if !changed {
+            break;
+        }
     }
 }
 
@@ -1240,6 +1464,78 @@ mod tests {
             right: Box::new(MlilExpr::Const(32)),
         };
         assert_eq!(fold_constants(&expr), MlilExpr::Const(42));
+    }
+
+    #[test]
+    fn bitwise_identity_folding() {
+        let x = MlilExpr::Var(SsaVar {
+            name: "eax".into(),
+            version: 0,
+        });
+        // x | 0 → x
+        let or0 = MlilExpr::BinOp {
+            op: BinOp::Or,
+            left: Box::new(x.clone()),
+            right: Box::new(MlilExpr::Const(0)),
+        };
+        assert_eq!(fold_constants(&or0), x);
+        // -(-x) → x
+        let double_neg = MlilExpr::UnaryOp {
+            op: UnaryOp::Neg,
+            operand: Box::new(MlilExpr::UnaryOp {
+                op: UnaryOp::Neg,
+                operand: Box::new(x.clone()),
+            }),
+        };
+        assert_eq!(fold_constants(&double_neg), x);
+    }
+
+    #[test]
+    fn propagates_constant_through_copy() {
+        // mov eax, 5 ; mov ebx, eax  →  ebx = 5
+        let mut m = lower_to_mlil(&lift_function(
+            "test",
+            0x1000,
+            &[
+                make_insn(0x1000, "mov", "eax, 5"),
+                make_insn(0x1005, "mov", "ebx, eax"),
+            ],
+        ));
+        version_defs_and_uses(&mut m);
+        propagate_values(&mut m);
+        let ebx_src = m
+            .instructions
+            .iter()
+            .flat_map(|i| &i.stmts)
+            .find_map(|s| match s {
+                MlilStmt::Assign { dest, src } if dest.name == "ebx" => Some(src.clone()),
+                _ => None,
+            })
+            .expect("ebx assignment");
+        assert_eq!(ebx_src, MlilExpr::Const(5));
+    }
+
+    #[test]
+    fn version_aware_dse_drops_dead_versioned_def() {
+        // mov ecx, 1 ; mov ecx, 2 ; mov ebx, ecx — ecx#1 is dead (ebx reads ecx#2).
+        let mut m = lower_to_mlil(&lift_function(
+            "test",
+            0x1000,
+            &[
+                make_insn(0x1000, "mov", "ecx, 1"),
+                make_insn(0x1005, "mov", "ecx, 2"),
+                make_insn(0x100a, "mov", "ebx, ecx"),
+            ],
+        ));
+        version_defs_and_uses(&mut m);
+        eliminate_dead_stores_ssa(&mut m);
+        let ecx_defs = m
+            .instructions
+            .iter()
+            .flat_map(|i| &i.stmts)
+            .filter(|s| matches!(s, MlilStmt::Assign { dest, .. } if dest.name == "ecx"))
+            .count();
+        assert_eq!(ecx_defs, 1, "the dead ecx#1 store should be removed");
     }
 
     #[test]
