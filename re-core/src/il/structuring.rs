@@ -377,6 +377,55 @@ fn recover_locals(
     crate::analysis::stack::recover_stack_variables(instructions, arch)
 }
 
+/// Remove statements that are unreachable because they follow an unconditional
+/// control transfer (`return`/`goto`/`break`/`continue`) with no intervening
+/// label. In structured HLIL the only way back into such code is a label (a goto
+/// target), so everything up to the next label is dead.
+fn prune_unreachable_statements(stmts: &mut Vec<HlilStmt>) {
+    let mut result = Vec::with_capacity(stmts.len());
+    let mut dead = false;
+    for mut stmt in std::mem::take(stmts) {
+        if matches!(stmt, HlilStmt::Label(_)) {
+            dead = false;
+        } else if dead {
+            continue;
+        }
+
+        // Recurse into nested bodies of kept statements.
+        match &mut stmt {
+            HlilStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                prune_unreachable_statements(then_body);
+                prune_unreachable_statements(else_body);
+            }
+            HlilStmt::While { body, .. }
+            | HlilStmt::DoWhile { body, .. }
+            | HlilStmt::For { body, .. } => prune_unreachable_statements(body),
+            HlilStmt::Block(inner) => prune_unreachable_statements(inner),
+            HlilStmt::Switch { cases, default, .. } => {
+                for (_, body) in cases {
+                    prune_unreachable_statements(body);
+                }
+                prune_unreachable_statements(default);
+            }
+            _ => {}
+        }
+
+        let terminates = matches!(
+            stmt,
+            HlilStmt::Return(_) | HlilStmt::Goto(_) | HlilStmt::Break | HlilStmt::Continue
+        );
+        result.push(stmt);
+        if terminates {
+            dead = true;
+        }
+    }
+    *stmts = result;
+}
+
 fn remove_unused_labels(stmts: &mut Vec<HlilStmt>) {
     // 1. Collect used labels
     let mut used = HashSet::new();
@@ -2113,6 +2162,11 @@ pub fn decompile(
     // Phase 2 (Roadmap): Combine nested if statements
     combine_nested_if_statements(&mut hlil_stmts);
 
+    // Drop statements made unreachable by a preceding return/goto/break/continue,
+    // then prune any labels that are no longer targeted.
+    prune_unreachable_statements(&mut hlil_stmts);
+    remove_unused_labels(&mut hlil_stmts);
+
     // 4. Collect remaining SSA variables and declare them
     let mut known_vars: HashSet<&str> = HashSet::new();
     for (_, name) in &info.params {
@@ -2526,6 +2580,32 @@ impl HlilStmt {
 mod tests {
     use super::*;
     use crate::disasm::Instruction;
+
+    #[test]
+    fn prune_drops_dead_code_after_return_but_keeps_labeled() {
+        let mut stmts = vec![
+            HlilStmt::Return(Some(HlilExpr::Const(1))),
+            // Unreachable: follows a return with no intervening label.
+            HlilStmt::Assign {
+                dest: HlilExpr::Var("dead".into()),
+                src: HlilExpr::Const(2),
+            },
+            // Reachable: a label (goto target) resets reachability.
+            HlilStmt::Label(0x100),
+            HlilStmt::Assign {
+                dest: HlilExpr::Var("live".into()),
+                src: HlilExpr::Const(3),
+            },
+        ];
+        prune_unreachable_statements(&mut stmts);
+        assert_eq!(stmts.len(), 3, "the dead assignment should be removed");
+        assert!(matches!(stmts[0], HlilStmt::Return(_)));
+        assert!(matches!(stmts[1], HlilStmt::Label(0x100)));
+        assert!(
+            matches!(&stmts[2], HlilStmt::Assign { dest: HlilExpr::Var(n), .. } if n == "live"),
+            "labeled (reachable) code must survive"
+        );
+    }
 
     fn make_insn(addr: u64, mn: &str, op: &str) -> Instruction {
         Instruction {

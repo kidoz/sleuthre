@@ -13,7 +13,11 @@
   save/restore boilerplate is elided (removing the `*(sp - 8) = ...` prologue
   noise and its uninitialized reads), `push x; pop reg` materialization folds to
   `reg = x`, and stack-passed (cdecl/stdcall) call arguments are recovered so
-  calls render as `f(a, b, c)` instead of orphaned `push` statements.
+  calls render as `f(a, b, c)` instead of orphaned `push` statements. Uses are
+  versioned to their reaching definition (a redefined register reads its current
+  value, not the stale incoming one); constant/copy propagation with constant
+  folding and version-aware dead-store elimination collapse register churn; and
+  unreachable code after a `return`/`goto` is pruned.
 
 ## [0.6.0] - 2026-05-31
 
