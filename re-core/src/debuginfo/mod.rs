@@ -28,12 +28,15 @@ pub fn extract_debug_info(
     dwarf::extract_dwarf_info(bytes, arch)
 }
 
-/// Extract debug info from a PDB file (Windows debug symbols).
+/// Extract debug info from a PDB file (Windows debug symbols). `image_base` is
+/// the PE load base, used to map section-relative symbol offsets to virtual
+/// addresses matching the loaded segments.
 pub fn extract_pdb_info(
     pdb_path: &Path,
     arch: crate::arch::Architecture,
+    image_base: u64,
 ) -> crate::Result<DebugInfo> {
-    pdb_parser::extract_pdb_info(pdb_path, arch)
+    pdb_parser::extract_pdb_info(pdb_path, arch, image_base)
 }
 
 #[cfg(test)]

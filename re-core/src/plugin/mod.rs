@@ -384,6 +384,7 @@ mod tests {
                 libraries: Vec::new(),
                 format: crate::loader::BinaryFormat::Raw,
                 debug_info_path: None,
+                image_base: 0,
             })
         }
     }

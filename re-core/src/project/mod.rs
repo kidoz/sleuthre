@@ -99,6 +99,9 @@ pub struct Project {
     pub type_libs: TypeLibraryManager,
     pub arch: Architecture,
     pub binary_format: BinaryFormat,
+    /// PE load/image base (0 for non-PE); used to relate PDB/external symbol
+    /// offsets to the loaded segment addresses.
+    pub image_base: u64,
     pub struct_overlays: Vec<StructOverlay>,
     pub debug_profiles: Vec<DebugProfile>,
 }
@@ -267,6 +270,7 @@ impl Project {
             type_libs: TypeLibraryManager::default(),
             arch: Architecture::X86_64,
             binary_format: BinaryFormat::Raw,
+            image_base: 0,
             struct_overlays: Vec::new(),
             debug_profiles: Vec::new(),
         }
@@ -613,6 +617,7 @@ impl Project {
                 &serde_json::to_string(&self.binary_format)
                     .map_err(|e| Error::Database(e.to_string()))?,
             )?;
+            db.set_metadata("image_base", &self.image_base.to_string())?;
 
             Ok(())
         })();
@@ -718,6 +723,11 @@ impl Project {
             && let Ok(format) = serde_json::from_str(&v)
         {
             project.binary_format = format;
+        }
+        if let Some(v) = db.get_metadata("image_base")?
+            && let Ok(base) = v.parse::<u64>()
+        {
+            project.image_base = base;
         }
 
         project.db = Some(db);
@@ -1500,11 +1510,13 @@ mod tests {
         // Non-default values: load must not silently fall back to x86_64 / Raw.
         p.arch = Architecture::Arm64;
         p.binary_format = BinaryFormat::Elf;
+        p.image_base = 0x1_4000_0000;
         p.save(&path).unwrap();
 
         let loaded = Project::load(&path).unwrap();
         assert_eq!(loaded.arch, Architecture::Arm64);
         assert_eq!(loaded.binary_format, BinaryFormat::Elf);
+        assert_eq!(loaded.image_base, 0x1_4000_0000);
         let _ = std::fs::remove_file(&path);
     }
 }

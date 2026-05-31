@@ -12,10 +12,15 @@ use std::path::Path;
 pub fn extract_pdb_info(
     pdb_path: &Path,
     arch: crate::arch::Architecture,
+    image_base: u64,
 ) -> crate::Result<DebugInfo> {
     let file = std::fs::File::open(pdb_path).map_err(Error::Io)?;
     let mut pdb =
         PDB::open(file).map_err(|e| Error::DebugInfo(format!("PDB open error: {}", e)))?;
+
+    // Maps section-relative symbol offsets to RVAs. Without it, symbol
+    // addresses below would be wrong (raw `offset.offset` drops the section).
+    let address_map = pdb.address_map().ok();
 
     let mut info = DebugInfo::default();
     let mut resolver = PdbTypeResolver::new();
@@ -103,7 +108,13 @@ pub fn extract_pdb_info(
                         match symbol_data {
                             pdb::SymbolData::Procedure(proc) => {
                                 let name = proc.name.to_string().to_string();
-                                let addr = proc.offset.offset as u64;
+                                let Some(addr) = section_offset_to_va(
+                                    proc.offset,
+                                    address_map.as_ref(),
+                                    image_base,
+                                ) else {
+                                    continue;
+                                };
                                 let (ret_type, params) = resolve_procedure_type(
                                     &type_finder,
                                     &mut resolver,
@@ -124,7 +135,13 @@ pub fn extract_pdb_info(
                             }
                             pdb::SymbolData::Data(data) => {
                                 let name = data.name.to_string().to_string();
-                                let addr = data.offset.offset as u64;
+                                let Some(addr) = section_offset_to_va(
+                                    data.offset,
+                                    address_map.as_ref(),
+                                    image_base,
+                                ) else {
+                                    continue;
+                                };
                                 let type_ref =
                                     resolver.resolve(&type_finder, data.type_index, arch);
                                 info.global_variables.insert(
@@ -152,7 +169,11 @@ pub fn extract_pdb_info(
                 && let pdb::SymbolData::Public(public) = symbol_data
             {
                 let name = public.name.to_string().to_string();
-                let addr = public.offset.offset as u64;
+                let Some(addr) =
+                    section_offset_to_va(public.offset, address_map.as_ref(), image_base)
+                else {
+                    continue;
+                };
                 if public.function && !info.function_signatures.contains_key(&addr) {
                     info.function_signatures.insert(
                         addr,
@@ -171,6 +192,20 @@ pub fn extract_pdb_info(
     }
 
     Ok(info)
+}
+
+/// Map a PDB section-relative symbol offset to a virtual address in the same
+/// space as the loaded segments: section-relative → RVA (via the address map) →
+/// `image_base + rva`. Returns `None` when the offset can't be resolved (so the
+/// symbol is skipped rather than recorded at a bogus address).
+fn section_offset_to_va(
+    offset: pdb::PdbInternalSectionOffset,
+    address_map: Option<&pdb::AddressMap<'_>>,
+    image_base: u64,
+) -> Option<u64> {
+    offset
+        .to_rva(address_map?)
+        .map(|rva| image_base + rva.0 as u64)
 }
 
 struct PdbTypeResolver {

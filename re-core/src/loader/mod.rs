@@ -55,6 +55,11 @@ pub struct LoadedBinary {
     pub libraries: Vec<String>,
     pub format: BinaryFormat,
     pub debug_info_path: Option<PathBuf>,
+    /// Load/image base the segment virtual addresses are relative to. Nonzero
+    /// for PE (the optional-header ImageBase); 0 elsewhere (ELF/Mach-O segment
+    /// addresses are already absolute in this loader). Used to map PDB
+    /// section-relative offsets to the same address space as the segments.
+    pub image_base: u64,
 }
 
 pub fn load_binary(path: &Path) -> Result<LoadedBinary> {
@@ -292,6 +297,7 @@ fn load_elf(elf: elf::Elf, bytes: &[u8]) -> Result<LoadedBinary> {
         libraries,
         format: BinaryFormat::Elf,
         debug_info_path: None,
+        image_base: 0,
     })
 }
 
@@ -397,6 +403,7 @@ fn load_pe(pe: pe::PE, bytes: &[u8]) -> Result<LoadedBinary> {
         libraries,
         format: BinaryFormat::Pe,
         debug_info_path: pdb_path,
+        image_base,
     })
 }
 
@@ -557,6 +564,7 @@ fn load_macho_single(macho: mach::MachO, bytes: &[u8]) -> Result<LoadedBinary> {
         libraries,
         format: BinaryFormat::MachO,
         debug_info_path: None,
+        image_base: 0,
     })
 }
 
@@ -594,6 +602,7 @@ pub fn load_raw_binary(
         libraries: Vec::new(),
         format: BinaryFormat::Raw,
         debug_info_path: None,
+        image_base: 0,
     })
 }
 

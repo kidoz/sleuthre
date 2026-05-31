@@ -248,6 +248,7 @@ fn analyze_loaded_with_bytes(
     project.libraries = loaded.libraries;
     project.arch = loaded.arch;
     project.binary_format = loaded.format;
+    project.image_base = loaded.image_base;
 
     // --- Disassembler (created and dropped in this scope) ---
     let disasm = Disassembler::new(loaded.arch).ok();
@@ -364,7 +365,9 @@ fn analyze_loaded_with_bytes(
         pdb_debug = pdb_candidates
             .into_iter()
             .find(|p| p.exists())
-            .map(|p| debuginfo::extract_pdb_info(&p, loaded.arch).unwrap_or_default())
+            .map(|p| {
+                debuginfo::extract_pdb_info(&p, loaded.arch, loaded.image_base).unwrap_or_default()
+            })
             .unwrap_or_default();
     }
 

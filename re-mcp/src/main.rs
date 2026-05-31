@@ -973,7 +973,7 @@ impl McpServer {
                 };
                 if let Some(project) = &mut self.project {
                     let pdb_path = std::path::Path::new(path);
-                    match debuginfo::extract_pdb_info(pdb_path, project.arch) {
+                    match debuginfo::extract_pdb_info(pdb_path, project.arch, project.image_base) {
                         Ok(debug_info) => {
                             let mut sig_count = 0usize;
                             let mut type_count = 0usize;
