@@ -30,62 +30,81 @@ pub fn lift_function(name: &str, entry: u64, instructions: &[Instruction]) -> Ll
 /// core data effect, then rely on later passes/CFG to re-attach control flow.
 fn lift_instruction(func: &mut LlilFunction, insn: &Instruction) -> Vec<LlilStmt> {
     let raw = insn.mnemonic.to_lowercase();
-    let (base, _cond) = strip_condition_suffix(&raw);
     let ops: Vec<&str> = if insn.op_str.is_empty() {
         Vec::new()
     } else {
         insn.op_str.split(',').map(|s| s.trim()).collect()
     };
 
-    match base {
+    // Try the full mnemonic first: flag-setting forms like `movs`/`muls`/`bics`/
+    // `lsls` end in characters that look like condition codes, so stripping a
+    // condition suffix up front would mangle them. Only on a miss do we strip a
+    // genuine condition suffix and retry (e.g. `addeq` -> `add`).
+    if let Some(stmts) = lift_mnemonic(func, &raw, &ops) {
+        return stmts;
+    }
+    let (base, _cond) = strip_condition_suffix(&raw);
+    if base != raw
+        && let Some(stmts) = lift_mnemonic(func, base, &ops)
+    {
+        return stmts;
+    }
+
+    vec![LlilStmt::Unimplemented {
+        mnemonic: insn.mnemonic.clone(),
+        op_str: insn.op_str.clone(),
+    }]
+}
+
+/// Lift a single (already lower-cased, condition-free) ARM mnemonic, or `None`
+/// if it isn't recognised.
+fn lift_mnemonic(func: &mut LlilFunction, mn: &str, ops: &[&str]) -> Option<Vec<LlilStmt>> {
+    Some(match mn {
         "nop" => vec![LlilStmt::Nop],
 
         // --- Data movement ---
-        "mov" | "movs" | "mvn" | "mvns" => lift_mov(func, base, &ops),
-        "movw" => lift_movw(func, &ops),
-        "movt" => lift_movt(func, &ops),
+        "mov" | "movs" | "mvn" | "mvns" => lift_mov(func, mn, ops),
+        "movw" => lift_movw(func, ops),
+        "movt" => lift_movt(func, ops),
 
         // --- Arithmetic (Rd, Rn, op2 form) ---
-        "add" | "adds" => lift_alu3(func, BinOp::Add, &ops),
-        "sub" | "subs" => lift_alu3(func, BinOp::Sub, &ops),
-        "rsb" | "rsbs" => lift_alu3_reversed(func, BinOp::Sub, &ops),
-        "mul" | "muls" => lift_alu3(func, BinOp::Mul, &ops),
+        "add" | "adds" => lift_alu3(func, BinOp::Add, ops),
+        "sub" | "subs" => lift_alu3(func, BinOp::Sub, ops),
+        "rsb" | "rsbs" => lift_alu3_reversed(func, BinOp::Sub, ops),
+        "mul" | "muls" => lift_alu3(func, BinOp::Mul, ops),
 
         // --- Bitwise ---
-        "and" | "ands" => lift_alu3(func, BinOp::And, &ops),
-        "orr" | "orrs" => lift_alu3(func, BinOp::Or, &ops),
-        "eor" | "eors" => lift_alu3(func, BinOp::Xor, &ops),
-        "bic" | "bics" => lift_bic(func, &ops),
-        "lsl" | "lsls" => lift_alu3(func, BinOp::Shl, &ops),
-        "lsr" | "lsrs" => lift_alu3(func, BinOp::Shr, &ops),
-        "asr" | "asrs" => lift_alu3(func, BinOp::Sar, &ops),
+        "and" | "ands" => lift_alu3(func, BinOp::And, ops),
+        "orr" | "orrs" => lift_alu3(func, BinOp::Or, ops),
+        "eor" | "eors" => lift_alu3(func, BinOp::Xor, ops),
+        "bic" | "bics" => lift_bic(func, ops),
+        "lsl" | "lsls" => lift_alu3(func, BinOp::Shl, ops),
+        "lsr" | "lsrs" => lift_alu3(func, BinOp::Shr, ops),
+        "asr" | "asrs" => lift_alu3(func, BinOp::Sar, ops),
 
         // --- Comparison ---
-        "cmp" => lift_cmp(func, &ops),
-        "cmn" => lift_cmn(func, &ops),
-        "tst" => lift_tst(func, &ops),
+        "cmp" => lift_cmp(func, ops),
+        "cmn" => lift_cmn(func, ops),
+        "tst" => lift_tst(func, ops),
 
         // --- Loads / stores ---
-        "ldr" | "ldrb" | "ldrh" | "ldrsb" | "ldrsh" => lift_ldr(func, base, &ops),
-        "str" | "strb" | "strh" => lift_str(func, base, &ops),
+        "ldr" | "ldrb" | "ldrh" | "ldrsb" | "ldrsh" => lift_ldr(func, mn, ops),
+        "str" | "strb" | "strh" => lift_str(func, mn, ops),
 
         // --- Stack ---
-        "push" => lift_push(func, &ops),
-        "pop" => lift_pop(func, &ops),
+        "push" => lift_push(func, ops),
+        "pop" => lift_pop(func, ops),
 
         // --- Branches ---
-        "b" => lift_branch(func, &ops),
-        "bl" | "blx" => lift_call(func, &ops),
-        "bx" => lift_return_or_call(func, &ops),
+        "b" => lift_branch(func, ops),
+        "bl" | "blx" => lift_call(func, ops),
+        "bx" => lift_return_or_call(func, ops),
 
         // --- Thumb IT block: treat as NOP (conditions handled via CFG later) ---
         "it" | "itt" | "ite" | "itte" | "itee" | "iteee" => vec![LlilStmt::Nop],
 
-        _ => vec![LlilStmt::Unimplemented {
-            mnemonic: insn.mnemonic.clone(),
-            op_str: insn.op_str.clone(),
-        }],
-    }
+        _ => return None,
+    })
 }
 
 /// Strip an ARM condition-code suffix from a mnemonic (`addeq` → (`add`, `eq`)).
@@ -483,6 +502,35 @@ mod tests {
     fn lift_add_three_regs() {
         let mut func = LlilFunction::new("t".into(), 0);
         let stmts = lift_instruction(&mut func, &mk(0, "add", "r0, r1, r2"));
+        assert!(matches!(&stmts[0], LlilStmt::SetReg { dest, .. } if dest == "r0"));
+    }
+
+    #[test]
+    fn flag_setting_forms_lift_not_dropped() {
+        // These mnemonics end in characters that look like condition codes
+        // (movs→"vs", muls→"ls", bics→"cs", lsls→"ls"); they must lift rather
+        // than be mangled by condition-suffix stripping into Unimplemented.
+        for (mn, ops) in [
+            ("movs", "r0, #1"),
+            ("muls", "r0, r1, r2"),
+            ("bics", "r0, r1, r2"),
+            ("lsls", "r0, r1, #2"),
+        ] {
+            let mut func = LlilFunction::new("t".into(), 0);
+            let stmts = lift_instruction(&mut func, &mk(0, mn, ops));
+            assert!(
+                !matches!(stmts.as_slice(), [LlilStmt::Unimplemented { .. }]),
+                "{mn} was dropped to Unimplemented"
+            );
+        }
+    }
+
+    #[test]
+    fn conditional_suffix_still_strips_on_miss() {
+        // `addeq` isn't a known mnemonic; the condition suffix is stripped and
+        // it lifts as `add`.
+        let mut func = LlilFunction::new("t".into(), 0);
+        let stmts = lift_instruction(&mut func, &mk(0, "addeq", "r0, r1, r2"));
         assert!(matches!(&stmts[0], LlilStmt::SetReg { dest, .. } if dest == "r0"));
     }
 
