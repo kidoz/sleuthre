@@ -5,6 +5,18 @@ use crate::theme::SyntaxColors;
 
 impl SleuthreApp {
     pub(crate) fn show_decompiler(&mut self, ui: &mut egui::Ui) {
+        // Whether the displayed function's signature was inferred heuristically
+        // (vs. recovered from debug info / set by the user). Computed before the
+        // header closure to avoid borrowing `self` while it is mutated there.
+        let signature_inferred = self
+            .project
+            .as_ref()
+            .and_then(|p| {
+                let start = p.functions.find_function_containing(self.current_address)?;
+                p.types.function_signatures.get(&start)
+            })
+            .is_some_and(|sig| sig.source.is_inferred());
+
         ui.horizontal(|ui| {
             if ui
                 .button("🔄 Refresh")
@@ -17,6 +29,18 @@ impl SleuthreApp {
             }
             ui.add_space(8.0);
             ui.label(format!("Function: 0x{:X}", self.current_address));
+            if signature_inferred {
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new("⚠ inferred signature")
+                        .color(egui::Color32::from_rgb(200, 170, 90))
+                        .small(),
+                )
+                .on_hover_text(
+                    "This function's signature was inferred by analysis \
+                     (lower confidence) — not from debug info or user input.",
+                );
+            }
         });
         ui.separator();
 
