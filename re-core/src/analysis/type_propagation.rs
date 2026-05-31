@@ -12,6 +12,11 @@ use crate::typelib::TypeLibraryManager;
 use crate::types::{FunctionParameter, FunctionSignature, PrimitiveType, TypeManager, TypeRef};
 use std::collections::BTreeMap;
 
+/// Backstop on backward-inference rounds. Inference is monotonic and converges
+/// in as many rounds as the longest resolvable call chain is deep; this cap
+/// just bounds pathological inputs (real chains are shallow).
+const MAX_INFERENCE_ROUNDS: usize = 8;
+
 /// Type information inferred for a single function.
 #[derive(Debug, Clone, Default)]
 pub struct FunctionTypeInfo {
@@ -182,54 +187,64 @@ impl<'a> TypePropagator<'a> {
             }
         }
 
-        // === Pass 3: Backward IL-based inference (return + parameter types) ===
+        // === Pass 3: Backward IL-based inference, iterated to a fixpoint ===
         // Following values across calls, infer an untyped function's return
         // type (its result flows into a typed callee's argument) and its
-        // parameter types (a typed value flows into its arguments). Requires
-        // per-function IL (`with_il`); a no-op otherwise.
-        let ret_types = self.infer_return_types(&result);
-        let param_types = self.infer_param_types(&result);
-        let targets: std::collections::BTreeSet<u64> = ret_types
-            .keys()
-            .chain(param_types.keys())
-            .copied()
-            .collect();
-        for addr in targets {
-            if result
-                .get(&addr)
-                .and_then(|i| i.signature.as_ref())
-                .is_some()
-            {
-                continue; // never override a seeded/forward signature
-            }
-            let ret = ret_types.get(&addr).cloned();
-            let params = param_types.get(&addr).cloned().unwrap_or_default();
-            if ret.is_none() && params.is_empty() {
-                continue;
-            }
-            let name = self
-                .functions
-                .functions
-                .get(&addr)
-                .map(|f| f.name.clone())
-                .unwrap_or_else(|| format!("sub_{:x}", addr));
-            let parameters = params
-                .into_iter()
-                .enumerate()
-                .map(|(i, type_ref)| FunctionParameter {
-                    name: format!("arg{}", i),
-                    type_ref,
-                })
+        // parameter types (a typed value flows into its arguments). Each round
+        // can type new functions, which become evidence for the next round
+        // (resolving a call chain one hop deeper). Inference is monotonic —
+        // signatures are only ever added, never changed — so it converges;
+        // `MAX_INFERENCE_ROUNDS` is a backstop. A no-op without IL (`with_il`).
+        for _ in 0..MAX_INFERENCE_ROUNDS {
+            let ret_types = self.infer_return_types(&result);
+            let param_types = self.infer_param_types(&result);
+            let targets: std::collections::BTreeSet<u64> = ret_types
+                .keys()
+                .chain(param_types.keys())
+                .copied()
                 .collect();
-            result.entry(addr).or_default().signature = Some(FunctionSignature {
-                name,
-                // `Void` is this codebase's "unknown" placeholder when only the
-                // parameters could be recovered.
-                return_type: ret.unwrap_or(TypeRef::Primitive(PrimitiveType::Void)),
-                parameters,
-                calling_convention: String::new(),
-                is_variadic: false,
-            });
+            let mut changed = false;
+            for addr in targets {
+                if result
+                    .get(&addr)
+                    .and_then(|i| i.signature.as_ref())
+                    .is_some()
+                {
+                    continue; // never override a seeded/forward/already-inferred signature
+                }
+                let ret = ret_types.get(&addr).cloned();
+                let params = param_types.get(&addr).cloned().unwrap_or_default();
+                if ret.is_none() && params.is_empty() {
+                    continue;
+                }
+                let name = self
+                    .functions
+                    .functions
+                    .get(&addr)
+                    .map(|f| f.name.clone())
+                    .unwrap_or_else(|| format!("sub_{:x}", addr));
+                let parameters = params
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, type_ref)| FunctionParameter {
+                        name: format!("arg{}", i),
+                        type_ref,
+                    })
+                    .collect();
+                result.entry(addr).or_default().signature = Some(FunctionSignature {
+                    name,
+                    // `Void` is this codebase's "unknown" placeholder when only
+                    // the parameters could be recovered.
+                    return_type: ret.unwrap_or(TypeRef::Primitive(PrimitiveType::Void)),
+                    parameters,
+                    calling_convention: String::new(),
+                    is_variadic: false,
+                });
+                changed = true;
+            }
+            if !changed {
+                break; // fixpoint reached
+            }
         }
 
         result
@@ -889,5 +904,115 @@ mod tests {
             .expect("G's parameter type should be inferred from the typed producer");
         assert_eq!(g.parameters.len(), 1);
         assert_eq!(g.parameters[0].type_ref, char_ptr);
+    }
+
+    #[test]
+    fn fixpoint_resolves_a_two_hop_chain() {
+        use crate::analysis::abi::abi_registers;
+        use crate::analysis::functions::CallingConvention;
+        use crate::arch::Architecture;
+        use crate::il::mlil::{MlilExpr, MlilInst, MlilStmt, SsaVar};
+        use crate::il::ssa::DefUse;
+
+        let var = |n: &str| SsaVar {
+            name: n.to_string(),
+            version: 0,
+        };
+        let call = |addr: u64, args: Vec<MlilExpr>| MlilExpr::Call {
+            target: Box::new(MlilExpr::Const(addr)),
+            args,
+        };
+        // `rax = call(callee); rdi = rax; rax = call(sink)(rdi)` at `base`.
+        let route = |base: u64, callee: u64, sink: u64| {
+            vec![
+                MlilInst {
+                    address: base,
+                    stmts: vec![MlilStmt::Assign {
+                        dest: var("rax"),
+                        src: call(callee, vec![]),
+                    }],
+                },
+                MlilInst {
+                    address: base + 4,
+                    stmts: vec![MlilStmt::Assign {
+                        dest: var("rdi"),
+                        src: MlilExpr::Var(var("rax")),
+                    }],
+                },
+                MlilInst {
+                    address: base + 8,
+                    stmts: vec![MlilStmt::Assign {
+                        dest: var("rax"),
+                        src: call(sink, vec![MlilExpr::Var(var("rdi"))]),
+                    }],
+                },
+            ]
+        };
+        let abi = abi_registers(
+            Architecture::X86_64,
+            CallingConvention::SysVAmd64,
+            BinaryFormat::Elf,
+        )
+        .unwrap();
+
+        // F1: rax = C(); rdi = rax; B(rdi)   — round 1 types B.param0 from C.
+        // F2: rax = A(); rdi = rax; B(rdi)   — round 2 types A.return from B.
+        let mut il_map = BTreeMap::new();
+        for (entry, callee, sink) in [(0x1000u64, 0x6000u64, 0x5000u64), (0x2000, 0x4000, 0x5000)] {
+            let mlil = MlilFunction {
+                name: format!("f_{entry:x}"),
+                entry,
+                instructions: route(entry, callee, sink),
+            };
+            let defuse = DefUse::build(&mlil);
+            il_map.insert(entry, FunctionIl { mlil, defuse, abi });
+        }
+
+        let mut functions = FunctionManager::default();
+        for a in [0x1000u64, 0x2000, 0x4000, 0x5000, 0x6000] {
+            functions.add_function(Function {
+                name: format!("sub_{a:x}"),
+                start_address: a,
+                end_address: None,
+                calling_convention: CallingConvention::SysVAmd64,
+                stack_frame_size: 0,
+            });
+        }
+        let xrefs = XrefManager::new();
+        let type_libs = TypeLibraryManager::default();
+        let imports: Vec<Import> = vec![];
+
+        // Only C @0x6000 is seeded; everything else must be derived.
+        let char_ptr = TypeRef::Pointer(Box::new(TypeRef::Primitive(PrimitiveType::Char)));
+        let mut debug_info = DebugInfo::default();
+        debug_info.function_signatures.insert(
+            0x6000,
+            FunctionSignature {
+                name: "make_str".to_string(),
+                return_type: char_ptr.clone(),
+                parameters: vec![],
+                calling_convention: String::new(),
+                is_variadic: false,
+            },
+        );
+        let types = TypeManager::default();
+
+        let propagator =
+            TypePropagator::new(&functions, &xrefs, &type_libs, &imports).with_il(&il_map);
+        let result = propagator.propagate(&debug_info, &types);
+
+        // Round 1: B's first parameter inferred from the typed producer C.
+        let b = result
+            .get(&0x5000)
+            .and_then(|i| i.signature.as_ref())
+            .expect("B should be typed in round 1");
+        assert_eq!(b.parameters.first().map(|p| &p.type_ref), Some(&char_ptr));
+        // Round 2: A's return inferred only after B became typed — requires the
+        // fixpoint loop; a single pass would leave A untyped.
+        let a = result
+            .get(&0x4000)
+            .and_then(|i| i.signature.as_ref())
+            .expect("A should be typed in round 2 via the fixpoint");
+        assert_eq!(a.return_type, char_ptr);
     }
 }
