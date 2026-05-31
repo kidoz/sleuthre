@@ -460,6 +460,109 @@ fn collect_used_vars_stmt(stmt: &MlilStmt, used: &mut std::collections::HashSet<
     }
 }
 
+/// Names of the stack and frame pointer registers across the x86 family.
+fn is_stack_or_frame_pointer(name: &str) -> bool {
+    matches!(name, "rsp" | "esp" | "sp" | "rbp" | "ebp" | "bp")
+}
+
+/// Whether `name` is a callee-saved general-purpose register on the x86 family
+/// (the set a function must preserve, so it spills them in the prologue and
+/// restores them in the epilogue). Covers both x86-32 (ebx/esi/edi/ebp) and
+/// x86-64 (rbx/rbp/r12–r15, plus rsi/rdi under Win64).
+fn is_callee_saved_register(name: &str) -> bool {
+    matches!(
+        name,
+        "rbx"
+            | "ebx"
+            | "rbp"
+            | "ebp"
+            | "rsi"
+            | "esi"
+            | "rdi"
+            | "edi"
+            | "r12"
+            | "r13"
+            | "r14"
+            | "r15"
+            | "r12d"
+            | "r13d"
+            | "r14d"
+            | "r15d"
+    )
+}
+
+/// Whether `addr` is a stack-pointer-relative address: a bare `sp`/`bp` register
+/// or `sp ± constant`. Matches the shape the lifter emits for `push` stores.
+fn is_stack_relative_addr(addr: &MlilExpr) -> bool {
+    match addr {
+        MlilExpr::Var(v) => is_stack_or_frame_pointer(&v.name),
+        MlilExpr::BinOp {
+            op: BinOp::Add | BinOp::Sub,
+            left,
+            right,
+        } => {
+            (matches!(&**left, MlilExpr::Var(v) if is_stack_or_frame_pointer(&v.name))
+                && matches!(&**right, MlilExpr::Const(_)))
+                || (matches!(&**right, MlilExpr::Var(v) if is_stack_or_frame_pointer(&v.name))
+                    && matches!(&**left, MlilExpr::Const(_)))
+        }
+        _ => false,
+    }
+}
+
+/// Whether `src` is a bare `pop`-style load from the top of stack — `*(sp)` with
+/// no offset, exactly what [`crate::il::lifter_x86`] emits for `pop reg`. This is
+/// deliberately narrow so it never matches a real frame-relative local load.
+fn is_pop_load(src: &MlilExpr) -> bool {
+    matches!(src, MlilExpr::Load { addr, .. }
+        if matches!(&**addr, MlilExpr::Var(v) if is_stack_or_frame_pointer(&v.name)))
+}
+
+/// Remove callee-saved register spill boilerplate: prologue saves
+/// (`*(sp - k) = reg` for the register's *incoming* value) and the matching
+/// epilogue restores (`reg = *(sp)`).
+///
+/// For decompiler output this is semantics-preserving: preserving caller
+/// registers is an ABI/codegen obligation with no bearing on the function's
+/// logic, so the save/restore churn is pure noise (and the saved value reads as
+/// an uninitialized register otherwise). The save is gated on the register not
+/// having been defined yet, so a genuine mid-function spill of a *computed*
+/// value into a stack local is left untouched.
+pub fn eliminate_callee_saved_spills(func: &mut MlilFunction) {
+    use std::collections::HashSet;
+
+    let mut defined: HashSet<String> = HashSet::new();
+    for inst in &mut func.instructions {
+        inst.stmts.retain(|stmt| match stmt {
+            // Prologue save: store an as-yet-undefined callee-saved register to
+            // a stack slot.
+            MlilStmt::Store {
+                addr,
+                value: MlilExpr::Var(v),
+                ..
+            } if is_stack_relative_addr(addr)
+                && is_callee_saved_register(&v.name)
+                && !defined.contains(&v.name) =>
+            {
+                false
+            }
+            // Epilogue restore: reload a callee-saved register from the top of
+            // stack (a `pop`).
+            MlilStmt::Assign { dest, src }
+                if is_callee_saved_register(&dest.name) && is_pop_load(src) =>
+            {
+                false
+            }
+            // Any other assignment marks its destination as defined.
+            MlilStmt::Assign { dest, .. } => {
+                defined.insert(dest.name.clone());
+                true
+            }
+            _ => true,
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -601,6 +704,65 @@ mod tests {
             MlilExpr::Var(v) => assert!(v.name.starts_with("flag_"), "got {}", v.name),
             other => panic!("expected fallback flag var, got {other:?}"),
         }
+    }
+
+    fn count_stores(f: &MlilFunction) -> usize {
+        f.instructions
+            .iter()
+            .flat_map(|i| &i.stmts)
+            .filter(|s| matches!(s, MlilStmt::Store { .. }))
+            .count()
+    }
+
+    fn lowered(insns: &[crate::disasm::Instruction]) -> MlilFunction {
+        let mut m = lower_to_mlil(&lift_function("test", 0x1000, insns));
+        eliminate_callee_saved_spills(&mut m);
+        m
+    }
+
+    #[test]
+    fn elides_callee_saved_save_and_restore() {
+        // `push ebx … pop ebx` is pure save/restore churn.
+        let m = lowered(&[
+            make_insn(0x1000, "push", "ebx"),
+            make_insn(0x1001, "pop", "ebx"),
+            make_insn(0x1002, "ret", ""),
+        ]);
+        assert_eq!(count_stores(&m), 0, "prologue save store should be removed");
+        let restores = m
+            .instructions
+            .iter()
+            .flat_map(|i| &i.stmts)
+            .filter(|s| {
+                matches!(s, MlilStmt::Assign { dest, src }
+                if dest.name == "ebx" && matches!(src, MlilExpr::Load { .. }))
+            })
+            .count();
+        assert_eq!(restores, 0, "epilogue pop restore should be removed");
+    }
+
+    #[test]
+    fn keeps_spill_of_computed_value() {
+        // `mov ebx, eax; push ebx` spills a *computed* value — not boilerplate.
+        let m = lowered(&[
+            make_insn(0x1000, "mov", "ebx, eax"),
+            make_insn(0x1004, "push", "ebx"),
+        ]);
+        assert_eq!(count_stores(&m), 1, "computed spill must be preserved");
+    }
+
+    #[test]
+    fn keeps_constant_argument_push() {
+        // `push 3` is a call argument, not a register save.
+        let m = lowered(&[make_insn(0x1000, "push", "3")]);
+        assert_eq!(count_stores(&m), 1);
+    }
+
+    #[test]
+    fn keeps_caller_saved_push() {
+        // eax is caller-saved; pushing it isn't prologue boilerplate.
+        let m = lowered(&[make_insn(0x1000, "push", "eax")]);
+        assert_eq!(count_stores(&m), 1);
     }
 
     #[test]

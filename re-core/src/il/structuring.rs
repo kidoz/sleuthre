@@ -2062,6 +2062,7 @@ pub fn decompile(
     let mut mlil = crate::il::mlil::lower_to_mlil(&llil);
     crate::il::mlil::apply_ssa(&mut mlil);
     crate::il::mlil::eliminate_dead_stores(&mut mlil);
+    crate::il::mlil::eliminate_callee_saved_spills(&mut mlil);
 
     let (mut info, stack_map) =
         analyze_function_signature(&mlil, instructions, arch, symbols, type_info, types);
