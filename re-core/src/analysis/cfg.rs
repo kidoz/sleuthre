@@ -3,7 +3,7 @@ use crate::disasm::Disassembler;
 use crate::memory::MemoryMap;
 use petgraph::graph::{DiGraph, NodeIndex};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 /// Upper bound on jump-table cases we will follow, to cap pathological or
 /// misidentified tables.
@@ -67,91 +67,129 @@ impl ControlFlowGraph {
         disasm: &Disassembler,
         start_addr: u64,
     ) -> Result<()> {
+        /// One decoded instruction: where the next one starts, its branch
+        /// successors (target + edge kind), and whether it ends a basic block.
+        struct InsnInfo {
+            next: u64,
+            succ: Vec<(u64, EdgeKind)>,
+            terminates: bool,
+        }
+
+        // Cap to bound pathological/garbage decode walks.
+        const MAX_INSNS: usize = 200_000;
+
+        // --- Pass 1: recursive-descent decode; record instructions + leaders ---
+        // A leader starts a basic block: the entry, and every branch target.
+        // (Fall-through positions after a conditional/call are leaders too,
+        // since they appear as successor targets below.)
+        let mut insns: BTreeMap<u64, InsnInfo> = BTreeMap::new();
+        let mut leaders: BTreeSet<u64> = BTreeSet::new();
+        leaders.insert(start_addr);
+
         let mut queue = VecDeque::new();
         queue.push_back(start_addr);
 
-        // Collect block_start -> (successor_address, edge_kind) for edge creation
-        let mut block_successors: Vec<(u64, Vec<(u64, EdgeKind)>)> = Vec::new();
-
-        while let Some(current_addr) = queue.pop_front() {
-            if self.addr_to_node.contains_key(&current_addr) {
+        while let Some(addr) = queue.pop_front() {
+            if insns.contains_key(&addr) || insns.len() >= MAX_INSNS {
                 continue;
             }
-
-            let mut addr = current_addr;
-            let mut instructions = Vec::new();
-            let mut targets: Vec<(u64, EdgeKind)> = Vec::new();
-
-            while let Ok(insn) = disasm.disassemble_one(memory, addr) {
-                instructions.push(insn.address);
-                let next_addr = insn.address + insn.bytes.len() as u64;
-
-                let is_branch = insn
-                    .groups
-                    .iter()
-                    .any(|g| g == "jump" || g == "call" || g == "ret");
-
-                if is_branch {
-                    let mnemonic = insn.mnemonic.to_lowercase();
-
-                    if mnemonic == "ret" || mnemonic == "retn" {
-                        // End of function path — no successors
-                    } else if mnemonic == "call" {
-                        // Call usually returns, so continue to next instruction
-                        targets.push((next_addr, EdgeKind::CallFallthrough));
-                    } else if mnemonic == "jmp" {
-                        if let Some(target) = parse_target(&insn.op_str) {
-                            // Direct unconditional jump.
-                            targets.push((target, EdgeKind::Unconditional));
-                        } else if let Some(base) = parse_jump_table_base(&insn.op_str) {
-                            // Indirect jump through a compiler-emitted jump
-                            // table (`jmp [reg*scale + base]`): recover each
-                            // case target and link it with a Switch edge. A
-                            // bare `[reg]` indirect jump has no statically
-                            // recoverable target and is left unlinked.
-                            for case in detect_jump_table(memory, base, MAX_JUMP_TABLE_CASES) {
-                                targets.push((case, EdgeKind::Switch));
-                            }
-                        }
-                    } else {
-                        // Conditional jump: branch target (true) and fallthrough (false)
-                        if let Some(target) = parse_target(&insn.op_str) {
-                            targets.push((target, EdgeKind::ConditionalTrue));
-                        }
-                        targets.push((next_addr, EdgeKind::ConditionalFalse));
-                    }
-                    addr = next_addr;
-                    break;
-                }
-
-                addr = next_addr;
-            }
-
-            if instructions.is_empty() {
+            let Ok(insn) = disasm.disassemble_one(memory, addr) else {
                 continue;
-            }
-
-            let block = BasicBlock {
-                start_address: current_addr,
-                end_address: addr,
-                instructions,
             };
-            self.add_block(block);
+            let next = insn.address + insn.bytes.len() as u64;
+            let is_branch = insn
+                .groups
+                .iter()
+                .any(|g| g == "jump" || g == "call" || g == "ret");
 
-            // Queue targets for discovery
-            for &(target, _) in &targets {
-                if !self.addr_to_node.contains_key(&target) {
-                    queue.push_back(target);
+            let mut succ: Vec<(u64, EdgeKind)> = Vec::new();
+            if is_branch {
+                let mnemonic = insn.mnemonic.to_lowercase();
+                if mnemonic == "ret" || mnemonic == "retn" {
+                    // End of path — no successors.
+                } else if mnemonic == "call" {
+                    succ.push((next, EdgeKind::CallFallthrough));
+                } else if mnemonic == "jmp" {
+                    if let Some(target) = parse_target(&insn.op_str) {
+                        succ.push((target, EdgeKind::Unconditional));
+                    } else if let Some(base) = parse_jump_table_base(&insn.op_str) {
+                        // Indirect jump through a compiler-emitted jump table
+                        // (`jmp [reg*scale + base]`); a bare `[reg]` indirect
+                        // jump has no statically recoverable target.
+                        for case in detect_jump_table(memory, base, MAX_JUMP_TABLE_CASES) {
+                            succ.push((case, EdgeKind::Switch));
+                        }
+                    }
+                } else {
+                    // Conditional: branch target (true) and fall-through (false).
+                    if let Some(target) = parse_target(&insn.op_str) {
+                        succ.push((target, EdgeKind::ConditionalTrue));
+                    }
+                    succ.push((next, EdgeKind::ConditionalFalse));
                 }
             }
 
-            block_successors.push((current_addr, targets));
+            for &(target, _) in &succ {
+                leaders.insert(target);
+                queue.push_back(target);
+            }
+            if !is_branch {
+                // Straight-line: keep decoding the same block.
+                queue.push_back(next);
+            }
+
+            insns.insert(
+                addr,
+                InsnInfo {
+                    next,
+                    succ,
+                    terminates: is_branch,
+                },
+            );
         }
 
-        // Second pass: add edges between blocks
-        for (source_addr, targets) in &block_successors {
+        // --- Pass 2: form blocks by walking from each leader until the next
+        // address is itself a leader (a split point) or the instruction ends a
+        // block. Record each block's outgoing edges as we go. ---
+        let mut block_edges: Vec<(u64, Vec<(u64, EdgeKind)>)> = Vec::new();
+        for &leader in &leaders {
+            if !insns.contains_key(&leader) {
+                continue; // a target with no decoded instruction (e.g. data)
+            }
+            let mut addr = leader;
+            let mut instructions = Vec::new();
+            let (end, edges) = loop {
+                let info = &insns[&addr];
+                instructions.push(addr);
+                if info.terminates {
+                    break (info.next, info.succ.clone());
+                }
+                // A non-terminating instruction whose successor begins another
+                // block (a leader / split point) or runs off decoded code: end
+                // here. If the successor forms a block, flow straight into it.
+                if leaders.contains(&info.next) || !insns.contains_key(&info.next) {
+                    let next = info.next;
+                    let edges = if insns.contains_key(&next) {
+                        vec![(next, EdgeKind::Unconditional)]
+                    } else {
+                        Vec::new()
+                    };
+                    break (next, edges);
+                }
+                addr = info.next;
+            };
+            self.add_block(BasicBlock {
+                start_address: leader,
+                end_address: end,
+                instructions,
+            });
+            block_edges.push((leader, edges));
+        }
+
+        // --- Pass 3: add edges between formed blocks ---
+        for (source_addr, edges) in &block_edges {
             if let Some(&source_node) = self.addr_to_node.get(source_addr) {
-                for &(target_addr, edge_kind) in targets {
+                for &(target_addr, edge_kind) in edges {
                     if let Some(&target_node) = self.addr_to_node.get(&target_addr)
                         && !self.graph.contains_edge(source_node, target_node)
                     {
@@ -478,5 +516,35 @@ mod tests {
         assert_eq!(switch_edges, 2, "expected 2 switch edges");
         assert!(cfg.addr_to_node.contains_key(&0x1010));
         assert!(cfg.addr_to_node.contains_key(&0x1018));
+    }
+
+    #[test]
+    fn branch_into_mid_block_splits_it() {
+        // nop; nop; jmp 0x1001 — the jump targets the middle of the straight-line
+        // run, which must split the block there rather than create an overlap.
+        let mut code = vec![0x90u8, 0x90, 0xEB, 0xFD]; // nop; nop; jmp -3 (→ 0x1001)
+        code.resize(64, 0x00); // pad so disassemble_one's read window stays in range
+        let mut map = MemoryMap::default();
+        map.add_segment(MemorySegment {
+            name: "code".to_string(),
+            start: 0x1000,
+            size: code.len() as u64,
+            data: code,
+            permissions: Permissions::READ | Permissions::EXECUTE,
+        })
+        .unwrap();
+
+        let disasm = Disassembler::new(Architecture::X86_64).unwrap();
+        let mut cfg = ControlFlowGraph::new();
+        cfg.build_for_function(&map, &disasm, 0x1000).unwrap();
+
+        // The mid-run target became a leader (the block was split there)…
+        assert!(
+            cfg.addr_to_node.contains_key(&0x1001),
+            "mid-block jump target was not made a block leader"
+        );
+        // …so the entry block holds only the first instruction, not the whole run.
+        let head = cfg.addr_to_node[&0x1000];
+        assert_eq!(cfg.graph[head].instructions, vec![0x1000]);
     }
 }
