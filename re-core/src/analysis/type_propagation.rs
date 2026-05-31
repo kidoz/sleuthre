@@ -304,6 +304,13 @@ impl<'a> TypePropagator<'a> {
                         let Some(call_g_site) = il.defuse.reaching_def(ret_reg, def_site) else {
                             continue;
                         };
+                        // `reaching_def` is a single-path approximation; only
+                        // trust the producer→consumer link when no control-flow
+                        // transfer sits between them (so the value provably flows
+                        // straight through), avoiding a branch-induced mis-link.
+                        if control_flow_between(il, call_g_site, call_site) {
+                            continue;
+                        }
                         if let Some(g_addr) = call_defining(stmt_at(il, call_g_site), ret_reg) {
                             candidates
                                 .entry(g_addr)
@@ -374,6 +381,11 @@ impl<'a> TypePropagator<'a> {
                         let Some(prod_site) = il.defuse.reaching_def(ret_reg, def_site) else {
                             continue;
                         };
+                        // Same straight-line requirement as return inference: no
+                        // control-flow transfer between producer and consumer.
+                        if control_flow_between(il, prod_site, call_site) {
+                            continue;
+                        }
                         if let Some(h_addr) = call_defining(stmt_at(il, prod_site), ret_reg)
                             && let Some(h_sig) =
                                 result.get(&h_addr).and_then(|i| i.signature.as_ref())
@@ -438,6 +450,32 @@ impl<'a> TypePropagator<'a> {
         }
         None
     }
+}
+
+/// Whether any control-flow transfer (jump, conditional branch, or return)
+/// appears strictly between the two sites in program order. Used to keep the
+/// single-path `reaching_def` links sound: if flow can divert between a value's
+/// producer and consumer, the linear "latest definition" may not be the one
+/// that actually reaches at runtime.
+fn control_flow_between(il: &FunctionIl, a: Site, b: Site) -> bool {
+    let a = (a.inst_index, a.stmt_index);
+    let b = (b.inst_index, b.stmt_index);
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    for (ii, inst) in il.mlil.instructions.iter().enumerate() {
+        for (si, stmt) in inst.stmts.iter().enumerate() {
+            let here = (ii, si);
+            if here > lo
+                && here < hi
+                && matches!(
+                    stmt,
+                    MlilStmt::Jump { .. } | MlilStmt::BranchIf { .. } | MlilStmt::Return
+                )
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// The statement at `site` within a function's IL.
@@ -811,6 +849,117 @@ mod tests {
             .expect("G's return type should be inferred from the typed argument");
         assert_eq!(g.return_type, char_ptr);
         assert_eq!(g.name, "sub_4000");
+    }
+
+    #[test]
+    fn inference_skips_across_control_flow() {
+        use crate::analysis::abi::abi_registers;
+        use crate::analysis::functions::CallingConvention;
+        use crate::arch::Architecture;
+        use crate::il::mlil::{MlilExpr, MlilInst, MlilStmt, SsaVar};
+        use crate::il::ssa::DefUse;
+
+        let var = |n: &str| SsaVar {
+            name: n.to_string(),
+            version: 0,
+        };
+        let call = |addr: u64, args: Vec<MlilExpr>| MlilExpr::Call {
+            target: Box::new(MlilExpr::Const(addr)),
+            args,
+        };
+
+        // Same shape as the return-inference test, but a conditional branch sits
+        // between G's call and the arg-register copy — so the single-path link
+        // is unsound and inference must NOT fire.
+        //   rax = G(); if (...) goto; rdi = rax; rax = H(rdi)
+        let mlil = MlilFunction {
+            name: "C".to_string(),
+            entry: 0x1000,
+            instructions: vec![
+                MlilInst {
+                    address: 0x1000,
+                    stmts: vec![MlilStmt::Assign {
+                        dest: var("rax"),
+                        src: call(0x4000, vec![]),
+                    }],
+                },
+                MlilInst {
+                    address: 0x1004,
+                    stmts: vec![MlilStmt::BranchIf {
+                        cond: MlilExpr::Const(0),
+                        target: MlilExpr::Const(0x9999),
+                    }],
+                },
+                MlilInst {
+                    address: 0x1008,
+                    stmts: vec![MlilStmt::Assign {
+                        dest: var("rdi"),
+                        src: MlilExpr::Var(var("rax")),
+                    }],
+                },
+                MlilInst {
+                    address: 0x100c,
+                    stmts: vec![MlilStmt::Assign {
+                        dest: var("rax"),
+                        src: call(0x5000, vec![MlilExpr::Var(var("rdi"))]),
+                    }],
+                },
+            ],
+        };
+        let abi = abi_registers(
+            Architecture::X86_64,
+            CallingConvention::SysVAmd64,
+            BinaryFormat::Elf,
+        )
+        .unwrap();
+        let defuse = DefUse::build(&mlil);
+        let mut il_map = BTreeMap::new();
+        il_map.insert(0x1000, FunctionIl { mlil, defuse, abi });
+
+        let mut functions = FunctionManager::default();
+        for (a, name) in [(0x1000u64, "C"), (0x4000, "sub_4000"), (0x5000, "use_str")] {
+            functions.add_function(Function {
+                name: name.to_string(),
+                start_address: a,
+                end_address: None,
+                calling_convention: CallingConvention::SysVAmd64,
+                stack_frame_size: 0,
+            });
+        }
+        let xrefs = XrefManager::new();
+        let type_libs = TypeLibraryManager::default();
+        let imports: Vec<Import> = vec![];
+
+        let char_ptr = TypeRef::Pointer(Box::new(TypeRef::Primitive(PrimitiveType::Char)));
+        let mut debug_info = DebugInfo::default();
+        debug_info.function_signatures.insert(
+            0x5000,
+            FunctionSignature {
+                name: "use_str".to_string(),
+                return_type: TypeRef::Primitive(PrimitiveType::I32),
+                parameters: vec![FunctionParameter {
+                    name: "s".to_string(),
+                    type_ref: char_ptr,
+                }],
+                calling_convention: String::new(),
+                is_variadic: false,
+                source: SignatureSource::DebugInfo,
+            },
+        );
+        let types = TypeManager::default();
+
+        let propagator =
+            TypePropagator::new(&functions, &xrefs, &type_libs, &imports).with_il(&il_map);
+        let result = propagator.propagate(&debug_info, &types);
+
+        // The intervening branch makes the link unsound → no inference for G.
+        assert!(
+            result
+                .get(&0x4000)
+                .and_then(|i| i.signature.as_ref())
+                .is_none(),
+            "inference should not cross a control-flow transfer"
+        );
     }
 
     #[test]
