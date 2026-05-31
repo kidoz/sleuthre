@@ -25,7 +25,7 @@ fn lift_instruction(func: &mut LlilFunction, insn: &Instruction) -> Vec<LlilStmt
 
     match mn.as_str() {
         "nop" => vec![LlilStmt::Nop],
-        "add" | "addu" => lift_binary_op(func, &ops, BinOp::Add),
+        "add" | "addu" | "addi" | "addiu" => lift_binary_op(func, &ops, BinOp::Add),
         "sub" | "subu" => lift_binary_op(func, &ops, BinOp::Sub),
         "and" | "andi" => lift_binary_op(func, &ops, BinOp::And),
         "or" | "ori" => lift_binary_op(func, &ops, BinOp::Or),
@@ -52,6 +52,18 @@ fn lift_instruction(func: &mut LlilFunction, insn: &Instruction) -> Vec<LlilStmt
 }
 
 fn parse_operand(func: &mut LlilFunction, op: &str) -> ExprId {
+    let op = op.trim();
+    // Negative immediates (e.g. `addiu $sp, $sp, -16`) — stored as the
+    // two's-complement bit pattern in the unsigned Const.
+    if let Some(rest) = op.strip_prefix('-') {
+        let magnitude = rest
+            .strip_prefix("0x")
+            .and_then(|h| i64::from_str_radix(h, 16).ok())
+            .or_else(|| rest.parse::<i64>().ok());
+        if let Some(m) = magnitude {
+            return func.add_expr(LlilExpr::Const((-m) as u64));
+        }
+    }
     if let Ok(val) = op.parse::<u64>() {
         func.add_expr(LlilExpr::Const(val))
     } else if let Some(hex) = op.strip_prefix("0x") {
@@ -246,5 +258,16 @@ mod tests {
             stmts.as_slice(),
             [LlilStmt::Unimplemented { .. }]
         ));
+    }
+
+    #[test]
+    fn addiu_negative_immediate_lifts() {
+        let mut func = LlilFunction::new("t".into(), 0x1000);
+        // The ubiquitous prologue `addiu $sp, $sp, -16` must lift (not drop).
+        let stmts = lift_instruction(&mut func, &make_insn("addiu", "$sp, $sp, -16"));
+        assert!(matches!(stmts.as_slice(), [LlilStmt::SetReg { dest, .. }] if dest == "$sp"));
+        // And the negative immediate parses to the two's-complement constant.
+        let id = parse_operand(&mut func, "-16");
+        assert_eq!(func.exprs[id], LlilExpr::Const((-16i64) as u64));
     }
 }
