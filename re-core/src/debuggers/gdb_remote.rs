@@ -28,6 +28,15 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Mutex;
 use std::time::Duration;
 
+/// Upper bound on a single RSP packet body (and on leading garbage before a
+/// packet start), so a hostile or buggy stub that never frames a packet can't
+/// hang the reader or exhaust memory. Real register/`qXfer` payloads are far
+/// smaller than this.
+const MAX_PACKET_BODY: usize = 16 * 1024 * 1024;
+/// Upper bound on `qfThreadInfo`/`qsThreadInfo` rounds, so a stub that never
+/// replies `l` can't loop forever.
+const MAX_THREAD_ROUNDS: usize = 4096;
+
 /// Register layouts per supported target. Order matches the `g`/`G` packet
 /// layout documented for each architecture.
 fn register_layout(arch: crate::arch::Architecture) -> &'static [(&'static str, usize)] {
@@ -242,13 +251,18 @@ fn format_packet(body: &str) -> String {
 
 fn read_packet(stream: &mut TcpStream) -> Result<String> {
     let mut byte = [0u8; 1];
-    // Skip until packet start.
+    // Skip until packet start, bounded so a stub flooding non-`$` data can't hang us.
+    let mut skipped = 0usize;
     loop {
         stream
             .read_exact(&mut byte)
             .map_err(|e| Error::Debugger(format!("gdb read: {}", e)))?;
         if byte[0] == b'$' {
             break;
+        }
+        skipped += 1;
+        if skipped > MAX_PACKET_BODY {
+            return Err(Error::Debugger("gdb: no packet start within limit".into()));
         }
     }
     // Collect the raw body until '#'. RSP escapes any literal '#'/'$'/'}'/'*'
@@ -261,6 +275,9 @@ fn read_packet(stream: &mut TcpStream) -> Result<String> {
             .map_err(|e| Error::Debugger(format!("gdb read: {}", e)))?;
         if byte[0] == b'#' {
             break;
+        }
+        if raw.len() >= MAX_PACKET_BODY {
+            return Err(Error::Debugger("gdb: packet body exceeds limit".into()));
         }
         raw.push(byte[0]);
     }
@@ -637,7 +654,12 @@ impl Debugger for GdbRemoteDebugger {
         // `qsThreadInfo` until the stub replies `l`. Each reply is `m<tid>[,<tid>...]`.
         let mut out = Vec::new();
         let mut packet = "qfThreadInfo".to_string();
+        let mut rounds = 0usize;
         while let Ok(reply) = self.send_recv(&packet) {
+            rounds += 1;
+            if rounds > MAX_THREAD_ROUNDS {
+                break; // stub never sent the terminating `l`
+            }
             if reply.is_empty() || reply == "l" {
                 break;
             }
