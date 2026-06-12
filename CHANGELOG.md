@@ -4,6 +4,30 @@
 
 ### Fixed
 
+- **Multi-arch analysis correctness (deep-review follow-ups, part 2).**
+  ARM32 conditional branches now lift as real conditional branches with their
+  condition mapped to the shared flag vocabulary (they were flattened to
+  unconditional jumps), direct branch targets parse capstone's `#0x…` form
+  (they previously collapsed to 0), cmp/cmn/tst define the `__flags` register
+  MLIL folds on, and `push`/`pop` track the stack pointer with one slot per
+  register (`pop {…, pc}` is a return). CFG construction classifies
+  ARM/ARM64/RISC-V branch/call/return mnemonics correctly instead of treating
+  everything non-x86 as conditional, and indirect unconditional branches no
+  longer get a fabricated fall-through edge. MLIL canonicalizes sub-registers
+  to their widest alias (`eax`→`rax`, `cl`→`rcx`, `w3`→`x3`) so dead-store
+  elimination sees through mixed-width def/use chains and SysV argument
+  recovery matches the dominant `mov edi, imm` staging form. ARM64
+  shifted-register ALU forms (`add x0, x1, x2, lsl #2`) lift as shift
+  expressions instead of disappearing, and all remaining silent instruction
+  skips (zero-statement lifts, 1-operand `imul`, unknown ALU arities) become
+  explicit `Unimplemented` barriers. Re-analysis no longer overwrites the
+  lowest-address function with a fresh `entry_point` stub (user renames and
+  detected conventions survive), the x86 stdcall heuristic only considers the
+  function's own first `ret` (a neighbor's `ret imm` inside the flat decode
+  window no longer reclassifies it), the thiscall/fastcall heuristic ignores
+  `push ecx` stack-slot reservations and register zeroing/initialization, and
+  the xref scan continues past early returns in multi-exit functions.
+
 - **Untrusted-input and soundness hardening (deep-review follow-ups).**
   Crafted ELF (`p_filesz > p_memsz`) and Mach-O (`filesize > vmsize`) segment
   headers could panic the loader on open; the copies are now clamped to the
