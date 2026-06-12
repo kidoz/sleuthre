@@ -4,6 +4,22 @@
 
 ### Fixed
 
+- **ARM64 lifting depth (deep-review follow-ups, part 3).** Pre/post-index
+  addressing (`stp x29, x30, [sp, #-16]!`, `ldp x29, x30, [sp], #16`) now
+  writes the base register back, so ARM64 prologue/epilogue stack tracking is
+  correct; the rewritten memory-operand parser also removes a latent slice
+  panic on malformed operand text. Flag-setting ALU forms (`adds`/`subs`/
+  `ands`) define the shared flags register, so `subs x2, x0, #1; b.ne` folds
+  into a relational expression like `cmp` does — and the fold now invalidates
+  itself when a pending flag source's operand is redefined (or a call
+  intervenes), so `subs x0, x0, #1; b.ne` falls back to the opaque flag
+  variable instead of folding a stale value. `movz` applies its `lsl` shift
+  (previously wrong by up to 2^48), and PC-relative literal `ldr` loads the
+  value at the printed address instead of the address itself. Zero/sign
+  extension is now modeled end-to-end: x86 `movzx`/`movsx`/`movsxd` and ARM64
+  `ldrsw` lower to a new MLIL `Cast` expression that survives all dataflow
+  passes, folds on constants, and renders as a C cast (`(int8_t)x`).
+
 - **Multi-arch analysis correctness (deep-review follow-ups, part 2).**
   ARM32 conditional branches now lift as real conditional branches with their
   condition mapped to the shared flag vocabulary (they were flattened to
