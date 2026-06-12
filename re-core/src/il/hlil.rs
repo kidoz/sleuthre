@@ -284,6 +284,17 @@ pub fn mlil_to_hlil_expr(expr: &MlilExpr) -> HlilExpr {
 /// Assign friendly names to registers for common architectures so the output
 /// reads like C rather than disassembly. Unknown register names pass through
 /// verbatim (they are already valid C identifiers).
+/// The display name a register would render as in pseudocode (no version
+/// suffix). Used so a recovered parameter is named identically to the body's
+/// reads of that register, binding them instead of leaving a phantom
+/// uninitialized local.
+pub(crate) fn register_display_name(canonical_reg: &str) -> String {
+    pretty_var_name(&SsaVar {
+        name: canonical_reg.to_string(),
+        version: 0,
+    })
+}
+
 fn pretty_var_name(ssa: &SsaVar) -> String {
     let base: &str = match ssa.name.as_str() {
         // x86 / x86-64 general-purpose: GAS-style low halves map to the same alias.

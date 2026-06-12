@@ -205,8 +205,40 @@ fn collect_required_types(ty: &TypeRef, required: &mut HashSet<String>) {
     }
 }
 
-/// Detect function parameters by scanning MLIL instructions for reads of ABI
-/// argument registers that occur before any write to that register.
+/// Whether a (canonical) register can be a function parameter — a
+/// general-purpose register, excluding stack/frame/PC pointers, flags, and
+/// synthetic registers.
+fn is_param_candidate_register(name: &str) -> bool {
+    if name.starts_with("__") || name.starts_with("flag_") {
+        return false;
+    }
+    !matches!(
+        name,
+        // stack / frame / program-counter / link registers across arches
+        "rsp"
+            | "esp"
+            | "sp"
+            | "spl"
+            | "rbp"
+            | "ebp"
+            | "bp"
+            | "rip"
+            | "eip"
+            | "ip"
+            | "pc"
+            | "lr"
+            | "fp"
+    )
+}
+
+/// Detect function parameters: any general-purpose register read before it is
+/// written is an incoming value, i.e. a parameter (the calling convention may
+/// pass it in a register, or it is a register-args `__usercall`-style
+/// function). Each parameter is named with the same display name the body
+/// uses for that register, so the reads bind to the declaration instead of
+/// appearing as phantom uninitialized locals. ABI argument registers are
+/// ordered first (in ABI order); other incoming registers follow in
+/// first-seen order.
 fn detect_parameters(
     mlil: &MlilFunction,
     arch: crate::arch::Architecture,
@@ -215,43 +247,45 @@ fn detect_parameters(
         crate::arch::Architecture::Arm64 => ARM64_ARG_REGS,
         crate::arch::Architecture::X86_64 => X86_64_ARG_REGS,
         crate::arch::Architecture::X86 => X86_ARG_REGS,
-        _ => return vec![],
+        _ => &[],
     };
 
-    let mut written: HashSet<&str> = HashSet::new();
-    let mut param_regs: Vec<&str> = Vec::new();
-    let mut seen: HashSet<&str> = HashSet::new();
+    let mut written: HashSet<String> = HashSet::new();
+    // (register, first-seen index), preserving discovery order.
+    let mut incoming: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
 
     for inst in &mlil.instructions {
         for stmt in &inst.stmts {
-            // Collect reads first, then mark writes.
-            let reads = collect_reads_from_stmt(stmt);
-            for reg_name in &reads {
-                if let Some(abi_reg) = abi_regs.iter().find(|&&r| r == reg_name.as_str())
-                    && !written.contains(abi_reg)
-                    && !seen.contains(abi_reg)
+            // Collect reads first, then mark writes (a read in the same
+            // statement still precedes the write of the destination).
+            for reg_name in collect_reads_from_stmt(stmt) {
+                if is_param_candidate_register(&reg_name)
+                    && !written.contains(&reg_name)
+                    && !seen.contains(&reg_name)
                 {
-                    param_regs.push(abi_reg);
-                    seen.insert(abi_reg);
+                    seen.insert(reg_name.clone());
+                    incoming.push(reg_name);
                 }
             }
-            // Now mark any write destination.
-            if let MlilStmt::Assign { dest, .. } = stmt
-                && let Some(abi_reg) = abi_regs.iter().find(|&&r| r == dest.name.as_str())
-            {
-                written.insert(abi_reg);
+            if let MlilStmt::Assign { dest, .. } = stmt {
+                written.insert(dest.name.clone());
             }
         }
     }
 
-    // Sort parameters by their ABI order (position in the abi_regs slice).
-    param_regs.sort_by_key(|r| abi_regs.iter().position(|ar| ar == r).unwrap_or(usize::MAX));
-    param_regs.dedup();
+    // Order: ABI argument registers first (in ABI order), then the rest in
+    // first-seen order.
+    incoming.sort_by_key(|r| abi_regs.iter().position(|ar| ar == r).unwrap_or(usize::MAX));
 
-    param_regs
+    incoming
         .iter()
-        .enumerate()
-        .map(|(i, _)| (default_word_type(arch).to_string(), format!("arg{}", i + 1)))
+        .map(|reg| {
+            (
+                default_word_type(arch).to_string(),
+                crate::il::hlil::register_display_name(reg),
+            )
+        })
         .collect()
 }
 
@@ -3258,8 +3292,10 @@ mod tests {
         ]);
         let params = detect_parameters(&func, crate::arch::Architecture::X86_64);
         assert_eq!(params.len(), 2, "expected 2 params, got {:?}", params);
-        assert_eq!(params[0], ("int64_t".to_string(), "arg1".to_string()));
-        assert_eq!(params[1], ("int64_t".to_string(), "arg2".to_string()));
+        // Parameters are named by the register's display name so the body's
+        // reads bind to them (rdi -> dst, rsi -> src).
+        assert_eq!(params[0], ("int64_t".to_string(), "dst".to_string()));
+        assert_eq!(params[1], ("int64_t".to_string(), "src".to_string()));
     }
 
     #[test]
@@ -3381,7 +3417,7 @@ mod tests {
         ]);
         let params = detect_parameters(&func, crate::arch::Architecture::X86);
         assert_eq!(params.len(), 1, "expected 1 param, got {:?}", params);
-        assert_eq!(params[0], ("int32_t".to_string(), "arg1".to_string()));
+        assert_eq!(params[0], ("int32_t".to_string(), "counter".to_string()));
     }
 
     #[test]
