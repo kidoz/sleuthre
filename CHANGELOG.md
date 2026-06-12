@@ -4,6 +4,26 @@
 
 ### Fixed
 
+- **Untrusted-input and soundness hardening (deep-review follow-ups).**
+  Crafted ELF (`p_filesz > p_memsz`) and Mach-O (`filesize > vmsize`) segment
+  headers could panic the loader on open; the copies are now clamped to the
+  allocation, with adversarial fixtures pinning both. A panic in a background
+  analysis worker no longer destroys the open project or wedges the loading
+  state (workers catch unwinds and the polls handle a dead worker). The MLIL
+  optimization passes are now sound: uses with no known reaching definition
+  carry a sentinel version, so dead-store elimination keeps branch-side
+  assignments feeding a join and value propagation can no longer rewrite a
+  use with a definition that follows it; unlifted instructions survive as an
+  `Unimplemented` dataflow barrier (rendered as a pseudocode comment) instead
+  of being erased to `Nop`, and the DSE return-register allowlist covers
+  ARM32/MIPS/RISC-V/ARM64-w. Rhai script execution is bounded (operation and
+  data-size caps) so a runaway console script or plugin can't hang or OOM the
+  app. DWARF/PDB type resolution is depth-capped against crafted deep type
+  chains (stack-overflow abort), a 9-byte SLEB128 no longer overflows in
+  debug builds, and the fuzz-smoke harness now exercises debug-info
+  extraction. MCP `save_project` writes are confined to the opened binary's
+  workspace and the `.slre` extension.
+
 - **GDB Remote debugger hardening (review follow-ups to 0.6).** A hostile or
   buggy stub could crash the GUI with a char-boundary panic via a non-ASCII
   marker byte in the `qXfer` module-list reply. Resume waits (`c`/`s`) no
