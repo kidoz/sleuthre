@@ -321,7 +321,7 @@ impl SleuthreApp {
             self.debugger_set_breakpoint_kind(kind);
         }
         // Active breakpoints list.
-        let mut clear_addr: Option<u64> = None;
+        let mut clear_bp: Option<(u64, BreakpointKind)> = None;
         let bps: Vec<(u64, BreakpointKind)> = self
             .debugger_remote
             .as_ref()
@@ -346,13 +346,13 @@ impl SleuthreApp {
                         egui::RichText::new(format!("  [{}] 0x{:x}", kind_str, addr)).size(11.0),
                     );
                     if ui.small_button("x").clicked() {
-                        clear_addr = Some(addr);
+                        clear_bp = Some((addr, kind));
                     }
                 });
             }
         }
-        if let Some(addr) = clear_addr {
-            self.debugger_remove_breakpoint(addr);
+        if let Some((addr, kind)) = clear_bp {
+            self.debugger_remove_breakpoint(addr, kind);
         }
 
         ui.separator();
@@ -1170,13 +1170,17 @@ impl SleuthreApp {
         self.debugger_continue();
     }
 
-    fn debugger_remove_breakpoint(&mut self, address: u64) {
-        let Some(d) = self.debugger_remote.as_mut() else {
-            return;
+    /// Clear one entry from the breakpoint list using its exact kind, so
+    /// watchpoints (z2..z4) are removed with the right packet — removing only
+    /// the execute kinds would leave them armed in the stub forever.
+    fn debugger_remove_breakpoint(&mut self, address: u64, kind: BreakpointKind) {
+        let result = match self.debugger_remote.as_mut() {
+            Some(d) => d.remove_breakpoint(address, kind),
+            None => return,
         };
-        // Try removing both kinds — the Vec dedupe is by (addr, kind).
-        let _ = d.remove_breakpoint(address, BreakpointKind::Software);
-        let _ = d.remove_breakpoint(address, BreakpointKind::Hardware);
+        if let Err(e) = result {
+            self.add_toast(ToastKind::Error, format!("Clear breakpoint failed: {}", e));
+        }
     }
 
     fn debugger_write_register(&mut self, name: &str, value: u64) {
