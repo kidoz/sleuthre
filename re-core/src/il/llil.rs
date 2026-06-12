@@ -26,9 +26,9 @@ pub enum LlilExpr {
     },
     /// Unary operation (not, neg).
     UnaryOp { op: UnaryOp, operand: ExprId },
-    /// Zero-extend to `bits` width.
+    /// Take the low `bits` of `operand` and zero-extend (`movzx`).
     Zx { bits: u8, operand: ExprId },
-    /// Sign-extend to `bits` width.
+    /// Take the low `bits` of `operand` and sign-extend (`movsx`, `ldrsw`).
     Sx { bits: u8, operand: ExprId },
     /// A flag condition (e.g. result of a comparison).
     Flag(FlagCondition),

@@ -101,7 +101,9 @@ fn lift_instruction(func: &mut LlilFunction, insn: &Instruction) -> Vec<LlilStmt
         "nop" | "endbr64" | "endbr32" => vec![LlilStmt::Nop],
 
         // --- Data movement ---
-        "mov" | "movabs" | "movzx" | "movsx" | "movsxd" => lift_mov(func, &ops),
+        "mov" | "movabs" => lift_mov(func, &ops),
+        "movzx" => lift_mov_extend(func, &ops, false),
+        "movsx" | "movsxd" => lift_mov_extend(func, &ops, true),
         "lea" => lift_lea(func, &ops),
         "push" => lift_push(func, &ops),
         "pop" => lift_pop(func, &ops),
@@ -164,6 +166,59 @@ fn lift_instruction(func: &mut LlilFunction, insn: &Instruction) -> Vec<LlilStmt
                 }]
             }
         }
+    }
+}
+
+/// `movzx`/`movsx`: copy a narrow source into a wider register with zero- or
+/// sign-extension. Lifting these as plain `mov` loses the extension semantics
+/// entirely (a `movsx eax, cl` on a negative byte is wrong by 2^8..2^32).
+fn lift_mov_extend(func: &mut LlilFunction, ops: &[&str], signed: bool) -> Vec<LlilStmt> {
+    if ops.len() < 2 {
+        return vec![LlilStmt::Nop];
+    }
+    let mut src = parse_operand(func, ops[1]);
+    if let Some(bits) = x86_operand_width_bits(ops[1]) {
+        src = func.add_expr(if signed {
+            LlilExpr::Sx { bits, operand: src }
+        } else {
+            LlilExpr::Zx { bits, operand: src }
+        });
+    }
+    vec![LlilStmt::SetReg {
+        dest: ops[0].trim().to_string(),
+        src,
+    }]
+}
+
+/// Bit width of a `movzx`/`movsx` *source* operand — a narrow register name
+/// or a memory size prefix. `None` when unrecognized (degrades to a plain
+/// move, the previous behavior).
+fn x86_operand_width_bits(op: &str) -> Option<u8> {
+    let op = op.trim();
+    if op.contains("ptr") {
+        // Check qword/dword before the bare "word" substring they contain.
+        return if op.contains("qword") {
+            None
+        } else if op.contains("dword") {
+            Some(32)
+        } else if op.contains("byte") {
+            Some(8)
+        } else if op.contains("word") {
+            Some(16)
+        } else {
+            None
+        };
+    }
+    match op {
+        "al" | "bl" | "cl" | "dl" | "ah" | "bh" | "ch" | "dh" | "sil" | "dil" | "bpl" | "spl" => {
+            Some(8)
+        }
+        "ax" | "bx" | "cx" | "dx" | "si" | "di" | "bp" | "sp" => Some(16),
+        "eax" | "ebx" | "ecx" | "edx" | "esi" | "edi" | "ebp" | "esp" => Some(32),
+        r if r.starts_with('r') && r.ends_with('b') => Some(8),
+        r if r.starts_with('r') && r.ends_with('w') => Some(16),
+        r if r.starts_with('r') && r.ends_with('d') => Some(32),
+        _ => None,
     }
 }
 

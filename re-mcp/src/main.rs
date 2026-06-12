@@ -153,6 +153,7 @@ fn collect_ssa_vars(func: &re_core::il::mlil::MlilFunction) -> Vec<serde_json::V
                     .push(addr);
             }
             MlilExpr::Load { addr: a, .. } => walk_expr(a, addr, map),
+            MlilExpr::Cast { operand, .. } => walk_expr(operand, addr, map),
             MlilExpr::BinOp { left, right, .. } => {
                 walk_expr(left, addr, map);
                 walk_expr(right, addr, map);

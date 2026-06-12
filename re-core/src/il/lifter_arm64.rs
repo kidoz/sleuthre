@@ -60,17 +60,17 @@ fn lift_instruction(func: &mut LlilFunction, insn: &Instruction) -> Vec<LlilStmt
         "movn" => lift_movn(func, &ops_raw),
 
         // --- Arithmetic ---
-        "add" | "adds" => lift_alu3(func, BinOp::Add, &ops_raw),
-        "sub" | "subs" => lift_alu3(func, BinOp::Sub, &ops_raw),
-        "mul" => lift_alu3(func, BinOp::Mul, &ops_raw),
+        "add" | "adds" => lift_alu3(func, BinOp::Add, &ops_raw, mn == "adds"),
+        "sub" | "subs" => lift_alu3(func, BinOp::Sub, &ops_raw, mn == "subs"),
+        "mul" => lift_alu3(func, BinOp::Mul, &ops_raw, false),
 
         // --- Bitwise ---
-        "and" | "ands" => lift_alu3(func, BinOp::And, &ops_raw),
-        "orr" => lift_alu3(func, BinOp::Or, &ops_raw),
-        "eor" => lift_alu3(func, BinOp::Xor, &ops_raw),
-        "lsl" => lift_alu3(func, BinOp::Shl, &ops_raw),
-        "lsr" => lift_alu3(func, BinOp::Shr, &ops_raw),
-        "asr" => lift_alu3(func, BinOp::Sar, &ops_raw),
+        "and" | "ands" => lift_alu3(func, BinOp::And, &ops_raw, mn == "ands"),
+        "orr" => lift_alu3(func, BinOp::Or, &ops_raw, false),
+        "eor" => lift_alu3(func, BinOp::Xor, &ops_raw, false),
+        "lsl" => lift_alu3(func, BinOp::Shl, &ops_raw, false),
+        "lsr" => lift_alu3(func, BinOp::Shr, &ops_raw, false),
+        "asr" => lift_alu3(func, BinOp::Sar, &ops_raw, false),
 
         // --- Unary ---
         "neg" | "negs" => lift_unary(func, UnaryOp::Neg, &ops_raw),
@@ -198,34 +198,67 @@ fn parse_arm64_immediate(s: &str) -> Option<u64> {
     }
 }
 
-/// Parse a memory operand like `[x1]`, `[x1, #16]`, `[x1, x2]`, `[x1, #16]!`, `[x1], #16`.
-/// Returns (address_expr_id, access_size_in_bytes).
-/// Size is inferred from the instruction mnemonic context (caller decides), here we default to 8.
-fn parse_mem_operand(func: &mut LlilFunction, op: &str) -> (ExprId, u8) {
+/// A parsed memory operand: the access address plus the base-register
+/// writeback mandated by pre-index (`[base, #imm]!`) and post-index
+/// (`[base], #imm`) forms. Callers append the writeback as a `SetReg` after
+/// the access — without it, every ARM64 prologue/epilogue leaves `sp`
+/// untouched and stack tracking is wrong for the whole function.
+struct MemAccess {
+    addr: ExprId,
+    /// `(base register, new base value)` to assign after the access.
+    writeback: Option<(String, ExprId)>,
+}
+
+/// Parse a memory operand like `[x1]`, `[x1, #16]`, `[x1, x2]`, `[x1, #16]!`,
+/// `[x1], #16`. Slicing is checked: the operand text derives from untrusted
+/// bytes, and a `[`-led operand with no `]` must not panic.
+fn parse_mem_access(func: &mut LlilFunction, op: &str) -> MemAccess {
     let op = op.trim();
-
-    // Check for post-index: [x1], #16
-    // The bracket part and the offset after the bracket
     let bracket_end = op.find(']').unwrap_or(op.len());
-    let inner = &op[1..bracket_end];
-
-    // Parse the inner part (base and optional offset)
+    let inner = op.get(1..bracket_end).unwrap_or("");
+    let base_str = inner.split(',').next().unwrap_or("").trim().to_string();
     let addr = parse_mem_inner(func, inner);
+    let after = op.get(bracket_end + 1..).unwrap_or("").trim();
 
-    // Check for post-index offset after the bracket
-    let after_bracket = &op[bracket_end + 1..];
-    let after_bracket = after_bracket.trim().trim_start_matches('!').trim();
-
-    if let Some(stripped) = after_bracket.strip_prefix(',') {
-        let stripped = stripped.trim();
-        if let Some(imm) = parse_arm64_immediate(stripped) {
-            // Post-index: we still use the base address for the access
-            // The base update is handled separately in the caller
-            let _ = imm; // post-index offset is for the base update, not the access address
-        }
+    // Pre-index `[base, #imm]!`: the access address (base + imm) is also the
+    // new base value.
+    if after.starts_with('!') && !base_str.is_empty() {
+        return MemAccess {
+            addr,
+            writeback: Some((base_str, addr)),
+        };
     }
+    // Post-index `[base], #imm`: access at base, then base += imm.
+    if let Some(rest) = after.strip_prefix(',')
+        && let Some(imm) = parse_arm64_immediate(rest.trim())
+        && !base_str.is_empty()
+    {
+        let base = func.reg(&base_str);
+        let off = func.const_val(imm);
+        let updated = func.binop(BinOp::Add, base, off);
+        return MemAccess {
+            addr,
+            writeback: Some((base_str, updated)),
+        };
+    }
+    MemAccess {
+        addr,
+        writeback: None,
+    }
+}
 
-    (addr, 8) // default size; caller overrides
+/// Address-only view of [`parse_mem_access`] for generic operand positions
+/// (no writeback can apply there). Returns (address, default size 8).
+fn parse_mem_operand(func: &mut LlilFunction, op: &str) -> (ExprId, u8) {
+    (parse_mem_access(func, op).addr, 8)
+}
+
+/// The `SetReg` statement realizing a writeback, if the access has one.
+fn writeback_stmt(wb: Option<(String, ExprId)>) -> Option<LlilStmt> {
+    wb.map(|(base, value)| LlilStmt::SetReg {
+        dest: base,
+        src: value,
+    })
 }
 
 /// Parse the inner content of a memory bracket: "x1", "x1, #16", "x1, x2", "sp, #-16"
@@ -830,11 +863,35 @@ fn lift_mov(func: &mut LlilFunction, ops: &[&str]) -> Vec<LlilStmt> {
     if ops.len() < 2 {
         return vec![LlilStmt::Nop];
     }
+    // `movz x0, #5, lsl #16` — fold the shifted immediate (0x50000); the
+    // unshifted value would be wrong by up to 2^48.
+    if ops.len() == 3 {
+        if let (Some(imm), Some(shift)) =
+            (parse_arm64_immediate(ops[1]), parse_shift_amount(ops[2]))
+        {
+            let src = func.const_val(imm.wrapping_shl(shift));
+            return vec![LlilStmt::SetReg {
+                dest: ops[0].trim().to_string(),
+                src,
+            }];
+        }
+        return vec![LlilStmt::Unimplemented {
+            mnemonic: "mov".to_string(),
+            op_str: ops.join(", "),
+        }];
+    }
     let src = parse_operand(func, ops[1]);
     vec![LlilStmt::SetReg {
         dest: ops[0].trim().to_string(),
         src,
     }]
+}
+
+/// Parse an `lsl #n` modifier into the shift amount.
+fn parse_shift_amount(modifier: &str) -> Option<u32> {
+    let rest = modifier.trim().strip_prefix("lsl")?.trim();
+    let amount = parse_arm64_immediate(rest)?;
+    u32::try_from(amount).ok().filter(|a| *a < 64)
 }
 
 fn lift_movk(_func: &mut LlilFunction, ops: &[&str]) -> Vec<LlilStmt> {
@@ -865,26 +922,20 @@ fn lift_movn(func: &mut LlilFunction, ops: &[&str]) -> Vec<LlilStmt> {
     }]
 }
 
-fn lift_alu3(func: &mut LlilFunction, op: BinOp, ops: &[&str]) -> Vec<LlilStmt> {
+fn lift_alu3(func: &mut LlilFunction, op: BinOp, ops: &[&str], sets_flags: bool) -> Vec<LlilStmt> {
     // ARM64 3-operand: dest, src1, src2
     // Also handles 2-operand form (e.g. add x0, x0, #1 sometimes printed as add x0, #1 in aliases)
     if ops.len() == 3 {
         let left = parse_operand(func, ops[1]);
         let right = parse_operand(func, ops[2]);
         let result = func.binop(op, left, right);
-        vec![LlilStmt::SetReg {
-            dest: ops[0].trim().to_string(),
-            src: result,
-        }]
+        alu_result_stmts(ops[0], result, sets_flags)
     } else if ops.len() == 2 {
         // 2-operand alias: dest = dest OP src
         let left = parse_operand(func, ops[0]);
         let right = parse_operand(func, ops[1]);
         let result = func.binop(op, left, right);
-        vec![LlilStmt::SetReg {
-            dest: ops[0].trim().to_string(),
-            src: result,
-        }]
+        alu_result_stmts(ops[0], result, sets_flags)
     } else if ops.len() == 4 {
         // Shifted-register form: `add x0, x1, x2, lsl #2` — the canonical
         // array-indexing idiom. Extend modifiers (uxtw/sxtw/…) need width
@@ -893,10 +944,7 @@ fn lift_alu3(func: &mut LlilFunction, op: BinOp, ops: &[&str]) -> Vec<LlilStmt> 
         let inner = parse_operand(func, ops[2]);
         if let Some(shifted) = apply_shift_modifier(func, inner, ops[3]) {
             let result = func.binop(op, left, shifted);
-            vec![LlilStmt::SetReg {
-                dest: ops[0].trim().to_string(),
-                src: result,
-            }]
+            alu_result_stmts(ops[0], result, sets_flags)
         } else {
             vec![LlilStmt::Unimplemented {
                 mnemonic: format!("alu-{:?}", op).to_lowercase(),
@@ -910,6 +958,26 @@ fn lift_alu3(func: &mut LlilFunction, op: BinOp, ops: &[&str]) -> Vec<LlilStmt> 
             op_str: ops.join(", "),
         }]
     }
+}
+
+/// Destination assignment for an ALU result, preceded by a `__flags` def for
+/// flag-setting forms (`adds`/`subs`/`ands`) so `subs…; b.ne` folds into a
+/// relational expression like `cmp` does. The flags def comes first: its
+/// operand reads must be the pre-assignment values when the destination is
+/// also an operand (`subs x0, x0, #1`).
+fn alu_result_stmts(dest: &str, result: ExprId, sets_flags: bool) -> Vec<LlilStmt> {
+    let mut stmts = Vec::new();
+    if sets_flags {
+        stmts.push(LlilStmt::SetReg {
+            dest: "__flags".to_string(),
+            src: result,
+        });
+    }
+    stmts.push(LlilStmt::SetReg {
+        dest: dest.trim().to_string(),
+        src: result,
+    });
+    stmts
 }
 
 /// Apply an ARM64 shift modifier (`lsl #2`, `lsr #1`, `asr #3`) to `value`.
@@ -990,18 +1058,30 @@ fn lift_ldr(func: &mut LlilFunction, mn: &str, ops: &[&str]) -> Vec<LlilStmt> {
         } else {
             mem_str.to_string()
         };
-        let (addr, _default_size) = parse_mem_operand(func, &full_mem);
+        let access = parse_mem_access(func, &full_mem);
+        let mut loaded = func.load(access.addr, size);
+        if mn == "ldrsw" {
+            // 32-bit load sign-extended to the 64-bit register.
+            loaded = func.add_expr(LlilExpr::Sx {
+                bits: 32,
+                operand: loaded,
+            });
+        }
+        let mut stmts = vec![LlilStmt::SetReg {
+            dest: dest.to_string(),
+            src: loaded,
+        }];
+        stmts.extend(writeback_stmt(access.writeback));
+        stmts
+    } else {
+        // PC-relative literal load — capstone prints the resolved address
+        // (`ldr x0, #0x4008`). The register receives the *value at* that
+        // address, not the address itself.
+        let addr = parse_operand(func, mem_str);
         let loaded = func.load(addr, size);
         vec![LlilStmt::SetReg {
             dest: dest.to_string(),
             src: loaded,
-        }]
-    } else {
-        // Literal load: ldr x0, =label or ldr x0, #imm
-        let src = parse_operand(func, mem_str);
-        vec![LlilStmt::SetReg {
-            dest: dest.to_string(),
-            src,
         }]
     }
 }
@@ -1024,9 +1104,15 @@ fn lift_str(func: &mut LlilFunction, mn: &str, ops: &[&str]) -> Vec<LlilStmt> {
         } else {
             mem_str.to_string()
         };
-        let (addr, _) = parse_mem_operand(func, &full_mem);
+        let access = parse_mem_access(func, &full_mem);
         let value = parse_operand(func, src_reg);
-        vec![LlilStmt::Store { addr, value, size }]
+        let mut stmts = vec![LlilStmt::Store {
+            addr: access.addr,
+            value,
+            size,
+        }];
+        stmts.extend(writeback_stmt(access.writeback));
+        stmts
     } else {
         vec![LlilStmt::Nop]
     }
@@ -1048,7 +1134,8 @@ fn lift_ldp(func: &mut LlilFunction, ops: &[&str]) -> Vec<LlilStmt> {
         } else {
             mem_str.to_string()
         };
-        let (addr, _) = parse_mem_operand(func, &full_mem);
+        let access = parse_mem_access(func, &full_mem);
+        let addr = access.addr;
 
         // First load at addr
         let load1 = func.load(addr, size);
@@ -1058,7 +1145,7 @@ fn lift_ldp(func: &mut LlilFunction, ops: &[&str]) -> Vec<LlilStmt> {
         let addr2 = func.binop(BinOp::Add, addr, offset);
         let load2 = func.load(addr2, size);
 
-        vec![
+        let mut stmts = vec![
             LlilStmt::SetReg {
                 dest: dest1.to_string(),
                 src: load1,
@@ -1067,7 +1154,9 @@ fn lift_ldp(func: &mut LlilFunction, ops: &[&str]) -> Vec<LlilStmt> {
                 dest: dest2.to_string(),
                 src: load2,
             },
-        ]
+        ];
+        stmts.extend(writeback_stmt(access.writeback));
+        stmts
     } else {
         vec![LlilStmt::Nop]
     }
@@ -1089,7 +1178,8 @@ fn lift_stp(func: &mut LlilFunction, ops: &[&str]) -> Vec<LlilStmt> {
         } else {
             mem_str.to_string()
         };
-        let (addr, _) = parse_mem_operand(func, &full_mem);
+        let access = parse_mem_access(func, &full_mem);
+        let addr = access.addr;
 
         let val1 = parse_operand(func, src1);
         let val2 = parse_operand(func, src2);
@@ -1098,7 +1188,7 @@ fn lift_stp(func: &mut LlilFunction, ops: &[&str]) -> Vec<LlilStmt> {
         let offset = func.const_val(size as u64);
         let addr2 = func.binop(BinOp::Add, addr, offset);
 
-        vec![
+        let mut stmts = vec![
             LlilStmt::Store {
                 addr,
                 value: val1,
@@ -1109,7 +1199,9 @@ fn lift_stp(func: &mut LlilFunction, ops: &[&str]) -> Vec<LlilStmt> {
                 value: val2,
                 size,
             },
-        ]
+        ];
+        stmts.extend(writeback_stmt(access.writeback));
+        stmts
     } else {
         vec![LlilStmt::Nop]
     }
@@ -1175,6 +1267,93 @@ fn lift_adr(func: &mut LlilFunction, ops: &[&str]) -> Vec<LlilStmt> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stp_pre_index_writes_back_the_base() {
+        // `stp x29, x30, [sp, #-16]!` must move sp, or stack tracking is
+        // wrong for the entire function.
+        let insns = [make_insn(0x1000, "stp", "x29, x30, [sp, #-16]!")];
+        let func = lift_function("t", 0x1000, &insns);
+        let stmts = &func.instructions[0].stmts;
+        assert_eq!(stmts.len(), 3, "two stores + writeback, got {:?}", stmts);
+        match &stmts[2] {
+            LlilStmt::SetReg { dest, src } => {
+                assert_eq!(dest, "sp");
+                // New base is the computed access address sp + (-16).
+                assert!(
+                    matches!(func.exprs[*src], LlilExpr::BinOp { op: BinOp::Add, .. }),
+                    "writeback must be sp plus the offset"
+                );
+            }
+            other => panic!("expected sp writeback, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ldp_post_index_writes_back_the_base() {
+        // `ldp x29, x30, [sp], #16` — loads at sp, then sp += 16.
+        let insns = [make_insn(0x1000, "ldp", "x29, x30, [sp], #16")];
+        let func = lift_function("t", 0x1000, &insns);
+        let stmts = &func.instructions[0].stmts;
+        assert_eq!(stmts.len(), 3, "two loads + writeback, got {:?}", stmts);
+        assert!(matches!(&stmts[2], LlilStmt::SetReg { dest, .. } if dest == "sp"));
+    }
+
+    #[test]
+    fn movz_applies_the_shift() {
+        let insns = [make_insn(0x1000, "movz", "x0, #5, lsl #16")];
+        let func = lift_function("t", 0x1000, &insns);
+        match &func.instructions[0].stmts[0] {
+            LlilStmt::SetReg { src, .. } => {
+                assert_eq!(func.exprs[*src], LlilExpr::Const(0x50000));
+            }
+            other => panic!("expected SetReg, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn literal_ldr_loads_from_the_address() {
+        // `ldr x0, #0x4008` receives the value *at* 0x4008, not 0x4008.
+        let insns = [make_insn(0x1000, "ldr", "x0, #0x4008")];
+        let func = lift_function("t", 0x1000, &insns);
+        match &func.instructions[0].stmts[0] {
+            LlilStmt::SetReg { src, .. } => {
+                assert!(
+                    matches!(func.exprs[*src], LlilExpr::Load { size: 8, .. }),
+                    "literal ldr must be a load"
+                );
+            }
+            other => panic!("expected SetReg, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ldrsw_sign_extends_the_loaded_word() {
+        let insns = [make_insn(0x1000, "ldrsw", "x0, [x1]")];
+        let func = lift_function("t", 0x1000, &insns);
+        match &func.instructions[0].stmts[0] {
+            LlilStmt::SetReg { src, .. } => match &func.exprs[*src] {
+                LlilExpr::Sx { bits: 32, operand } => {
+                    assert!(matches!(
+                        func.exprs[*operand],
+                        LlilExpr::Load { size: 4, .. }
+                    ));
+                }
+                other => panic!("expected Sx(load), got {:?}", other),
+            },
+            other => panic!("expected SetReg, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn subs_defines_flags_before_the_destination() {
+        let insns = [make_insn(0x1000, "subs", "x0, x0, #1")];
+        let func = lift_function("t", 0x1000, &insns);
+        let stmts = &func.instructions[0].stmts;
+        assert_eq!(stmts.len(), 2);
+        assert!(matches!(&stmts[0], LlilStmt::SetReg { dest, .. } if dest == "__flags"));
+        assert!(matches!(&stmts[1], LlilStmt::SetReg { dest, .. } if dest == "x0"));
+    }
 
     #[test]
     fn shifted_register_alu_lifts_as_shift_expression() {

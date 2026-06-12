@@ -285,6 +285,7 @@ fn collect_reads_from_stmt(stmt: &MlilStmt) -> Vec<String> {
 fn collect_reads_from_expr(expr: &MlilExpr) -> Vec<String> {
     match expr {
         MlilExpr::Var(ssa) => vec![ssa.name.clone()],
+        MlilExpr::Cast { operand, .. } => collect_reads_from_expr(operand),
         MlilExpr::Const(_) => vec![],
         MlilExpr::Load { addr, .. } => collect_reads_from_expr(addr),
         MlilExpr::BinOp { left, right, .. } => {
@@ -870,6 +871,7 @@ fn lift_stack_refs_in_expr(expr: &mut HlilExpr, stack_map: &HashMap<i64, StackVa
 
     // Recurse
     match expr {
+        HlilExpr::Cast { operand, .. } => lift_stack_refs_in_expr(operand, stack_map),
         HlilExpr::Deref { addr, .. } => lift_stack_refs_in_expr(addr, stack_map),
         HlilExpr::BinOp { left, right, .. } => {
             lift_stack_refs_in_expr(left, stack_map);
@@ -971,6 +973,7 @@ fn resolve_symbols_in_stmt(stmt: &mut HlilStmt, symbols: &HashMap<u64, String>) 
 
 fn resolve_symbols_in_expr(expr: &mut HlilExpr, symbols: &HashMap<u64, String>) {
     match expr {
+        HlilExpr::Cast { operand, .. } => resolve_symbols_in_expr(operand, symbols),
         HlilExpr::Const(val) => {
             if let Some(name) = symbols.get(val) {
                 *expr = HlilExpr::Global(*val, name.clone());
@@ -1101,6 +1104,7 @@ fn resolve_globals_in_stmt(stmt: &mut HlilStmt, types: &TypeManager) {
 
 fn resolve_globals_in_expr(expr: &mut HlilExpr, types: &TypeManager) {
     match expr {
+        HlilExpr::Cast { operand, .. } => resolve_globals_in_expr(operand, types),
         HlilExpr::Const(val) => {
             if let Some(var) = types.global_variables.get(val) {
                 *expr = HlilExpr::Global(*val, var.name.clone());
@@ -1333,6 +1337,9 @@ fn infer_types_in_expr(
     types: &TypeManager,
 ) {
     match expr {
+        HlilExpr::Cast { operand, .. } => {
+            infer_types_in_expr(operand, inferred_types, types);
+        }
         HlilExpr::Deref { addr, size } => {
             if let HlilExpr::Var(name) = &**addr {
                 let inner = match *size {
@@ -1473,6 +1480,7 @@ fn collect_ssa_vars_expr(expr: &HlilExpr, found: &mut HashSet<String>) {
         HlilExpr::Var(name) => {
             found.insert(name.clone());
         }
+        HlilExpr::Cast { operand, .. } => collect_ssa_vars_expr(operand, found),
         HlilExpr::Deref { addr, .. } => collect_ssa_vars_expr(addr, found),
         HlilExpr::BinOp { left, right, .. } => {
             collect_ssa_vars_expr(left, found);

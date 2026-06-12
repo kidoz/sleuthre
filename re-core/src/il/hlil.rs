@@ -10,6 +10,14 @@ use std::fmt;
 /// A high-level expression used in pseudocode.
 #[derive(Debug, Clone)]
 pub enum HlilExpr {
+    /// C-style width cast: `(int8_t)x` / `(uint16_t)x`. `bits` is the source
+    /// width being truncated to; assignment to a wider variable then zero- or
+    /// sign-extends per the type's signedness.
+    Cast {
+        signed: bool,
+        bits: u8,
+        operand: Box<HlilExpr>,
+    },
     Var(String),
     Global(u64, String),
     Const(u64),
@@ -225,6 +233,15 @@ impl SourceWriter {
 pub fn mlil_to_hlil_expr(expr: &MlilExpr) -> HlilExpr {
     match expr {
         MlilExpr::Var(ssa) => HlilExpr::Var(pretty_var_name(ssa)),
+        MlilExpr::Cast {
+            signed,
+            bits,
+            operand,
+        } => HlilExpr::Cast {
+            signed: *signed,
+            bits: *bits,
+            operand: Box::new(mlil_to_hlil_expr(operand)),
+        },
         MlilExpr::Const(v) => HlilExpr::Const(*v),
         MlilExpr::Load { addr, size } => HlilExpr::Deref {
             addr: Box::new(mlil_to_hlil_expr(addr)),
@@ -781,6 +798,32 @@ fn write_expr_prec(w: &mut SourceWriter, expr: &HlilExpr, parent_prec: u8) {
             };
             w.write(prefix);
             write_expr_prec(w, operand, 10);
+        }
+        HlilExpr::Cast {
+            signed,
+            bits,
+            operand,
+        } => {
+            let ty = match (signed, bits) {
+                (true, 8) => "int8_t",
+                (true, 16) => "int16_t",
+                (true, 32) => "int32_t",
+                (true, _) => "int64_t",
+                (false, 8) => "uint8_t",
+                (false, 16) => "uint16_t",
+                (false, 32) => "uint32_t",
+                (false, _) => "uint64_t",
+            };
+            // A cast binds like a unary prefix operator.
+            let parens = parent_prec > 9;
+            if parens {
+                w.write("(");
+            }
+            w.write(&format!("({})", ty));
+            write_expr_prec(w, operand, 10);
+            if parens {
+                w.write(")");
+            }
         }
         HlilExpr::Call { target, args } => {
             match &**target {

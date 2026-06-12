@@ -39,6 +39,16 @@ impl fmt::Display for SsaVar {
 /// MLIL expression — higher-level than LLIL, uses SSA variables.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MlilExpr {
+    /// Width cast: take the low `bits` of `operand` and zero- (`signed:
+    /// false`) or sign- (`signed: true`) extend. Produced from LLIL `Zx`/`Sx`
+    /// (x86 `movzx`/`movsx`, ARM64 `ldrsw`); renders as a C cast like
+    /// `(int8_t)x`, whose assignment to a wider variable carries exactly
+    /// these semantics.
+    Cast {
+        signed: bool,
+        bits: u8,
+        operand: Box<MlilExpr>,
+    },
     Var(SsaVar),
     Const(u64),
     Load {
@@ -185,9 +195,16 @@ fn lower_expr(llil_func: &LlilFunction, id: ExprId) -> MlilExpr {
             op: *op,
             operand: Box::new(lower_expr(llil_func, *operand)),
         },
-        llil::LlilExpr::Zx { operand, .. } | llil::LlilExpr::Sx { operand, .. } => {
-            lower_expr(llil_func, *operand)
-        }
+        llil::LlilExpr::Zx { bits, operand } => MlilExpr::Cast {
+            signed: false,
+            bits: *bits,
+            operand: Box::new(lower_expr(llil_func, *operand)),
+        },
+        llil::LlilExpr::Sx { bits, operand } => MlilExpr::Cast {
+            signed: true,
+            bits: *bits,
+            operand: Box::new(lower_expr(llil_func, *operand)),
+        },
         llil::LlilExpr::Flag(cond) => {
             // Represent as a named flag variable
             MlilExpr::Var(SsaVar {
@@ -301,12 +318,24 @@ pub fn lower_to_mlil(llil_func: &LlilFunction) -> MlilFunction {
             match stmt {
                 LlilStmt::SetReg { dest, src } => {
                     let src = lower_expr(llil_func, *src);
+                    let canonical = canonical_register(dest);
                     if dest == "__flags" {
                         last_flag = Some(src.clone());
+                    } else if let Some(flag) = &last_flag {
+                        // A pending flag source that reads this register
+                        // would fold a stale value into a later branch
+                        // (`subs x0, x0, #1; b.ne` — the flag source reads
+                        // the pre-decrement x0). Drop it; the branch falls
+                        // back to the opaque flag variable.
+                        let mut flag_reads = std::collections::HashSet::new();
+                        collect_used_vars_expr(flag, &mut flag_reads);
+                        if flag_reads.contains(&canonical) {
+                            last_flag = None;
+                        }
                     }
                     stmts.push(MlilStmt::Assign {
                         dest: SsaVar {
-                            name: canonical_register(dest),
+                            name: canonical,
                             version: 0,
                         },
                         src,
@@ -478,6 +507,7 @@ fn rename_uses(expr: &mut MlilExpr, current: &HashMap<String, u32>) {
         // matching a definition's version in the optimization passes.
         MlilExpr::Var(v) => v.version = current.get(&v.name).copied().unwrap_or(VER_UNKNOWN),
         MlilExpr::Load { addr, .. } => rename_uses(addr, current),
+        MlilExpr::Cast { operand, .. } => rename_uses(operand, current),
         MlilExpr::BinOp { left, right, .. } => {
             rename_uses(left, current);
             rename_uses(right, current);
@@ -501,6 +531,31 @@ fn rename_uses(expr: &mut MlilExpr, current: &HashMap<String, u32>) {
 /// Constant folding: simplify expressions with known constant operands.
 pub fn fold_constants(expr: &MlilExpr) -> MlilExpr {
     match expr {
+        MlilExpr::Cast {
+            signed,
+            bits,
+            operand,
+        } => {
+            let inner = fold_constants(operand);
+            if let MlilExpr::Const(c) = inner
+                && *bits < 64
+                && *bits > 0
+            {
+                let mask = (1u64 << *bits) - 1;
+                let low = c & mask;
+                let value = if *signed && (low >> (*bits - 1)) & 1 == 1 {
+                    low | !mask // sign bit set: extend with ones
+                } else {
+                    low
+                };
+                return MlilExpr::Const(value);
+            }
+            MlilExpr::Cast {
+                signed: *signed,
+                bits: *bits,
+                operand: Box::new(inner),
+            }
+        }
         MlilExpr::BinOp { op, left, right } => {
             let left = fold_constants(left);
             let right = fold_constants(right);
@@ -590,6 +645,7 @@ fn collect_ssavars_in_expr(expr: &MlilExpr, used: &mut std::collections::HashSet
             used.insert(v.clone());
         }
         MlilExpr::Load { addr, .. } => collect_ssavars_in_expr(addr, used),
+        MlilExpr::Cast { operand, .. } => collect_ssavars_in_expr(operand, used),
         MlilExpr::BinOp { left, right, .. } => {
             collect_ssavars_in_expr(left, used);
             collect_ssavars_in_expr(right, used);
@@ -744,6 +800,7 @@ fn substitute_values(expr: &mut MlilExpr, values: &HashMap<SsaVar, MlilExpr>, ch
             }
         }
         MlilExpr::Load { addr, .. } => substitute_values(addr, values, changed),
+        MlilExpr::Cast { operand, .. } => substitute_values(operand, values, changed),
         MlilExpr::BinOp { left, right, .. } => {
             substitute_values(left, values, changed);
             substitute_values(right, values, changed);
@@ -855,6 +912,7 @@ fn collect_used_vars_expr(expr: &MlilExpr, used: &mut std::collections::HashSet<
             used.insert(ssa.name.clone());
         }
         MlilExpr::Load { addr, .. } => collect_used_vars_expr(addr, used),
+        MlilExpr::Cast { operand, .. } => collect_used_vars_expr(operand, used),
         MlilExpr::BinOp { left, right, .. } => {
             collect_used_vars_expr(left, used);
             collect_used_vars_expr(right, used);
@@ -1603,6 +1661,101 @@ mod tests {
                 .any(|s| matches!(s, MlilStmt::Assign { dest, .. } if dest.name == "rcx")),
             "the ecx def feeding the unlifted div must survive DSE"
         );
+    }
+
+    /// `subs x2, x0, #1; b.ne` — dest does not overlap the operands, so the
+    /// branch folds into a relational expression exactly like `cmp`.
+    #[test]
+    fn subs_folds_into_relational_branch() {
+        let insns = [
+            make_insn(0x1000, "subs", "x2, x0, #1"),
+            make_insn(0x1004, "b.ne", "#0x2000"),
+        ];
+        let llil = crate::il::lift_function(crate::arch::Architecture::Arm64, "t", 0x1000, &insns);
+        let m = lower_to_mlil(&llil);
+        let cond = m
+            .instructions
+            .iter()
+            .flat_map(|i| &i.stmts)
+            .find_map(|s| match s {
+                MlilStmt::BranchIf { cond, .. } => Some(cond.clone()),
+                _ => None,
+            })
+            .expect("a conditional branch");
+        assert!(
+            matches!(
+                &cond,
+                MlilExpr::BinOp {
+                    op: BinOp::CmpNe,
+                    ..
+                }
+            ),
+            "expected folded x0 != 1, got {:?}",
+            cond
+        );
+    }
+
+    /// `subs x0, x0, #1; b.ne` — the destination overlaps an operand, so the
+    /// recorded flag source is stale at the branch. The fold must NOT fire
+    /// (a folded `x0 - 1 != 0` would read the post-decrement x0).
+    #[test]
+    fn subs_overlapping_dest_does_not_fold_stale_flags() {
+        let insns = [
+            make_insn(0x1000, "subs", "x0, x0, #1"),
+            make_insn(0x1004, "b.ne", "#0x2000"),
+        ];
+        let llil = crate::il::lift_function(crate::arch::Architecture::Arm64, "t", 0x1000, &insns);
+        let m = lower_to_mlil(&llil);
+        let cond = m
+            .instructions
+            .iter()
+            .flat_map(|i| &i.stmts)
+            .find_map(|s| match s {
+                MlilStmt::BranchIf { cond, .. } => Some(cond.clone()),
+                _ => None,
+            })
+            .expect("a conditional branch");
+        assert!(
+            matches!(&cond, MlilExpr::Var(v) if v.name.starts_with("flag_")),
+            "must fall back to the opaque flag var, got {:?}",
+            cond
+        );
+    }
+
+    /// `movzx`/`movsx` survive lowering as casts, and casts of constants fold
+    /// to the masked / sign-extended value.
+    #[test]
+    fn extension_moves_lower_to_casts_and_fold() {
+        let insns = [make_insn(0x1000, "movsx", "eax, cl")];
+        let m = lower_to_mlil(&lift_function("t", 0x1000, &insns));
+        match &m.instructions[0].stmts[0] {
+            MlilStmt::Assign { src, .. } => assert!(
+                matches!(
+                    src,
+                    MlilExpr::Cast {
+                        signed: true,
+                        bits: 8,
+                        ..
+                    }
+                ),
+                "movsx must lower to a signed 8-bit cast, got {:?}",
+                src
+            ),
+            other => panic!("expected assign, got {:?}", other),
+        }
+
+        let sx = MlilExpr::Cast {
+            signed: true,
+            bits: 8,
+            operand: Box::new(MlilExpr::Const(0xff)),
+        };
+        assert_eq!(fold_constants(&sx), MlilExpr::Const(u64::MAX));
+        let zx = MlilExpr::Cast {
+            signed: false,
+            bits: 8,
+            operand: Box::new(MlilExpr::Const(0x1ff)),
+        };
+        assert_eq!(fold_constants(&zx), MlilExpr::Const(0xff));
     }
 
     /// `mov ecx, 5; shl eax, cl` — the cl read is the same register as the

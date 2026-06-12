@@ -125,6 +125,7 @@ impl DefUse {
     fn collect_uses(&mut self, expr: &MlilExpr, site: Site) {
         match expr {
             MlilExpr::Var(v) => self.uses.entry(v.name.clone()).or_default().push(site),
+            MlilExpr::Cast { operand, .. } => self.collect_uses(operand, site),
             MlilExpr::Const(_) => {}
             MlilExpr::Load { addr, .. } => self.collect_uses(addr, site),
             MlilExpr::BinOp { left, right, .. } => {
