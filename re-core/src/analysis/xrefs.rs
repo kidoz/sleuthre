@@ -149,9 +149,9 @@ impl XrefManager {
                     }
                 }
 
-                if mnemonic == "ret" || mnemonic == "retn" {
-                    break;
-                }
+                // Do not stop at a `ret`: multi-exit functions have code
+                // (and xrefs) after their first return; the walk is already
+                // bounded by `end_boundary`.
                 addr += insn.bytes.len() as u64;
             }
         }

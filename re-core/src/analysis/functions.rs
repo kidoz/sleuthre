@@ -110,14 +110,19 @@ impl FunctionManager {
         entry_point: u64,
         arch: Architecture,
     ) -> Result<()> {
-        // Always add entry point
-        self.add_function(Function {
-            name: "entry_point".to_string(),
-            start_address: entry_point,
-            end_address: None,
-            calling_convention: CallingConvention::default(),
-            stack_frame_size: 0,
-        });
+        // Ensure the entry point is a function, but never overwrite an
+        // existing record: on re-analysis this address is an already-known
+        // function whose name/calling-convention/frame data (possibly
+        // user-edited) must survive.
+        if !self.functions.contains_key(&entry_point) {
+            self.add_function(Function {
+                name: "entry_point".to_string(),
+                start_address: entry_point,
+                end_address: None,
+                calling_convention: CallingConvention::default(),
+                stack_frame_size: 0,
+            });
+        }
 
         for segment in &memory.segments {
             if !segment.permissions.contains(Permissions::EXECUTE) {
@@ -505,16 +510,19 @@ fn detect_calling_convention(
         let ops = &insn.op_str;
 
         if arch == Architecture::X86 {
-            // Very basic heuristic for thiscall/fastcall on x86
-            if !ecx_written && ops.contains("ecx") {
-                if mn == "mov" && ops.starts_with("ecx,") {
+            // Heuristic for thiscall/fastcall on x86: an *uninitialized read*
+            // of ecx (edx) suggests it carries an argument. Writes mark the
+            // register as locally initialized, and `push ecx` is the common
+            // one-slot stack-reservation idiom, not an argument read.
+            if !ecx_written && ops.contains("ecx") && mn != "push" {
+                if reg_is_written(&mn, ops, "ecx") {
                     ecx_written = true;
                 } else if default_cc == CallingConvention::Cdecl {
                     default_cc = CallingConvention::Thiscall; // Likely thiscall
                 }
             }
-            if !edx_written && ops.contains("edx") {
-                if mn == "mov" && ops.starts_with("edx,") {
+            if !edx_written && ops.contains("edx") && mn != "push" {
+                if reg_is_written(&mn, ops, "edx") {
                     edx_written = true;
                 } else if default_cc == CallingConvention::Thiscall {
                     default_cc = CallingConvention::Fastcall; // Both ecx and edx used
@@ -568,16 +576,35 @@ fn detect_calling_convention(
     // (cdecl). The register heuristic above already promotes ecx/edx-passing
     // functions to thiscall/fastcall, so only refine the plain cdecl default.
     if arch == Architecture::X86 && default_cc == CallingConvention::Cdecl {
-        let callee_cleanup = insns.iter().any(|insn| {
-            let mn = insn.mnemonic.to_lowercase();
-            (mn == "ret" || mn == "retn") && !insn.op_str.trim().is_empty()
-        });
+        // Only the *first* return can belong to this function: the window is
+        // a flat 100-byte decode that may run into the next function, whose
+        // `ret imm` must not reclassify this one.
+        let callee_cleanup = insns
+            .iter()
+            .find(|insn| {
+                let mn = insn.mnemonic.to_lowercase();
+                mn == "ret" || mn == "retn"
+            })
+            .is_some_and(|insn| !insn.op_str.trim().is_empty());
         if callee_cleanup {
             default_cc = CallingConvention::Stdcall;
         }
     }
 
     (default_cc, frame_size)
+}
+
+/// Whether this instruction writes `reg` without reading it: a plain move
+/// into it, an address materialization, a pop, or the xor/sub zeroing idiom.
+fn reg_is_written(mn: &str, ops: &str, reg: &str) -> bool {
+    let dest_first = ops.trim_start().starts_with(&format!("{},", reg));
+    match mn {
+        "mov" | "lea" | "movzx" | "movsx" => dest_first,
+        "pop" => ops.trim() == reg,
+        // `xor ecx, ecx` / `sub ecx, ecx` zero the register.
+        "xor" | "sub" => ops.split(',').map(str::trim).all(|o| o == reg),
+        _ => false,
+    }
 }
 
 fn is_call_mnemonic(mnemonic: &str) -> bool {
@@ -695,6 +722,57 @@ mod tests {
             detected_cc(&[0xC2, 0x08, 0x00], Architecture::X86),
             CallingConvention::Stdcall
         );
+    }
+
+    /// The 100-byte detection window can run past this function into the
+    /// next one; a neighbor's `ret imm` must not reclassify this function.
+    #[test]
+    fn x86_neighbor_ret_imm_does_not_make_stdcall() {
+        // This function: bare `ret` (C3). Next function: `ret 8` (C2 08 00).
+        assert_eq!(
+            detected_cc(&[0xC3, 0xC2, 0x08, 0x00], Architecture::X86),
+            CallingConvention::Cdecl
+        );
+    }
+
+    /// `push ecx` is the common one-slot stack-reservation idiom, not an
+    /// argument read — it must not classify the function as thiscall.
+    #[test]
+    fn x86_push_ecx_is_not_thiscall() {
+        // push ecx (51); ret (C3)
+        assert_eq!(
+            detected_cc(&[0x51, 0xC3], Architecture::X86),
+            CallingConvention::Cdecl
+        );
+    }
+
+    /// A genuine uninitialized read of ecx still classifies as thiscall.
+    #[test]
+    fn x86_reading_ecx_is_thiscall() {
+        // mov eax, ecx (89 C8); ret (C3)
+        assert_eq!(
+            detected_cc(&[0x89, 0xC8, 0xC3], Architecture::X86),
+            CallingConvention::Thiscall
+        );
+    }
+
+    /// Re-running discovery must not overwrite an existing (possibly
+    /// user-renamed) function at the entry point with a fresh stub.
+    #[test]
+    fn rediscovery_preserves_existing_entry_function() {
+        let mut mgr = FunctionManager::default();
+        let memory = MemoryMap::default();
+        let disasm = Disassembler::new(Architecture::X86_64).unwrap();
+        mgr.discover_functions(&memory, &disasm, 0x1000, Architecture::X86_64)
+            .unwrap();
+        mgr.functions.get_mut(&0x1000).unwrap().name = "main".to_string();
+        mgr.functions.get_mut(&0x1000).unwrap().calling_convention =
+            CallingConvention::SysVAmd64;
+        mgr.discover_functions(&memory, &disasm, 0x1000, Architecture::X86_64)
+            .unwrap();
+        let f = mgr.functions.get(&0x1000).unwrap();
+        assert_eq!(f.name, "main", "re-analysis must keep the user's rename");
+        assert_eq!(f.calling_convention, CallingConvention::SysVAmd64);
     }
 
     #[test]
