@@ -275,7 +275,7 @@ fn collect_reads_from_stmt(stmt: &MlilStmt) -> Vec<String> {
             }
             reads
         }
-        MlilStmt::Return | MlilStmt::Nop => vec![],
+        MlilStmt::Return | MlilStmt::Nop | MlilStmt::Unimplemented { .. } => vec![],
     }
 }
 
@@ -2229,6 +2229,9 @@ fn lower_mlil_stmts(
                 }
             }
             MlilStmt::Nop => {}
+            MlilStmt::Unimplemented { text } => {
+                result.push(HlilStmt::Comment(format!("unimplemented: {}", text)));
+            }
         }
     }
     result

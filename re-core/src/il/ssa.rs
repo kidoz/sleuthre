@@ -112,7 +112,10 @@ impl DefUse {
                             idx.collect_uses(a, site);
                         }
                     }
-                    MlilStmt::Return | MlilStmt::Nop => {}
+                    // Unknown effects: indexable defs/uses cannot be
+                    // attributed; downstream straight-line checks treat the
+                    // statement as a barrier instead.
+                    MlilStmt::Return | MlilStmt::Nop | MlilStmt::Unimplemented { .. } => {}
                 }
             }
         }

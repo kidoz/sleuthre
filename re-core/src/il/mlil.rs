@@ -11,6 +11,14 @@ use crate::il::llil::{
     VectorOpKind,
 };
 
+/// Version assigned to a use with no known reaching definition: before any
+/// def of the name, after a join point, or after an instruction with unknown
+/// effects. It is distinct from every version a definition can carry (defs
+/// get 0 or 1..), which is what makes the optimization passes sound: value
+/// propagation never substitutes into such a use, and dead-store elimination
+/// treats it as keeping *every* definition of the name alive.
+pub const VER_UNKNOWN: u32 = u32::MAX;
+
 /// An SSA variable: a register name with a version number.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SsaVar {
@@ -20,7 +28,11 @@ pub struct SsaVar {
 
 impl fmt::Display for SsaVar {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}#{}", self.name, self.version)
+        if self.version == VER_UNKNOWN {
+            write!(f, "{}#?", self.name)
+        } else {
+            write!(f, "{}#{}", self.name, self.version)
+        }
     }
 }
 
@@ -84,6 +96,13 @@ pub enum MlilStmt {
     },
     Return,
     Nop,
+    /// An instruction the lifter could not translate (original text kept).
+    /// It may read or write anything, so the dataflow passes must treat it
+    /// as a barrier — erasing it to `Nop` would let dead-store elimination
+    /// delete the live definitions it consumes.
+    Unimplemented {
+        text: String,
+    },
 }
 
 /// An MLIL instruction with source address.
@@ -283,7 +302,12 @@ pub fn lower_to_mlil(llil_func: &LlilFunction) -> MlilFunction {
                     });
                 }
                 LlilStmt::Return => stmts.push(MlilStmt::Return),
-                LlilStmt::Nop | LlilStmt::Unimplemented { .. } => stmts.push(MlilStmt::Nop),
+                LlilStmt::Nop => stmts.push(MlilStmt::Nop),
+                LlilStmt::Unimplemented { mnemonic, op_str } => {
+                    stmts.push(MlilStmt::Unimplemented {
+                        text: format!("{} {}", mnemonic, op_str).trim().to_string(),
+                    });
+                }
             }
         }
         instructions.push(MlilInst {
@@ -393,6 +417,9 @@ pub fn version_defs_and_uses(func: &mut MlilFunction) {
                         rename_uses(a, &current);
                     }
                 }
+                // Unknown effects: every register may have been redefined, so
+                // later uses must not be linked to definitions above it.
+                MlilStmt::Unimplemented { .. } => current.clear(),
                 MlilStmt::Return | MlilStmt::Nop => {}
             }
         }
@@ -402,7 +429,10 @@ pub fn version_defs_and_uses(func: &mut MlilFunction) {
 /// Point every variable in `expr` at its current reaching-definition version.
 fn rename_uses(expr: &mut MlilExpr, current: &HashMap<String, u32>) {
     match expr {
-        MlilExpr::Var(v) => v.version = current.get(&v.name).copied().unwrap_or(0),
+        // No reaching definition known (use-before-def, post-join, or past an
+        // unimplemented instruction): the sentinel keeps this use from ever
+        // matching a definition's version in the optimization passes.
+        MlilExpr::Var(v) => v.version = current.get(&v.name).copied().unwrap_or(VER_UNKNOWN),
         MlilExpr::Load { addr, .. } => rename_uses(addr, current),
         MlilExpr::BinOp { left, right, .. } => {
             rename_uses(left, current);
@@ -552,6 +582,18 @@ fn collect_ssavars_in_expr(expr: &MlilExpr, used: &mut std::collections::HashSet
 pub fn eliminate_dead_stores_ssa(func: &mut MlilFunction) {
     use std::collections::HashSet;
 
+    // An unimplemented instruction reads an unknown set of registers (e.g.
+    // `div ecx` implicitly reads eax/edx): any definition feeding it would
+    // look dead. No elimination is sound in that case.
+    let has_unknown_effects = func.instructions.iter().any(|i| {
+        i.stmts
+            .iter()
+            .any(|s| matches!(s, MlilStmt::Unimplemented { .. }))
+    });
+    if has_unknown_effects {
+        return;
+    }
+
     let mut used: HashSet<SsaVar> = HashSet::new();
     for inst in &func.instructions {
         for stmt in &inst.stmts {
@@ -572,22 +614,34 @@ pub fn eliminate_dead_stores_ssa(func: &mut MlilFunction) {
                         collect_ssavars_in_expr(a, &mut used);
                     }
                 }
-                MlilStmt::Return | MlilStmt::Nop => {}
+                MlilStmt::Return | MlilStmt::Nop | MlilStmt::Unimplemented { .. } => {}
             }
         }
     }
+
+    // A use whose reaching definition is unknown (post-join / use-before-def)
+    // may read *any* definition of that name — every def of the name must
+    // survive, or branch-side assignments feeding a join get deleted.
+    let used_any_version: HashSet<&str> = used
+        .iter()
+        .filter(|v| v.version == VER_UNKNOWN)
+        .map(|v| v.name.as_str())
+        .collect();
 
     for inst in &mut func.instructions {
         inst.stmts.retain(|stmt| match stmt {
             MlilStmt::Assign { dest, .. } => {
                 // Return registers (value consumed by the implicit return) and
-                // synthetic/flag registers are always kept.
-                dest.name == "rax"
-                    || dest.name == "eax"
-                    || dest.name == "x0"
-                    || dest.name.starts_with("flag_")
+                // synthetic/flag registers are always kept. The return-register
+                // list covers every lifted architecture: x86 (rax/eax), ARM64
+                // (x0/w0), ARM32 (r0), MIPS (v0/v1), RISC-V (a0/a1).
+                matches!(
+                    dest.name.as_str(),
+                    "rax" | "eax" | "x0" | "w0" | "r0" | "v0" | "v1" | "a0" | "a1"
+                ) || dest.name.starts_with("flag_")
                     || dest.name.starts_with("__")
                     || used.contains(dest)
+                    || used_any_version.contains(dest.name.as_str())
             }
             _ => true,
         });
@@ -614,7 +668,7 @@ fn for_each_use_expr_mut(stmt: &mut MlilStmt, mut f: impl FnMut(&mut MlilExpr)) 
                 f(a);
             }
         }
-        MlilStmt::Return | MlilStmt::Nop => {}
+        MlilStmt::Return | MlilStmt::Nop | MlilStmt::Unimplemented { .. } => {}
     }
 }
 
@@ -800,7 +854,7 @@ fn collect_used_vars_stmt(stmt: &MlilStmt, used: &mut std::collections::HashSet<
                 collect_used_vars_expr(a, used);
             }
         }
-        MlilStmt::Return | MlilStmt::Nop => {}
+        MlilStmt::Return | MlilStmt::Nop | MlilStmt::Unimplemented { .. } => {}
     }
 }
 
@@ -1070,9 +1124,12 @@ pub fn reconstruct_stack_operations(func: &mut MlilFunction) {
                 MlilStmt::Assign { dest, .. } => {
                     defined.insert(dest.name.clone());
                 }
-                MlilStmt::Jump { .. } | MlilStmt::BranchIf { .. } | MlilStmt::Return => {
-                    control_flow = true
-                }
+                MlilStmt::Jump { .. }
+                | MlilStmt::BranchIf { .. }
+                | MlilStmt::Return
+                // Unknown effects may include stack adjustment — drop any
+                // tracked data pushes rather than misattribute them.
+                | MlilStmt::Unimplemented { .. } => control_flow = true,
                 _ => {}
             }
         }
@@ -1399,7 +1456,9 @@ mod tests {
     fn reaching_defs_reset_at_branch_targets() {
         // eax is reassigned (so it *would* be versioned), then a jump lands on a
         // block whose first instruction reads eax: the reaching map resets at the
-        // join, so the use falls back to version 0 rather than a wrong guess.
+        // join, so the use gets the unknown-definition sentinel rather than a
+        // wrong guess (and rather than version 0, which would alias a
+        // single-def register's version and let propagation rewrite it).
         let mut m = lower_to_mlil(&lift_function(
             "test",
             0x1000,
@@ -1413,8 +1472,92 @@ mod tests {
         version_defs_and_uses(&mut m);
         assert_eq!(
             src_var_version(&m, 0),
-            0,
-            "use at a branch target resets to version 0"
+            VER_UNKNOWN,
+            "use at a branch target resets to the unknown sentinel"
+        );
+    }
+
+    /// Both sides of a diamond assign the same register and a use follows the
+    /// join: dead-store elimination must keep *both* definitions (the join use
+    /// carries the unknown sentinel, which keeps every version of the name).
+    #[test]
+    fn dse_keeps_both_branch_definitions_feeding_a_join() {
+        let mut m = lower_to_mlil(&lift_function(
+            "test",
+            0x1000,
+            &[
+                make_insn(0x1000, "test", "ecx, ecx"),
+                make_insn(0x1002, "je", "0x1010"),
+                make_insn(0x1004, "mov", "ebx, 1"),
+                make_insn(0x1009, "jmp", "0x1015"),
+                make_insn(0x1010, "mov", "ebx, 2"),
+                make_insn(0x1015, "mov", "eax, ebx"),
+            ],
+        ));
+        version_defs_and_uses(&mut m);
+        eliminate_dead_stores_ssa(&mut m);
+        let ebx_defs = m
+            .instructions
+            .iter()
+            .flat_map(|i| &i.stmts)
+            .filter(|s| matches!(s, MlilStmt::Assign { dest, .. } if dest.name == "ebx"))
+            .count();
+        assert_eq!(ebx_defs, 2, "both branch-side ebx defs must survive DSE");
+    }
+
+    /// A register is read first and reassigned later: propagation must not
+    /// rewrite the earlier read with the later value (use-before-def shares
+    /// no version with the definition).
+    #[test]
+    fn propagation_never_rewrites_a_use_before_its_def() {
+        let mut m = lower_to_mlil(&lift_function(
+            "test",
+            0x1000,
+            &[
+                make_insn(0x1000, "mov", "eax, edi"), // reads incoming edi
+                make_insn(0x1005, "mov", "edi, 5"),   // single def of edi
+            ],
+        ));
+        version_defs_and_uses(&mut m);
+        propagate_values(&mut m);
+        match &m.instructions[0].stmts[0] {
+            MlilStmt::Assign { src, .. } => assert!(
+                matches!(src, MlilExpr::Var(v) if v.name == "edi"),
+                "eax must read the incoming edi, not the later constant; got {:?}",
+                src
+            ),
+            other => panic!("expected assign, got {:?}", other),
+        }
+    }
+
+    /// An unlifted instruction has unknown reads: it must survive lowering as
+    /// a barrier (not a Nop), and DSE must not delete definitions that may
+    /// feed it (`div ecx` implicitly reads eax/edx and ecx).
+    #[test]
+    fn unimplemented_blocks_dead_store_elimination() {
+        let mut m = lower_to_mlil(&lift_function(
+            "test",
+            0x1000,
+            &[
+                make_insn(0x1000, "mov", "ecx, 10"),
+                make_insn(0x1005, "div", "ecx"),
+            ],
+        ));
+        assert!(
+            m.instructions
+                .iter()
+                .flat_map(|i| &i.stmts)
+                .any(|s| matches!(s, MlilStmt::Unimplemented { text } if text.contains("div"))),
+            "unlifted div must lower to an Unimplemented barrier"
+        );
+        version_defs_and_uses(&mut m);
+        eliminate_dead_stores_ssa(&mut m);
+        assert!(
+            m.instructions
+                .iter()
+                .flat_map(|i| &i.stmts)
+                .any(|s| matches!(s, MlilStmt::Assign { dest, .. } if dest.name == "ecx")),
+            "the ecx def feeding the unlifted div must survive DSE"
         );
     }
 

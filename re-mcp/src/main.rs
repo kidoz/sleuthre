@@ -159,7 +159,7 @@ fn collect_ssa_vars(func: &re_core::il::mlil::MlilFunction) -> Vec<serde_json::V
                         walk_expr(a, inst.address, &mut map);
                     }
                 }
-                MlilStmt::Return | MlilStmt::Nop => {}
+                MlilStmt::Return | MlilStmt::Nop | MlilStmt::Unimplemented { .. } => {}
             }
         }
     }

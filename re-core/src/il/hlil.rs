@@ -333,7 +333,9 @@ fn pretty_var_name(ssa: &SsaVar) -> String {
         name if name.starts_with("__") => return name.to_string(),
         name => name,
     };
-    if ssa.version > 0 {
+    // The unknown-definition sentinel renders as the bare name, like
+    // version 0: both stand for "the incoming/ambient value".
+    if ssa.version > 0 && ssa.version != super::mlil::VER_UNKNOWN {
         format!("{}_{}", base, ssa.version)
     } else {
         base.to_string()

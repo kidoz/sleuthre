@@ -468,7 +468,12 @@ fn control_flow_between(il: &FunctionIl, a: Site, b: Site) -> bool {
                 && here < hi
                 && matches!(
                     stmt,
-                    MlilStmt::Jump { .. } | MlilStmt::BranchIf { .. } | MlilStmt::Return
+                    MlilStmt::Jump { .. }
+                        | MlilStmt::BranchIf { .. }
+                        | MlilStmt::Return
+                        // Unknown effects: the value may have been clobbered,
+                        // so producer/consumer links across it are unsound.
+                        | MlilStmt::Unimplemented { .. }
                 )
             {
                 return true;
