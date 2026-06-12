@@ -120,11 +120,55 @@ pub struct MlilFunction {
     pub instructions: Vec<MlilInst>,
 }
 
+/// Canonicalize a register name to its widest architectural alias (`eax` →
+/// `rax`, `cl` → `rcx`, `w3` → `x3`) at MLIL lowering time. Sub-registers
+/// were previously unrelated variables to every dataflow pass: DSE deleted
+/// the `mov ecx, 5` feeding a `shl eax, cl`, and the ABI tables (keyed on
+/// the wide names) missed `mov edi, …` argument setup entirely. Width
+/// semantics (zero/sign extension of the narrow write) are intentionally not
+/// modeled, matching MLIL's existing width handling, and the pseudocode
+/// renderer already maps each alias family to one display name, so output
+/// naming is unchanged. `sp` and `ip` are deliberately NOT mapped — as
+/// operand text those names are ARM's stack pointer and r12, not the 16-bit
+/// x86 aliases.
+fn canonical_register(name: &str) -> String {
+    // ARM64: w-registers are the 32-bit views of the x-registers.
+    if let Some(num) = name.strip_prefix('w')
+        && !num.is_empty()
+        && num.len() <= 2
+        && num.chars().all(|c| c.is_ascii_digit())
+    {
+        return format!("x{}", num);
+    }
+    match name {
+        "wzr" => "xzr",
+        "eax" | "ax" | "al" | "ah" => "rax",
+        "ebx" | "bx" | "bl" | "bh" => "rbx",
+        "ecx" | "cx" | "cl" | "ch" => "rcx",
+        "edx" | "dx" | "dl" | "dh" => "rdx",
+        "esi" | "si" | "sil" => "rsi",
+        "edi" | "di" | "dil" => "rdi",
+        "ebp" | "bp" | "bpl" => "rbp",
+        "esp" | "spl" => "rsp",
+        "eip" => "rip",
+        "r8d" | "r8w" | "r8b" => "r8",
+        "r9d" | "r9w" | "r9b" => "r9",
+        "r10d" | "r10w" | "r10b" => "r10",
+        "r11d" | "r11w" | "r11b" => "r11",
+        "r12d" | "r12w" | "r12b" => "r12",
+        "r13d" | "r13w" | "r13b" => "r13",
+        "r14d" | "r14w" | "r14b" => "r14",
+        "r15d" | "r15w" | "r15b" => "r15",
+        other => other,
+    }
+    .to_string()
+}
+
 /// Convert LLIL expression index into an MLIL expression tree.
 fn lower_expr(llil_func: &LlilFunction, id: ExprId) -> MlilExpr {
     match &llil_func.exprs[id] {
         llil::LlilExpr::Reg(name) => MlilExpr::Var(SsaVar {
-            name: name.clone(),
+            name: canonical_register(name),
             version: 0,
         }),
         llil::LlilExpr::Const(v) => MlilExpr::Const(*v),
@@ -262,7 +306,7 @@ pub fn lower_to_mlil(llil_func: &LlilFunction) -> MlilFunction {
                     }
                     stmts.push(MlilStmt::Assign {
                         dest: SsaVar {
-                            name: dest.clone(),
+                            name: canonical_register(dest),
                             version: 0,
                         },
                         src,
@@ -1218,8 +1262,8 @@ mod tests {
             cond,
             MlilExpr::BinOp {
                 op: BinOp::CmpLt,
-                left: Box::new(var("eax")),
-                right: Box::new(var("ebx")),
+                left: Box::new(var("rax")),
+                right: Box::new(var("rbx")),
             }
         );
     }
@@ -1250,7 +1294,7 @@ mod tests {
             cond,
             MlilExpr::BinOp {
                 op: BinOp::CmpEq,
-                left: Box::new(var("eax")),
+                left: Box::new(var("rax")),
                 right: Box::new(MlilExpr::Const(0)),
             }
         );
@@ -1269,7 +1313,7 @@ mod tests {
                 op: BinOp::CmpNe,
                 left: Box::new(MlilExpr::BinOp {
                     op: BinOp::And,
-                    left: Box::new(var("al")),
+                    left: Box::new(var("rax")),
                     right: Box::new(MlilExpr::Const(1)),
                 }),
                 right: Box::new(MlilExpr::Const(0)),
@@ -1380,7 +1424,7 @@ mod tests {
             .iter()
             .flat_map(|i| &i.stmts)
             .filter_map(|s| match s {
-                MlilStmt::Assign { dest, src } if dest.name == "ebp" => Some(src.clone()),
+                MlilStmt::Assign { dest, src } if dest.name == "rbp" => Some(src.clone()),
                 _ => None,
             })
             .collect();
@@ -1500,7 +1544,7 @@ mod tests {
             .instructions
             .iter()
             .flat_map(|i| &i.stmts)
-            .filter(|s| matches!(s, MlilStmt::Assign { dest, .. } if dest.name == "ebx"))
+            .filter(|s| matches!(s, MlilStmt::Assign { dest, .. } if dest.name == "rbx"))
             .count();
         assert_eq!(ebx_defs, 2, "both branch-side ebx defs must survive DSE");
     }
@@ -1522,8 +1566,8 @@ mod tests {
         propagate_values(&mut m);
         match &m.instructions[0].stmts[0] {
             MlilStmt::Assign { src, .. } => assert!(
-                matches!(src, MlilExpr::Var(v) if v.name == "edi"),
-                "eax must read the incoming edi, not the later constant; got {:?}",
+                matches!(src, MlilExpr::Var(v) if v.name == "rdi"),
+                "eax must read the incoming edi (canonical rdi), not the later constant; got {:?}",
                 src
             ),
             other => panic!("expected assign, got {:?}", other),
@@ -1556,8 +1600,35 @@ mod tests {
             m.instructions
                 .iter()
                 .flat_map(|i| &i.stmts)
-                .any(|s| matches!(s, MlilStmt::Assign { dest, .. } if dest.name == "ecx")),
+                .any(|s| matches!(s, MlilStmt::Assign { dest, .. } if dest.name == "rcx")),
             "the ecx def feeding the unlifted div must survive DSE"
+        );
+    }
+
+    /// `mov ecx, 5; shl eax, cl` — the cl read is the same register as the
+    /// ecx write (canonical rcx); DSE must not delete the shift amount.
+    #[test]
+    fn dse_keeps_def_read_through_a_subregister() {
+        let mut m = lower_to_mlil(&lift_function(
+            "test",
+            0x1000,
+            &[
+                make_insn(0x1000, "mov", "ecx, 5"),
+                make_insn(0x1005, "shl", "eax, cl"),
+            ],
+        ));
+        version_defs_and_uses(&mut m);
+        eliminate_dead_stores_ssa(&mut m);
+        assert!(
+            m.instructions
+                .iter()
+                .flat_map(|i| &i.stmts)
+                .any(|s| matches!(
+                    s,
+                    MlilStmt::Assign { dest, src } if dest.name == "rcx"
+                        && matches!(src, MlilExpr::Const(5))
+                )),
+            "the shift-amount def must survive DSE"
         );
     }
 
@@ -1651,7 +1722,7 @@ mod tests {
             .iter()
             .flat_map(|i| &i.stmts)
             .find_map(|s| match s {
-                MlilStmt::Assign { dest, src } if dest.name == "ebx" => Some(src.clone()),
+                MlilStmt::Assign { dest, src } if dest.name == "rbx" => Some(src.clone()),
                 _ => None,
             })
             .expect("ebx assignment");
@@ -1676,7 +1747,7 @@ mod tests {
             .instructions
             .iter()
             .flat_map(|i| &i.stmts)
-            .filter(|s| matches!(s, MlilStmt::Assign { dest, .. } if dest.name == "ecx"))
+            .filter(|s| matches!(s, MlilStmt::Assign { dest, .. } if dest.name == "rcx"))
             .count();
         assert_eq!(ecx_defs, 1, "the dead ecx#1 store should be removed");
     }

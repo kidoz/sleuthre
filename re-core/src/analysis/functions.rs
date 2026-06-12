@@ -766,8 +766,7 @@ mod tests {
         mgr.discover_functions(&memory, &disasm, 0x1000, Architecture::X86_64)
             .unwrap();
         mgr.functions.get_mut(&0x1000).unwrap().name = "main".to_string();
-        mgr.functions.get_mut(&0x1000).unwrap().calling_convention =
-            CallingConvention::SysVAmd64;
+        mgr.functions.get_mut(&0x1000).unwrap().calling_convention = CallingConvention::SysVAmd64;
         mgr.discover_functions(&memory, &disasm, 0x1000, Architecture::X86_64)
             .unwrap();
         let f = mgr.functions.get(&0x1000).unwrap();

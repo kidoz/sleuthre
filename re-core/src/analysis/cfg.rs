@@ -118,8 +118,7 @@ impl ControlFlowGraph {
                     mnemonic.as_str(),
                     "call" | "bl" | "blx" | "blr" | "jal" | "jalr"
                 );
-                let is_unconditional =
-                    matches!(mnemonic.as_str(), "jmp" | "b" | "j" | "br" | "bx");
+                let is_unconditional = matches!(mnemonic.as_str(), "jmp" | "b" | "j" | "br" | "bx");
                 if is_return {
                     // End of path — no successors.
                 } else if is_call {

@@ -39,7 +39,9 @@ const ARM64_ARG_REGS: &[&str] = &["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"
 const X86_64_RETURN_REGS: &[&str] = &["rax", "eax"];
 
 /// ABI argument registers for x86 (thiscall/fastcall potential registers). Cdecl uses stack.
-const X86_ARG_REGS: &[&str] = &["ecx", "edx"];
+// MLIL canonicalizes sub-registers to their widest alias, so 32-bit ecx/edx
+// appear as rcx/rdx here.
+const X86_ARG_REGS: &[&str] = &["rcx", "rdx"];
 
 /// Registers that hold the return value on ARM64.
 const ARM64_RETURN_REGS: &[&str] = &["x0"];
@@ -475,8 +477,8 @@ fn recover_x86_this_arguments(
                 MlilStmt::Call { target, args } => {
                     let regs: &[&str] = match target {
                         MlilExpr::Const(addr) => match conventions.get(addr) {
-                            Some(CallingConvention::Thiscall) => &["ecx"],
-                            Some(CallingConvention::Fastcall) => &["ecx", "edx"],
+                            Some(CallingConvention::Thiscall) => &["rcx"],
+                            Some(CallingConvention::Fastcall) => &["rcx", "rdx"],
                             _ => &[],
                         },
                         _ => &[],
@@ -2724,6 +2726,33 @@ mod tests {
     use crate::disasm::Instruction;
 
     #[test]
+    fn recovers_args_staged_in_32bit_registers() {
+        // `mov edi, 5; call f` is the dominant codegen for small int args on
+        // x86-64 — canonicalization maps edi→rdi so the SysV table matches.
+        let insns = [
+            make_insn(0x1000, "mov", "edi, 5"),
+            make_insn(0x1003, "call", "0x2000"),
+        ];
+        let llil = crate::il::lift_function(crate::arch::Architecture::X86_64, "t", 0x1000, &insns);
+        let mut m = crate::il::mlil::lower_to_mlil(&llil);
+        crate::il::mlil::version_defs_and_uses(&mut m);
+        recover_register_call_args(&mut m, crate::arch::Architecture::X86_64);
+        let args = m
+            .instructions
+            .iter()
+            .flat_map(|i| &i.stmts)
+            .find_map(|s| match s {
+                MlilStmt::Call { args, .. } => Some(args.clone()),
+                _ => None,
+            })
+            .expect("a call statement");
+        assert!(
+            matches!(args.first(), Some(MlilExpr::Var(v)) if v.name == "rdi"),
+            "32-bit edi staging must be recovered as the rdi argument, got {args:?}"
+        );
+    }
+
+    #[test]
     fn recovers_x86_64_register_call_args() {
         // mov rdi, 5 ; mov rsi, rax ; call 0x2000  →  f(rdi, rsi)
         let insns = [
@@ -2784,7 +2813,7 @@ mod tests {
             })
             .expect("a call statement");
         assert!(
-            matches!(args.first(), Some(MlilExpr::Var(v)) if v.name == "ecx"),
+            matches!(args.first(), Some(MlilExpr::Var(v)) if v.name == "rcx"),
             "thiscall `this` (ecx) should be the first argument, got {args:?}"
         );
     }
@@ -3328,11 +3357,11 @@ mod tests {
                 address: 0x1000,
                 stmts: vec![MlilStmt::Assign {
                     dest: SsaVar {
-                        name: "eax".into(),
+                        name: "rax".into(),
                         version: 1,
                     },
                     src: MlilExpr::Var(SsaVar {
-                        name: "ecx".into(),
+                        name: "rcx".into(),
                         version: 0,
                     }),
                 }],
