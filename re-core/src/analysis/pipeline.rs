@@ -6,7 +6,9 @@ use std::sync::{
 };
 
 use crate::Result;
-use crate::analysis::passes::{HeuristicNamePass, SignaturePass, SuspiciousNamePass};
+use crate::analysis::passes::{
+    HeuristicNamePass, ImportThunkNamePass, SignaturePass, SuspiciousNamePass,
+};
 use crate::analysis::struct_inference::StructInferencePass;
 use crate::analysis::type_propagation::{FunctionIl, TypePropagator};
 use crate::arch::Architecture;
@@ -450,6 +452,7 @@ fn analyze_loaded_with_bytes(
         let mut pm = PluginManager::default();
         pm.register_analysis_pass(Box::new(SuspiciousNamePass));
         pm.register_analysis_pass(Box::new(HeuristicNamePass));
+        pm.register_analysis_pass(Box::new(ImportThunkNamePass::new(&project.imports)));
         pm.register_analysis_pass(Box::new(StructInferencePass::new(project.arch)));
 
         let sig_db = match loaded.arch {
@@ -645,6 +648,7 @@ pub fn reanalyze_with_cancellation(
         let mut pm = PluginManager::default();
         pm.register_analysis_pass(Box::new(SuspiciousNamePass));
         pm.register_analysis_pass(Box::new(HeuristicNamePass));
+        pm.register_analysis_pass(Box::new(ImportThunkNamePass::new(&project.imports)));
         pm.register_analysis_pass(Box::new(StructInferencePass::new(project.arch)));
 
         let sig_db = match project.arch {

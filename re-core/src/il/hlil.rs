@@ -843,6 +843,15 @@ fn write_expr_prec(w: &mut SourceWriter, expr: &HlilExpr, parent_prec: u8) {
                 HlilExpr::FieldAccess { .. } => {
                     write_expr_prec(w, target, 11);
                 }
+                // Call through an import slot resolved to a name (`call [IAT]`
+                // where the IAT entry is a known import): render as a direct
+                // call to the import, `MessageBoxA(...)`, instead of the noisy
+                // function-pointer-cast deref.
+                HlilExpr::Deref { addr, .. } if matches!(&**addr, HlilExpr::Global(_, _)) => {
+                    if let HlilExpr::Global(faddr, name) = &**addr {
+                        w.write_annotated(name, AnnotationKind::Function(*faddr));
+                    }
+                }
                 // Indirect call through a dereferenced pointer: wrap the target
                 // in a function-pointer cast so the expression parses as C.
                 HlilExpr::Deref { addr, .. } => {

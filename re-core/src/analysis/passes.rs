@@ -143,6 +143,133 @@ impl AnalysisPass for HeuristicNamePass {
     }
 }
 
+/// A sanitized, unique-per-function name derived from an import or string.
+/// Keeps the result a valid C identifier and avoids colliding with an
+/// existing name.
+fn unique_evidence_name(stem: &str, addr: u64) -> String {
+    let mut cleaned: String = stem
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    // C identifiers can't start with a digit.
+    if cleaned.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        cleaned.insert(0, '_');
+    }
+    if cleaned.is_empty() {
+        cleaned.push_str("fn");
+    }
+    // Suffix with the address so two functions reaching the same import/string
+    // get distinct names.
+    format!("{}_{:x}", cleaned, addr)
+}
+
+/// Evidence-based function naming from imports (G6).
+///
+/// Names functions whose body is dominated by a single imported call — import
+/// thunks (`jmp [iat]`) become `<import>` and thin wrappers become
+/// `<import>_<addr>`. This turns anonymous `sub_*` functions into navigable
+/// names without requiring full library signatures, which is the single
+/// biggest navigation win on a stripped MSVC binary with hundreds of imports.
+pub struct ImportThunkNamePass {
+    /// IAT slot address -> import name.
+    imports: std::collections::HashMap<u64, String>,
+}
+
+impl ImportThunkNamePass {
+    pub fn new(imports: &[crate::loader::Import]) -> Self {
+        let map = imports
+            .iter()
+            .filter(|i| !i.name.is_empty())
+            .map(|i| (i.address, i.name.clone()))
+            .collect();
+        Self { imports: map }
+    }
+}
+
+impl AnalysisPass for ImportThunkNamePass {
+    fn name(&self) -> &str {
+        "Import Thunk Naming"
+    }
+
+    fn run_analysis(
+        &self,
+        _memory: &MemoryMap,
+        functions: &mut FunctionManager,
+        xrefs: &XrefManager,
+        _strings: &StringsManager,
+    ) -> Result<Vec<AnalysisFinding>> {
+        if self.imports.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut findings = Vec::new();
+
+        // Snapshot the function start addresses and end boundaries up front so
+        // we can both read the call graph and mutate names without aliasing.
+        let bounds: Vec<(u64, Option<u64>)> = functions
+            .functions
+            .values()
+            .map(|f| (f.start_address, f.end_address))
+            .collect();
+
+        for (start, end) in bounds {
+            // Count this function's outbound code references to imports vs. to
+            // anything else. A function that calls/jumps exactly one import and
+            // nothing else is a thunk or thin wrapper.
+            let stop = end.unwrap_or(start + 64);
+            let mut import_hit: Option<&str> = None;
+            let mut import_count = 0usize;
+            let mut other_calls = 0usize;
+            for (from, refs) in &xrefs.from_address_xrefs {
+                if *from < start || *from >= stop {
+                    continue;
+                }
+                for x in refs {
+                    if !matches!(
+                        x.xref_type,
+                        crate::analysis::xrefs::XrefType::Call
+                            | crate::analysis::xrefs::XrefType::Jump
+                    ) {
+                        continue;
+                    }
+                    if let Some(name) = self.imports.get(&x.to_address) {
+                        import_count += 1;
+                        import_hit = Some(name);
+                    } else {
+                        other_calls += 1;
+                    }
+                }
+            }
+
+            // Only rename anonymous functions that resolve to exactly one
+            // import and make no other calls — a confident wrapper.
+            let (Some(name), 1, 0) = (import_hit, import_count, other_calls) else {
+                continue;
+            };
+            let Some(func) = functions.functions.get_mut(&start) else {
+                continue;
+            };
+            if !func.name.starts_with("sub_") && !func.name.starts_with("fcn_") {
+                continue;
+            }
+            func.name = unique_evidence_name(name, start);
+            findings.push(AnalysisFinding::new(
+                start,
+                FindingCategory::Info,
+                format!("Wrapper for imported '{}'", name),
+                0.7,
+            ));
+        }
+
+        Ok(findings)
+    }
+}
+
 /// Detect common MSVC x86 prologue/code patterns: SEH frame setup, FPO
 /// (frame-pointer omission), and inline memcpy/memset via `rep movs`/`rep stos`.
 ///
@@ -284,6 +411,68 @@ fn detect_fpo_prologue(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn import_thunk_named_after_its_import() {
+        use crate::analysis::functions::{CallingConvention, Function};
+        use crate::analysis::xrefs::{Xref, XrefType};
+        use crate::loader::Import;
+
+        let mut functions = FunctionManager::default();
+        functions.add_function(Function {
+            name: "sub_401000".to_string(),
+            start_address: 0x401000,
+            end_address: Some(0x401006),
+            calling_convention: CallingConvention::default(),
+            stack_frame_size: 0,
+        });
+        // A second function makes other calls — must NOT be renamed.
+        functions.add_function(Function {
+            name: "sub_402000".to_string(),
+            start_address: 0x402000,
+            end_address: Some(0x402020),
+            calling_convention: CallingConvention::default(),
+            stack_frame_size: 0,
+        });
+
+        let mut xrefs = XrefManager::new();
+        // sub_401000: jmp [0x40a000] (the IAT slot for MessageBoxA).
+        xrefs.add_xref(Xref {
+            from_address: 0x401000,
+            to_address: 0x40a000,
+            xref_type: XrefType::Jump,
+        });
+        // sub_402000: calls the import AND another function -> ambiguous.
+        xrefs.add_xref(Xref {
+            from_address: 0x402004,
+            to_address: 0x40a000,
+            xref_type: XrefType::Call,
+        });
+        xrefs.add_xref(Xref {
+            from_address: 0x402010,
+            to_address: 0x401000,
+            xref_type: XrefType::Call,
+        });
+
+        let imports = vec![Import {
+            name: "MessageBoxA".to_string(),
+            library: "USER32.dll".to_string(),
+            address: 0x40a000,
+        }];
+        let strings = StringsManager::default();
+        let pass = ImportThunkNamePass::new(&imports);
+        pass.run_analysis(&MemoryMap::default(), &mut functions, &xrefs, &strings)
+            .unwrap();
+
+        assert_eq!(
+            functions.functions[&0x401000].name, "MessageBoxA_401000",
+            "single-import thunk should be renamed"
+        );
+        assert_eq!(
+            functions.functions[&0x402000].name, "sub_402000",
+            "a function with other calls must not be renamed"
+        );
+    }
 
     #[test]
     fn seh_shape_a_detected() {

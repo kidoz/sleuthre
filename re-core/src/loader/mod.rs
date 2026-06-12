@@ -369,13 +369,17 @@ fn load_pe(pe: pe::PE, bytes: &[u8]) -> Result<LoadedBinary> {
         })?;
     }
 
-    // Extract PE imports
+    // Extract PE imports. `import.offset` is the IAT slot RVA
+    // (`import_address_table_rva + i*ptr_size`) — the address that call sites
+    // dereference (`call dword ptr [iat]`). `import.rva` is the hint/name
+    // table RVA instead, which no code references; using it breaks
+    // import-call resolution and thunk naming.
     let mut imports = Vec::new();
     for import in &pe.imports {
         imports.push(Import {
             name: import.name.to_string(),
             library: import.dll.to_string(),
-            address: image_base + import.rva as u64,
+            address: image_base + import.offset as u64,
         });
     }
 
