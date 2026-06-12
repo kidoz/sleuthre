@@ -10,8 +10,17 @@ pub struct TypeContext<R: Reader> {
     /// Types that have been fully resolved into CompoundTypes
     pub compound_types: Vec<CompoundType>,
     pub arch: crate::arch::Architecture,
+    /// Current nesting depth of in-flight `resolve_type` calls. The cache's
+    /// placeholder protects against *cyclic* type graphs but not against a
+    /// crafted multi-thousand-link acyclic chain of pointer/const/typedef
+    /// DIEs, which would overflow the stack (debug info is untrusted input).
+    depth: u32,
     _phantom: std::marker::PhantomData<R>,
 }
+
+/// Deepest legitimate type nesting we expect; beyond this the chain is
+/// treated as hostile and resolves to `void`.
+const MAX_TYPE_DEPTH: u32 = 64;
 
 impl<R: Reader<Offset = usize>> TypeContext<R> {
     pub fn new(arch: crate::arch::Architecture) -> Self {
@@ -19,6 +28,7 @@ impl<R: Reader<Offset = usize>> TypeContext<R> {
             cache: HashMap::new(),
             compound_types: Vec::new(),
             arch,
+            depth: 0,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -36,12 +46,17 @@ impl<R: Reader<Offset = usize>> TypeContext<R> {
         if let Some(cached) = self.cache.get(&key) {
             return cached.clone();
         }
+        if self.depth >= MAX_TYPE_DEPTH {
+            return TypeRef::Primitive(PrimitiveType::Void);
+        }
 
         // Insert a placeholder to handle recursive types
         self.cache
             .insert(key, TypeRef::Named("<resolving>".to_string()));
 
+        self.depth += 1;
         let resolved = self.resolve_type_inner(dwarf, unit, type_offset);
+        self.depth -= 1;
         self.cache.insert(key, resolved.clone());
         resolved
     }

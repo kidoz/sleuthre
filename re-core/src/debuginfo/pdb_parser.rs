@@ -210,12 +210,20 @@ fn section_offset_to_va(
 
 struct PdbTypeResolver {
     cache: HashMap<u32, TypeRef>,
+    /// Current nesting depth of in-flight `resolve` calls — see the cap
+    /// check in [`PdbTypeResolver::resolve`].
+    depth: u32,
 }
+
+/// Deepest legitimate type nesting we expect from a PDB; beyond this the
+/// chain is treated as hostile and resolves to `void`.
+const MAX_PDB_TYPE_DEPTH: u32 = 64;
 
 impl PdbTypeResolver {
     fn new() -> Self {
         Self {
             cache: HashMap::new(),
+            depth: 0,
         }
     }
 
@@ -238,11 +246,20 @@ impl PdbTypeResolver {
             return prim;
         }
 
+        // The placeholder protects against cycles, but a crafted acyclic
+        // chain of pointer/modifier records could still overflow the stack —
+        // PDB content is untrusted input, so depth is capped as well.
+        if self.depth >= MAX_PDB_TYPE_DEPTH {
+            return TypeRef::Primitive(PrimitiveType::Void);
+        }
+
         // Placeholder for recursion
         self.cache
             .insert(idx, TypeRef::Named("<resolving>".to_string()));
 
+        self.depth += 1;
         let resolved = self.resolve_inner(type_finder, type_index, arch);
+        self.depth -= 1;
         self.cache.insert(idx, resolved.clone());
         resolved
     }
@@ -284,7 +301,13 @@ impl PdbTypeResolver {
             TypeData::Array(arr) => {
                 let element = self.resolve(type_finder, arr.element_type, arch);
                 let elem_size = type_size_hint(type_finder, arr.element_type, arch).max(1);
-                let total_size = arr.dimensions.iter().copied().sum::<u32>();
+                // Dimensions come from the PDB verbatim; saturate instead of
+                // overflowing on crafted values.
+                let total_size = arr
+                    .dimensions
+                    .iter()
+                    .copied()
+                    .fold(0u32, |acc, d| acc.saturating_add(d));
                 let count = (total_size as usize) / elem_size;
                 TypeRef::Array {
                     element: Box::new(element),

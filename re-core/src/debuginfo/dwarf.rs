@@ -258,7 +258,10 @@ fn read_sleb128(bytes: &[u8]) -> Option<i64> {
         shift += 7;
         if byte & 0x80 == 0 {
             if shift < 64 && (byte & 0x40) != 0 {
-                result |= -(1i64 << shift);
+                // Sign-extend. `(-1) << shift` (not `-(1 << shift)`) — the
+                // latter overflows at shift 63, which a crafted 9-byte
+                // SLEB128 in an exprloc reaches (panic in debug builds).
+                result |= (-1i64) << shift;
             }
             return Some(result);
         }

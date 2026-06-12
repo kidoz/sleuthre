@@ -33,6 +33,11 @@ impl Rng {
 fn exercise(data: &[u8]) {
     let _ = re_core::loader::load_binary_from_bytes(data);
 
+    // DWARF extraction runs on the raw bytes in the default analysis
+    // pipeline, so it is just as reachable from a hostile binary as the
+    // loader itself.
+    let _ = re_core::debuginfo::extract_debug_info(data, re_core::arch::Architecture::X86_64);
+
     let images = re_core::formats::image::default_image_registry();
     for ext in ["x.bmp", "x.tga", "x.pcx"] {
         let _ = images.decode(data, ext);
