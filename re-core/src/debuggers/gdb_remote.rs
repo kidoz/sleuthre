@@ -36,6 +36,9 @@ const MAX_PACKET_BODY: usize = 16 * 1024 * 1024;
 /// Upper bound on `qfThreadInfo`/`qsThreadInfo` rounds, so a stub that never
 /// replies `l` can't loop forever.
 const MAX_THREAD_ROUNDS: usize = 4096;
+/// Socket timeout for request/response exchanges. Resume waits (`c`/`s`)
+/// deliberately bypass it — see [`GdbRemoteDebugger::resume_and_wait`].
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Register layouts per supported target. Order matches the `g`/`G` packet
 /// layout documented for each architecture.
@@ -170,7 +173,7 @@ impl GdbRemoteDebugger {
         let stream =
             TcpStream::connect(addr).map_err(|e| Error::Debugger(format!("gdb connect: {}", e)))?;
         stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(READ_TIMEOUT))
             .map_err(|e| Error::Debugger(format!("gdb set_read_timeout: {}", e)))?;
         stream
             .set_write_timeout(Some(Duration::from_secs(5)))
@@ -241,6 +244,41 @@ impl GdbRemoteDebugger {
             return Err(Error::Debugger("gdb NAK".into()));
         }
         read_packet(&mut stream)
+    }
+
+    /// Send a resume packet (`c`/`s`) and block until the stub's stop reply.
+    ///
+    /// Unlike [`send_recv`](Self::send_recv), the wait for the stop reply runs
+    /// with the socket read timeout disabled: the inferior may run arbitrarily
+    /// long before it next stops, and timing out mid-wait would both report a
+    /// spurious failure and leave the eventual stop reply unread in the
+    /// socket, desynchronizing every later exchange. The escape hatch is the
+    /// interrupt path — an unframed `\x03` via [`InterruptHandle`] forces a
+    /// stop reply onto this same connection. The normal timeout is restored
+    /// before returning.
+    fn resume_and_wait(&self, body: &str) -> Result<String> {
+        let packet = format_packet(body);
+        let mut stream = self
+            .stream
+            .lock()
+            .map_err(|_| Error::Debugger("gdb mutex poisoned".into()))?;
+        stream
+            .write_all(packet.as_bytes())
+            .map_err(|e| Error::Debugger(format!("gdb write: {}", e)))?;
+        let mut ack = [0u8; 1];
+        stream
+            .read_exact(&mut ack)
+            .map_err(|e| Error::Debugger(format!("gdb ack: {}", e)))?;
+        if ack[0] == b'-' {
+            return Err(Error::Debugger("gdb NAK".into()));
+        }
+        stream
+            .set_read_timeout(None)
+            .map_err(|e| Error::Debugger(format!("gdb set_read_timeout: {}", e)))?;
+        let result = read_packet(&mut stream);
+        // Best-effort restore; a failure surfaces on the next plain exchange.
+        let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
+        result
     }
 }
 
@@ -602,7 +640,7 @@ impl Debugger for GdbRemoteDebugger {
     }
 
     fn step(&mut self) -> Result<StopReason> {
-        let reply = self.send_recv("s")?;
+        let reply = self.resume_and_wait("s")?;
         let reason = parse_stop_reply(&reply);
         self.state = match reason {
             StopReason::Exited(_) | StopReason::Terminated(_) => DebuggerState::Detached,
@@ -615,7 +653,7 @@ impl Debugger for GdbRemoteDebugger {
         // `c` blocks the stub until it next stops. We wait for the stop reply
         // synchronously so the caller knows whether a breakpoint hit, the
         // inferior exited, or a signal arrived.
-        let reply = self.send_recv("c")?;
+        let reply = self.resume_and_wait("c")?;
         let reason = parse_stop_reply(&reply);
         self.state = match reason {
             StopReason::Exited(_) | StopReason::Terminated(_) => DebuggerState::Detached,
