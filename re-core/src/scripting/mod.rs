@@ -479,10 +479,7 @@ mod tests {
     fn eval_string_blowup_is_terminated() {
         let mut engine = ScriptEngine::new();
         let mut project = Project::new("test".into(), PathBuf::from("/tmp/test"));
-        let result = engine.eval(
-            "let s = \"x\"; loop { s += s; }",
-            &mut project,
-        );
+        let result = engine.eval("let s = \"x\"; loop { s += s; }", &mut project);
         assert!(result.is_err(), "string growth must be cut off");
     }
 

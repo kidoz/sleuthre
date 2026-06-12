@@ -67,6 +67,52 @@ fn resource_result(id: &Value, uri: &str, data: &impl serde::Serialize) -> Value
     }
 }
 
+/// Confine an MCP-initiated project save to the workspace of the opened
+/// binary: the resolved target must live in (or under) the binary's directory
+/// and carry the `.slre` extension, so a misbehaving client cannot overwrite
+/// arbitrary files the server process can write (per the project threat
+/// model, MCP tools never write outside the workspace).
+fn confine_save_path(
+    target: &std::path::Path,
+    binary_path: &std::path::Path,
+) -> Result<PathBuf, String> {
+    if target.extension().and_then(|e| e.to_str()) != Some("slre") {
+        return Err("save path must use the .slre extension".into());
+    }
+    let workspace = binary_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| "project has no workspace directory".to_string())?
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve workspace: {}", e))?;
+    let file_name = target
+        .file_name()
+        .ok_or_else(|| "save path has no file name".to_string())?;
+    // Relative paths resolve against the workspace. Canonicalizing the
+    // parent (symlinks and `..` resolved) before the containment check
+    // closes both escape routes.
+    let parent_candidate = match target.parent().filter(|p| !p.as_os_str().is_empty()) {
+        Some(p) if p.is_absolute() => p.to_path_buf(),
+        Some(p) => workspace.join(p),
+        None => workspace.clone(),
+    };
+    let parent = parent_candidate
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve save directory: {}", e))?;
+    if !parent.starts_with(&workspace) {
+        return Err(format!(
+            "save path must stay inside the project workspace {}",
+            workspace.display()
+        ));
+    }
+    let resolved = parent.join(file_name);
+    // Refuse to write through a pre-existing symlink at the final component.
+    if resolved.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+        return Err("save path is a symlink".into());
+    }
+    Ok(resolved)
+}
+
 /// Format an LLIL function as a human-readable listing — one instruction per
 /// line with its source address. Debug-format is used because LLIL does not
 /// yet have a dedicated textual printer.
@@ -728,8 +774,20 @@ impl McpServer {
                     return missing_param_error(&id, "path");
                 };
                 if let Some(project) = &mut self.project {
-                    match project.save(std::path::Path::new(path)) {
-                        Ok(()) => tool_text_result(&id, &format!("Project saved to {}", path)),
+                    let resolved = match confine_save_path(
+                        std::path::Path::new(path),
+                        &project.path,
+                    ) {
+                        Ok(p) => p,
+                        Err(msg) => {
+                            return json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32602, "message": msg } });
+                        }
+                    };
+                    match project.save(&resolved) {
+                        Ok(()) => tool_text_result(
+                            &id,
+                            &format!("Project saved to {}", resolved.display()),
+                        ),
                         Err(e) => {
                             json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32003, "message": e.to_string() } })
                         }
@@ -1480,6 +1538,24 @@ mod tests {
         assert_eq!(resp["jsonrpc"], "2.0");
         assert_eq!(resp["id"], 42);
         assert_eq!(resp["result"]["content"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn confine_save_path_enforces_workspace_and_extension() {
+        let workspace = std::env::temp_dir().join(format!("slre-mcp-test-{}", std::process::id()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let binary = workspace.join("sample.exe");
+
+        // A bare file name lands inside the workspace.
+        let ok = confine_save_path(std::path::Path::new("out.slre"), &binary).unwrap();
+        assert_eq!(ok.parent().unwrap(), workspace.canonicalize().unwrap());
+
+        // Wrong extension, absolute escape, and `..` traversal are rejected.
+        assert!(confine_save_path(std::path::Path::new("out.txt"), &binary).is_err());
+        assert!(confine_save_path(std::path::Path::new("/etc/pwned.slre"), &binary).is_err());
+        assert!(confine_save_path(std::path::Path::new("../escape.slre"), &binary).is_err());
+
+        std::fs::remove_dir_all(&workspace).ok();
     }
 
     #[test]
