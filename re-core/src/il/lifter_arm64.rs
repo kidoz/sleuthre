@@ -8,7 +8,17 @@ pub fn lift_function(name: &str, entry: u64, instructions: &[Instruction]) -> Ll
     let mut func = LlilFunction::new(name.to_string(), entry);
 
     for insn in instructions {
-        let stmts = lift_instruction(&mut func, insn);
+        let mut stmts = lift_instruction(&mut func, insn);
+        if stmts.is_empty() {
+            // A helper bailed on malformed/unexpected operands: record the
+            // original text as an explicit barrier instead of silently
+            // dropping the instruction (a zero-statement lift corrupts the
+            // dataflow passes downstream exactly like a Nop would).
+            stmts.push(LlilStmt::Unimplemented {
+                mnemonic: insn.mnemonic.clone(),
+                op_str: insn.op_str.clone(),
+            });
+        }
         func.add_inst(LlilInst {
             address: insn.address,
             stmts,
@@ -875,9 +885,49 @@ fn lift_alu3(func: &mut LlilFunction, op: BinOp, ops: &[&str]) -> Vec<LlilStmt> 
             dest: ops[0].trim().to_string(),
             src: result,
         }]
+    } else if ops.len() == 4 {
+        // Shifted-register form: `add x0, x1, x2, lsl #2` — the canonical
+        // array-indexing idiom. Extend modifiers (uxtw/sxtw/…) need width
+        // semantics MLIL doesn't model, so they stay Unimplemented.
+        let left = parse_operand(func, ops[1]);
+        let inner = parse_operand(func, ops[2]);
+        if let Some(shifted) = apply_shift_modifier(func, inner, ops[3]) {
+            let result = func.binop(op, left, shifted);
+            vec![LlilStmt::SetReg {
+                dest: ops[0].trim().to_string(),
+                src: result,
+            }]
+        } else {
+            vec![LlilStmt::Unimplemented {
+                mnemonic: format!("alu-{:?}", op).to_lowercase(),
+                op_str: ops.join(", "),
+            }]
+        }
     } else {
-        vec![LlilStmt::Nop]
+        // Never a silent Nop: unknown arity means unknown effects.
+        vec![LlilStmt::Unimplemented {
+            mnemonic: format!("alu-{:?}", op).to_lowercase(),
+            op_str: ops.join(", "),
+        }]
     }
+}
+
+/// Apply an ARM64 shift modifier (`lsl #2`, `lsr #1`, `asr #3`) to `value`.
+/// Returns `None` for extend modifiers and anything else unrecognized.
+fn apply_shift_modifier(func: &mut LlilFunction, value: ExprId, modifier: &str) -> Option<ExprId> {
+    let mut parts = modifier.split_whitespace();
+    let op = match parts.next()? {
+        "lsl" => BinOp::Shl,
+        "lsr" => BinOp::Shr,
+        "asr" => BinOp::Sar,
+        _ => return None,
+    };
+    let amount = parts.next()?;
+    if !amount.starts_with('#') {
+        return None;
+    }
+    let amt = parse_operand(func, amount);
+    Some(func.binop(op, value, amt))
 }
 
 fn lift_unary(func: &mut LlilFunction, op: UnaryOp, ops: &[&str]) -> Vec<LlilStmt> {
@@ -1125,6 +1175,60 @@ fn lift_adr(func: &mut LlilFunction, ops: &[&str]) -> Vec<LlilStmt> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shifted_register_alu_lifts_as_shift_expression() {
+        // `add x0, x1, x2, lsl #2` — the canonical array-indexing idiom —
+        // must lift as x0 = x1 + (x2 << 2), not vanish as a Nop.
+        let mut func = LlilFunction::new("t".into(), 0);
+        let insn = Instruction {
+            address: 0,
+            mnemonic: "add".into(),
+            op_str: "x0, x1, x2, lsl #2".into(),
+            bytes: vec![],
+            groups: vec![],
+        };
+        let stmts = lift_instruction(&mut func, &insn);
+        match &stmts[0] {
+            LlilStmt::SetReg { dest, src } => {
+                assert_eq!(dest, "x0");
+                match &func.exprs[*src] {
+                    LlilExpr::BinOp {
+                        op: BinOp::Add,
+                        right,
+                        ..
+                    } => {
+                        assert!(
+                            matches!(&func.exprs[*right], LlilExpr::BinOp { op: BinOp::Shl, .. }),
+                            "rhs must be the shifted register"
+                        );
+                    }
+                    other => panic!("expected Add, got {:?}", other),
+                }
+            }
+            other => panic!("expected SetReg, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn extend_modifier_alu_stays_unimplemented() {
+        // `add x0, x1, w2, sxtw` needs width semantics — must be an explicit
+        // barrier, not a silent Nop.
+        let mut func = LlilFunction::new("t".into(), 0);
+        let insn = Instruction {
+            address: 0,
+            mnemonic: "add".into(),
+            op_str: "x0, x1, w2, sxtw".into(),
+            bytes: vec![],
+            groups: vec![],
+        };
+        let stmts = lift_instruction(&mut func, &insn);
+        assert!(
+            matches!(&stmts[0], LlilStmt::Unimplemented { .. }),
+            "got {:?}",
+            stmts
+        );
+    }
 
     fn make_insn(addr: u64, mn: &str, op: &str) -> Instruction {
         Instruction {

@@ -7,7 +7,17 @@ pub fn lift_function(name: &str, entry: u64, instructions: &[Instruction]) -> Ll
     let mut func = LlilFunction::new(name.to_string(), entry);
 
     for insn in instructions {
-        let stmts = lift_instruction(&mut func, insn);
+        let mut stmts = lift_instruction(&mut func, insn);
+        if stmts.is_empty() {
+            // A helper bailed on malformed/unexpected operands: record the
+            // original text as an explicit barrier instead of silently
+            // dropping the instruction (a zero-statement lift corrupts the
+            // dataflow passes downstream exactly like a Nop would).
+            stmts.push(LlilStmt::Unimplemented {
+                mnemonic: insn.mnemonic.clone(),
+                op_str: insn.op_str.clone(),
+            });
+        }
         func.add_inst(LlilInst {
             address: insn.address,
             stmts,
