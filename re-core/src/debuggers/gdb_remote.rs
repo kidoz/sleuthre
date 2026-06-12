@@ -918,6 +918,92 @@ impl GdbRemoteDebugger {
 mod tests {
     use super::*;
 
+    /// Minimal scripted RSP stub on a loopback socket. Accepts one
+    /// connection, acks each inbound packet, records its body, and answers
+    /// from `replies` in order (`(body, delay_ms)`); once the queue is
+    /// exhausted it replies empty ("not supported"). Lets tests assert the
+    /// exact bytes the debugger puts on the wire.
+    fn spawn_fake_stub(
+        replies: Vec<(&'static str, u64)>,
+    ) -> (std::net::SocketAddr, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((mut s, _)) = listener.accept() else {
+                return;
+            };
+            let mut replies = replies.into_iter();
+            let mut byte = [0u8; 1];
+            loop {
+                // Skip to packet start; tolerates the client's `+` acks.
+                loop {
+                    if s.read_exact(&mut byte).is_err() {
+                        return;
+                    }
+                    if byte[0] == b'$' {
+                        break;
+                    }
+                }
+                let mut body = Vec::new();
+                loop {
+                    if s.read_exact(&mut byte).is_err() {
+                        return;
+                    }
+                    if byte[0] == b'#' {
+                        break;
+                    }
+                    body.push(byte[0]);
+                }
+                let mut cksum = [0u8; 2];
+                if s.read_exact(&mut cksum).is_err() {
+                    return;
+                }
+                let _ = tx.send(String::from_utf8_lossy(&body).into_owned());
+                let (reply, delay_ms) = replies.next().unwrap_or(("", 0));
+                if delay_ms > 0 {
+                    std::thread::sleep(Duration::from_millis(delay_ms));
+                }
+                // Ack the inbound packet first, then send the framed reply.
+                if s.write_all(b"+").is_err()
+                    || s.write_all(format_packet(reply).as_bytes()).is_err()
+                {
+                    return;
+                }
+            }
+        });
+        (addr, rx)
+    }
+
+    #[test]
+    fn live_stub_round_trip_breakpoint_and_continue() {
+        let (addr, seen) = spawn_fake_stub(vec![
+            ("PacketSize=4000", 0), // qSupported
+            ("1", 0),               // qAttached
+            ("OK", 0),              // Z0
+            ("T05swbreak:;", 100),  // c — stop reply arrives after a delay
+            ("OK", 0),              // z0
+        ]);
+        let mut dbg = GdbRemoteDebugger::connect(addr, crate::arch::Architecture::Arm64)
+            .expect("handshake against fake stub");
+        dbg.set_breakpoint(0x4000, BreakpointKind::Software)
+            .unwrap();
+        let reason = dbg.continue_exec().unwrap();
+        assert!(matches!(reason, StopReason::SoftwareBreakpoint(_)));
+        dbg.remove_breakpoint(0x4000, BreakpointKind::Software)
+            .unwrap();
+        let packets: Vec<String> = seen.try_iter().collect();
+        assert_eq!(
+            packets[0],
+            "qSupported:multiprocess+;swbreak+;hwbreak+;vContSupported+"
+        );
+        // AArch64 execute breakpoints carry kind 4 (the BRK instruction
+        // width); kind 1 makes gdbserver reject the packet.
+        assert!(packets.iter().any(|p| p == "Z0,4000,4"), "{:?}", packets);
+        assert!(packets.iter().any(|p| p == "z0,4000,4"), "{:?}", packets);
+        assert!(packets.iter().any(|p| p == "c"), "{:?}", packets);
+    }
+
     #[test]
     fn format_packet_sums_body() {
         // 'OK' = 0x4F + 0x4B = 0x9A.
