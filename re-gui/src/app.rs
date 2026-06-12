@@ -723,6 +723,15 @@ impl Default for SleuthreApp {
     }
 }
 
+/// Best-effort extraction of a panic payload's message for user display.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".into())
+}
+
 impl SleuthreApp {
     pub(crate) fn add_toast(&mut self, kind: ToastKind, message: String) {
         let now = std::time::SystemTime::now()
@@ -751,18 +760,25 @@ impl SleuthreApp {
         let worker_cancellation = cancellation.clone();
 
         std::thread::spawn(move || {
-            let result = re_core::analysis::pipeline::analyze_binary_with_config(
-                &path,
-                &config,
-                Some(&worker_cancellation),
-                |stage| {
-                    let _ = tx.send(LoadProgress::Stage(stage.to_string()));
-                    ctx_clone.request_repaint();
-                },
-            );
-            let _ = tx.send(LoadProgress::Done(
-                result.map(Box::new).map_err(|e| e.to_string()),
-            ));
+            // Hostile binaries can still find panics in analysis; a panic
+            // must not unwind past this thread without a Done message, or
+            // the UI stays wedged in the loading state.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                re_core::analysis::pipeline::analyze_binary_with_config(
+                    &path,
+                    &config,
+                    Some(&worker_cancellation),
+                    |stage| {
+                        let _ = tx.send(LoadProgress::Stage(stage.to_string()));
+                        ctx_clone.request_repaint();
+                    },
+                )
+            }));
+            let payload = match result {
+                Ok(r) => r.map(Box::new).map_err(|e| e.to_string()),
+                Err(p) => Err(format!("analysis panicked: {}", panic_message(&p))),
+            };
+            let _ = tx.send(LoadProgress::Done(payload));
             ctx_clone.request_repaint();
         });
 
@@ -777,7 +793,20 @@ impl SleuthreApp {
             return;
         };
 
-        while let Ok(msg) = rx.try_recv() {
+        loop {
+            let msg = match rx.try_recv() {
+                Ok(msg) => msg,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // Worker died without a Done message — clear the loading
+                    // state instead of showing the spinner forever.
+                    self.add_toast(ToastKind::Error, "Load worker died unexpectedly.".into());
+                    self.load_receiver = None;
+                    self.load_stage = None;
+                    self.load_cancel = None;
+                    return;
+                }
+            };
             match msg {
                 LoadProgress::Stage(s) => {
                     self.load_stage = Some(s);
@@ -859,16 +888,26 @@ impl SleuthreApp {
         let worker_cancellation = cancellation.clone();
 
         std::thread::spawn(move || {
-            let findings = re_core::analysis::pipeline::reanalyze_with_cancellation(
-                &mut project,
-                &config,
-                Some(&worker_cancellation),
-                |stage| {
-                    let _ = tx.send(ReanalysisProgress::Stage(stage.to_string()));
-                    ctx_clone.request_repaint();
-                },
-            )
-            .map_err(|e| e.to_string());
+            // The user's project (with all annotations) moved into this
+            // thread — a panic in analysis must not destroy it. catch_unwind
+            // borrows `project` mutably, so even on panic we still own it
+            // afterwards and can ship it back (possibly part-analyzed, but
+            // alive) instead of dropping it and wedging the loading state.
+            let analysis = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                re_core::analysis::pipeline::reanalyze_with_cancellation(
+                    &mut project,
+                    &config,
+                    Some(&worker_cancellation),
+                    |stage| {
+                        let _ = tx.send(ReanalysisProgress::Stage(stage.to_string()));
+                        ctx_clone.request_repaint();
+                    },
+                )
+            }));
+            let findings = match analysis {
+                Ok(r) => r.map_err(|e| e.to_string()),
+                Err(p) => Err(format!("re-analysis panicked: {}", panic_message(&p))),
+            };
 
             let _ = tx.send(ReanalysisProgress::Done {
                 project: Box::new(project),
@@ -888,7 +927,23 @@ impl SleuthreApp {
             return;
         };
 
-        while let Ok(msg) = rx.try_recv() {
+        loop {
+            let msg = match rx.try_recv() {
+                Ok(msg) => msg,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // Should be unreachable now that the worker catches
+                    // panics, but never leave the UI wedged if it happens.
+                    self.add_toast(
+                        ToastKind::Error,
+                        "Re-analysis worker died unexpectedly.".into(),
+                    );
+                    self.reanalysis_receiver = None;
+                    self.load_stage = None;
+                    self.load_cancel = None;
+                    return;
+                }
+            };
             match msg {
                 ReanalysisProgress::Stage(s) => {
                     self.load_stage = Some(s);
