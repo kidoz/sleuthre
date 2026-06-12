@@ -422,6 +422,21 @@ fn parse_addr_attr(s: &str) -> Option<u64> {
     }
 }
 
+/// Split a `qXfer` read reply into its more-to-come marker (`m` = more, `l` =
+/// last) and the payload chunk. Returns `None` for an empty reply or an
+/// unexpected marker. Uses `strip_prefix`, not a byte-index `split_at` — the
+/// decoded reply is untrusted and may begin with a multi-byte char, where a
+/// byte split would panic on the char boundary.
+fn qxfer_chunk(reply: &str) -> Option<(bool, &str)> {
+    if let Some(chunk) = reply.strip_prefix('m') {
+        Some((true, chunk))
+    } else if let Some(chunk) = reply.strip_prefix('l') {
+        Some((false, chunk))
+    } else {
+        None
+    }
+}
+
 /// Parse a `qXfer:libraries-svr4` document into `(name, load_address)` pairs.
 ///
 /// Handles the svr4 form (`<library name=... l_addr="0x..."/>`) and the older
@@ -752,14 +767,15 @@ impl Debugger for GdbRemoteDebugger {
                 Ok(r) => r,
                 Err(_) => break,
             };
-            if reply.is_empty() || reply.starts_with('E') {
+            if reply.starts_with('E') {
                 break;
             }
-            let (marker, chunk) = reply.split_at(1);
+            let Some((more, chunk)) = qxfer_chunk(&reply) else {
+                break; // empty or unexpected marker
+            };
             xml.push_str(chunk);
             offset += chunk.len();
-            // `l` = last chunk; `m` = more to come; anything else is unexpected.
-            if marker != "m" {
+            if !more {
                 break;
             }
         }
@@ -1013,6 +1029,18 @@ mod tests {
     #[test]
     fn parse_libraries_svr4_xml_empty_when_unsupported() {
         assert!(parse_libraries_svr4_xml("").is_empty());
+    }
+
+    #[test]
+    fn qxfer_chunk_is_panic_free_on_non_ascii_marker() {
+        // A hostile stub can lead the reply with a byte >= 0x80, which
+        // decode_rsp_body turns into a multi-byte char; a byte-index
+        // split_at(1) would panic on the char boundary here.
+        let decoded = decode_rsp_body(&[0x80, b'x']);
+        assert_eq!(qxfer_chunk(&decoded), None);
+        assert_eq!(qxfer_chunk("m<library/>"), Some((true, "<library/>")));
+        assert_eq!(qxfer_chunk("l"), Some((false, "")));
+        assert_eq!(qxfer_chunk(""), None);
     }
 
     #[test]
