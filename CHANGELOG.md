@@ -2,103 +2,42 @@
 
 ## [Unreleased]
 
-### Fixed
-
-- **ARM64 lifting depth (deep-review follow-ups, part 3).** Pre/post-index
-  addressing (`stp x29, x30, [sp, #-16]!`, `ldp x29, x30, [sp], #16`) now
-  writes the base register back, so ARM64 prologue/epilogue stack tracking is
-  correct; the rewritten memory-operand parser also removes a latent slice
-  panic on malformed operand text. Flag-setting ALU forms (`adds`/`subs`/
-  `ands`) define the shared flags register, so `subs x2, x0, #1; b.ne` folds
-  into a relational expression like `cmp` does — and the fold now invalidates
-  itself when a pending flag source's operand is redefined (or a call
-  intervenes), so `subs x0, x0, #1; b.ne` falls back to the opaque flag
-  variable instead of folding a stale value. `movz` applies its `lsl` shift
-  (previously wrong by up to 2^48), and PC-relative literal `ldr` loads the
-  value at the printed address instead of the address itself. Zero/sign
-  extension is now modeled end-to-end: x86 `movzx`/`movsx`/`movsxd` and ARM64
-  `ldrsw` lower to a new MLIL `Cast` expression that survives all dataflow
-  passes, folds on constants, and renders as a C cast (`(int8_t)x`).
-
-- **Multi-arch analysis correctness (deep-review follow-ups, part 2).**
-  ARM32 conditional branches now lift as real conditional branches with their
-  condition mapped to the shared flag vocabulary (they were flattened to
-  unconditional jumps), direct branch targets parse capstone's `#0x…` form
-  (they previously collapsed to 0), cmp/cmn/tst define the `__flags` register
-  MLIL folds on, and `push`/`pop` track the stack pointer with one slot per
-  register (`pop {…, pc}` is a return). CFG construction classifies
-  ARM/ARM64/RISC-V branch/call/return mnemonics correctly instead of treating
-  everything non-x86 as conditional, and indirect unconditional branches no
-  longer get a fabricated fall-through edge. MLIL canonicalizes sub-registers
-  to their widest alias (`eax`→`rax`, `cl`→`rcx`, `w3`→`x3`) so dead-store
-  elimination sees through mixed-width def/use chains and SysV argument
-  recovery matches the dominant `mov edi, imm` staging form. ARM64
-  shifted-register ALU forms (`add x0, x1, x2, lsl #2`) lift as shift
-  expressions instead of disappearing, and all remaining silent instruction
-  skips (zero-statement lifts, 1-operand `imul`, unknown ALU arities) become
-  explicit `Unimplemented` barriers. Re-analysis no longer overwrites the
-  lowest-address function with a fresh `entry_point` stub (user renames and
-  detected conventions survive), the x86 stdcall heuristic only considers the
-  function's own first `ret` (a neighbor's `ret imm` inside the flat decode
-  window no longer reclassifies it), the thiscall/fastcall heuristic ignores
-  `push ecx` stack-slot reservations and register zeroing/initialization, and
-  the xref scan continues past early returns in multi-exit functions.
-
-- **Untrusted-input and soundness hardening (deep-review follow-ups).**
-  Crafted ELF (`p_filesz > p_memsz`) and Mach-O (`filesize > vmsize`) segment
-  headers could panic the loader on open; the copies are now clamped to the
-  allocation, with adversarial fixtures pinning both. A panic in a background
-  analysis worker no longer destroys the open project or wedges the loading
-  state (workers catch unwinds and the polls handle a dead worker). The MLIL
-  optimization passes are now sound: uses with no known reaching definition
-  carry a sentinel version, so dead-store elimination keeps branch-side
-  assignments feeding a join and value propagation can no longer rewrite a
-  use with a definition that follows it; unlifted instructions survive as an
-  `Unimplemented` dataflow barrier (rendered as a pseudocode comment) instead
-  of being erased to `Nop`, and the DSE return-register allowlist covers
-  ARM32/MIPS/RISC-V/ARM64-w. Rhai script execution is bounded (operation and
-  data-size caps) so a runaway console script or plugin can't hang or OOM the
-  app. DWARF/PDB type resolution is depth-capped against crafted deep type
-  chains (stack-overflow abort), a 9-byte SLEB128 no longer overflows in
-  debug builds, and the fuzz-smoke harness now exercises debug-info
-  extraction. MCP `save_project` writes are confined to the opened binary's
-  workspace and the `.slre` extension.
-
-- **GDB Remote debugger hardening (review follow-ups to 0.6).** A hostile or
-  buggy stub could crash the GUI with a char-boundary panic via a non-ASCII
-  marker byte in the `qXfer` module-list reply. Resume waits (`c`/`s`) no
-  longer inherit the 5-second socket read timeout, so a continue that runs
-  longer than that no longer fails spuriously and desynchronizes the protocol
-  (the Stop button's unframed `0x03` remains the escape hatch, and the UI now
-  polls for the stop reply instead of waiting for an input event). `Z`/`z`
-  breakpoint packets send architecture-correct kinds (4 for ARM/AArch64/
-  MIPS/RISC-V instead of a hardcoded x86 `1`, which gdbserver rejects).
-  Watchpoints can now be removed from the breakpoint list (removal previously
-  only tried the execute kinds, leaving `Z2..Z4` armed in the stub). Thread
-  enumeration and the backtrace are cached per stop instead of issuing RSP
-  round-trips on every rendered frame. A scripted RSP-stub test now covers the
-  handshake, breakpoint wire format, and resume replies over a real socket.
-
 ### Changed
 
-- **Decompiler quality on 32-bit x86.** Conditional branches are folded back into
-  relational expressions (`cmp a,b; jl` → `a < b`; `test eax,eax; je` → `eax == 0`)
-  instead of leaking opaque `flag_*` pseudo-variables. Registers, parameters, and
-  return values are typed by the target word size (`int32_t` on 32-bit) rather
-  than always `int64_t`, and a bare integer literal no longer forces `uint64_t`.
-  A LIFO stack simulation reconstructs stack operations: callee-saved
-  save/restore boilerplate is elided (removing the `*(sp - 8) = ...` prologue
-  noise and its uninitialized reads), `push x; pop reg` materialization folds to
-  `reg = x`, and stack-passed (cdecl/stdcall) call arguments are recovered so
-  calls render as `f(a, b, c)` instead of orphaned `push` statements. Uses are
-  versioned to their reaching definition (a redefined register reads its current
-  value, not the stale incoming one); constant/copy propagation with constant
-  folding and version-aware dead-store elimination collapse register churn; and
-  unreachable code after a `return`/`goto` is pruned. Register-passed call
-  arguments are recovered for x86-64 (SysV) and ARM64 (AAPCS), so calls render
-  as `f(a, b)` from the argument registers; x86 `thiscall`/`fastcall` callees get
-  their implicit `ecx` (`this`) / `ecx`,`edx` arguments recovered from the
-  detected calling convention.
+- Decompiler folds conditional branches back into relational expressions (`cmp a,b; jl` → `a < b`; `test eax,eax; je` → `eax == 0`) instead of leaking opaque `flag_*` pseudo-variables
+- Registers, parameters, and return values are typed by the target word size (`int32_t` on 32-bit x86) instead of always `int64_t`; a bare integer literal no longer forces `uint64_t`
+- LIFO stack simulation reconstructs stack operations: callee-saved save/restore boilerplate elided, `push x; pop reg` folds to `reg = x`, and stack-passed (cdecl/stdcall) call arguments render as `f(a, b, c)` instead of orphaned `push` statements
+- Uses are versioned to their reaching definition; constant/copy propagation with folding and version-aware dead-store elimination collapse register churn; unreachable code after `return`/`goto` is pruned
+- Register-passed call arguments recovered for x86-64 (SysV) and ARM64 (AAPCS); x86 `thiscall`/`fastcall` callees get their implicit `ecx` (`this`) / `ecx`,`edx` arguments from the detected calling convention
+- MLIL canonicalizes sub-registers to their widest alias (`eax`→`rax`, `cl`→`rcx`, `w3`→`x3`) so dead-store elimination sees through mixed-width def/use chains and argument recovery matches the dominant `mov edi, imm` staging form
+- Zero/sign extension modeled end-to-end: x86 `movzx`/`movsx`/`movsxd` and ARM64 `ldrsw` lower to a new MLIL `Cast` expression that survives the dataflow passes, folds on constants, and renders as a C cast (`(int8_t)x`)
+- Debugger thread enumeration and backtrace are cached per stop instead of issuing RSP round-trips on every rendered frame
+
+### Fixed
+
+- MLIL dataflow soundness: uses with no known reaching definition carry a sentinel version, so dead-store elimination keeps branch-side assignments feeding a join and value propagation can no longer rewrite a use with a definition that follows it
+- Unlifted instructions survive as an `Unimplemented` dataflow barrier (rendered as a pseudocode comment) instead of being erased to `Nop`; remaining silent skips (zero-statement lifts, 1-operand `imul`, unknown ALU arities) are surfaced the same way
+- Dead-store elimination's return-register allowlist covers ARM32 (`r0`), MIPS (`v0`/`v1`), RISC-V (`a0`/`a1`), and ARM64 `w0`
+- ARM32: conditional branches keep their condition (previously flattened to unconditional jumps), direct branch targets parse capstone's `#0x…` form (previously collapsed to 0), cmp/cmn/tst define the `__flags` register MLIL folds on, and `push`/`pop` track the stack pointer with one slot per register (`pop {…, pc}` is a return)
+- ARM64: pre/post-index addressing (`stp x29, x30, [sp, #-16]!`, `ldp x29, x30, [sp], #16`) writes the base register back, fixing stack tracking through prologues/epilogues
+- ARM64: shifted-register ALU forms (`add x0, x1, x2, lsl #2`) lift as shift expressions instead of disappearing, `movz` applies its `lsl` shift (previously wrong by up to 2^48), and PC-relative literal `ldr` loads the value at the printed address instead of the address itself
+- ARM64 flag-setting ALU forms (`adds`/`subs`/`ands`) define flags so `subs x2, x0, #1; b.ne` folds like `cmp`; the fold invalidates itself when a pending flag operand is redefined or a call intervenes, instead of folding a stale value
+- CFG construction classifies ARM/ARM64/RISC-V branch/call/return mnemonics correctly instead of treating everything non-x86 as conditional; indirect unconditional branches no longer get a fabricated fall-through edge
+- Re-analysis no longer overwrites the lowest-address function with a fresh `entry_point` stub — user renames and detected conventions survive
+- x86 stdcall heuristic considers only the function's own first `ret`, so a neighbor's `ret imm` inside the flat decode window no longer reclassifies it; the thiscall/fastcall heuristic ignores `push ecx` stack-slot reservations and register zeroing/initialization
+- Xref scan continues past early returns in multi-exit functions
+- GDB resume waits (`c`/`s`) no longer inherit the 5-second socket read timeout, so a long-running continue no longer fails spuriously and desynchronizes the protocol; the UI polls for the stop reply instead of waiting for an input event
+- `Z`/`z` breakpoint packets send architecture-correct kinds (4 for ARM/AArch64/MIPS/RISC-V instead of a hardcoded x86 `1`, which gdbserver rejects)
+- Watchpoints can be removed from the debugger breakpoint list (removal previously tried only the execute kinds, leaving `Z2..Z4` armed in the stub)
+
+### Security
+
+- Crafted ELF (`p_filesz > p_memsz`) and Mach-O (`filesize > vmsize`) segment headers could panic the loader on open; copies are clamped to the allocation, with adversarial fixtures pinning both
+- A panic in a background analysis worker no longer destroys the open project or wedges the loading state (workers catch unwinds; the polls handle a dead worker)
+- Fixed a char-boundary panic on a hostile GDB stub's non-ASCII `qXfer` marker byte; a scripted RSP-stub test covers the handshake, breakpoint wire format, and resume replies over a real socket
+- DWARF/PDB type resolution is depth-capped against crafted deep type chains (stack-overflow abort), and a 9-byte SLEB128 no longer overflows in debug builds; the fuzz-smoke harness now exercises debug-info extraction
+- Rhai script execution is bounded with operation and data-size caps so a runaway console script or plugin can't hang or OOM the app
+- MCP `save_project` writes are confined to the opened binary's workspace and the `.slre` extension
 
 ## [0.6.0] - 2026-05-31
 
