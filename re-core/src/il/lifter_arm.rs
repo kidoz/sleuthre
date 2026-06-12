@@ -43,7 +43,16 @@ fn lift_instruction(func: &mut LlilFunction, insn: &Instruction) -> Vec<LlilStmt
     if let Some(stmts) = lift_mnemonic(func, &raw, &ops) {
         return stmts;
     }
-    let (base, _cond) = strip_condition_suffix(&raw);
+    let (base, cond) = strip_condition_suffix(&raw);
+    // Conditional branch: `b<cond>` must keep its condition — flattening it
+    // to an unconditional jump corrupts every if/loop in the function. Other
+    // conditional forms (e.g. `addeq`) still drop the predicate (MVP).
+    if base == "b"
+        && let Some(c) = cond
+        && c != "al"
+    {
+        return lift_bcc(func, c, &ops);
+    }
     if base != raw
         && let Some(stmts) = lift_mnemonic(func, base, &ops)
     {
@@ -298,7 +307,7 @@ fn lift_cmp(func: &mut LlilFunction, ops: &[&str]) -> Vec<LlilStmt> {
         right: rhs,
     });
     vec![LlilStmt::SetReg {
-        dest: "flags".into(),
+        dest: "__flags".into(),
         src: sub,
     }]
 }
@@ -315,7 +324,7 @@ fn lift_cmn(func: &mut LlilFunction, ops: &[&str]) -> Vec<LlilStmt> {
         right: rhs,
     });
     vec![LlilStmt::SetReg {
-        dest: "flags".into(),
+        dest: "__flags".into(),
         src: add,
     }]
 }
@@ -332,7 +341,7 @@ fn lift_tst(func: &mut LlilFunction, ops: &[&str]) -> Vec<LlilStmt> {
         right: rhs,
     });
     vec![LlilStmt::SetReg {
-        dest: "flags".into(),
+        dest: "__flags".into(),
         src: and,
     }]
 }
@@ -406,19 +415,33 @@ fn parse_memory_addr(func: &mut LlilFunction, ops: &[&str]) -> ExprId {
 }
 
 fn lift_push(func: &mut LlilFunction, ops: &[&str]) -> Vec<LlilStmt> {
-    // Multi-register push: `push {r4, r5, lr}`. Lower each as a separate store
-    // relative to sp; the structuring pass will hide these as prologue noise.
+    // Multi-register push: `push {r4, r5, lr}` stores the registers to
+    // descending stack slots. Model each as `sp = sp - 4; *(sp) = reg` —
+    // distinct addresses (the old single-`[sp]` model aliased every slot)
+    // and an sp the stack-tracking passes can follow. The list's first
+    // register lands at the lowest address, so iterate in reverse.
     let mut stmts = Vec::new();
-    for op in ops {
+    for op in ops.iter().rev() {
         let name = op.trim().trim_matches(|c| c == '{' || c == '}');
         if name.is_empty() {
             continue;
         }
-        let reg_expr = reg(func, name);
         let sp = reg(func, "sp");
+        let four = imm(func, 4);
+        let dec = func.add_expr(LlilExpr::BinOp {
+            op: BinOp::Sub,
+            left: sp,
+            right: four,
+        });
+        stmts.push(LlilStmt::SetReg {
+            dest: "sp".to_string(),
+            src: dec,
+        });
+        let slot = reg(func, "sp");
+        let value = reg(func, name);
         stmts.push(LlilStmt::Store {
-            addr: sp,
-            value: reg_expr,
+            addr: slot,
+            value,
             size: 4,
         });
     }
@@ -426,29 +449,101 @@ fn lift_push(func: &mut LlilFunction, ops: &[&str]) -> Vec<LlilStmt> {
 }
 
 fn lift_pop(func: &mut LlilFunction, ops: &[&str]) -> Vec<LlilStmt> {
+    // Mirror of `lift_push`: `reg = *(sp); sp = sp + 4` per register, first
+    // register from the lowest address. `pop {.., pc}` is a function return.
     let mut stmts = Vec::new();
     for op in ops {
         let name = op.trim().trim_matches(|c| c == '{' || c == '}');
         if name.is_empty() {
             continue;
         }
-        let sp = reg(func, "sp");
-        let load = func.add_expr(LlilExpr::Load { addr: sp, size: 4 });
+        let slot = reg(func, "sp");
+        let load = func.add_expr(LlilExpr::Load {
+            addr: slot,
+            size: 4,
+        });
+        if name.eq_ignore_ascii_case("pc") {
+            let sp = reg(func, "sp");
+            let four = imm(func, 4);
+            let inc = func.add_expr(LlilExpr::BinOp {
+                op: BinOp::Add,
+                left: sp,
+                right: four,
+            });
+            stmts.push(LlilStmt::SetReg {
+                dest: "sp".to_string(),
+                src: inc,
+            });
+            stmts.push(LlilStmt::Return);
+            continue;
+        }
         stmts.push(LlilStmt::SetReg {
             dest: name.to_string(),
             src: load,
+        });
+        let sp = reg(func, "sp");
+        let four = imm(func, 4);
+        let inc = func.add_expr(LlilExpr::BinOp {
+            op: BinOp::Add,
+            left: sp,
+            right: four,
+        });
+        stmts.push(LlilStmt::SetReg {
+            dest: "sp".to_string(),
+            src: inc,
         });
     }
     stmts
 }
 
 fn lift_branch(func: &mut LlilFunction, ops: &[&str]) -> Vec<LlilStmt> {
+    // Capstone prints ARM branch targets with a `#` prefix (`b #0x1c`);
+    // parse_operand strips it (a bare parse_number would fail and produce
+    // a bogus jump to 0).
     let target = ops
         .first()
-        .and_then(|s| parse_number(s).ok())
-        .map(|v| imm(func, v))
+        .map(|s| parse_operand(func, s))
         .unwrap_or_else(|| imm(func, 0));
     vec![LlilStmt::Jump { target }]
+}
+
+/// Conditional direct branch: `b<cond> #target` becomes a `BranchIf` on the
+/// flag condition so MLIL can fold the preceding cmp/tst into a relational
+/// expression, exactly as on x86.
+fn lift_bcc(func: &mut LlilFunction, cond: &str, ops: &[&str]) -> Vec<LlilStmt> {
+    let Some(flag_cond) = arm_cond_to_flag(cond) else {
+        // pl/vc have no FlagCondition mapping yet — stay honest rather than
+        // emitting a wrong branch shape.
+        return vec![LlilStmt::Unimplemented {
+            mnemonic: format!("b{}", cond),
+            op_str: ops.join(", "),
+        }];
+    };
+    let target = ops
+        .first()
+        .map(|s| parse_operand(func, s))
+        .unwrap_or_else(|| imm(func, 0));
+    let flag = func.add_expr(LlilExpr::Flag(flag_cond));
+    vec![LlilStmt::BranchIf { cond: flag, target }]
+}
+
+/// Map an ARM condition code to the shared [`FlagCondition`] vocabulary.
+fn arm_cond_to_flag(cond: &str) -> Option<FlagCondition> {
+    Some(match cond {
+        "eq" => FlagCondition::E,
+        "ne" => FlagCondition::Ne,
+        "cs" | "hs" => FlagCondition::Uge,
+        "cc" | "lo" => FlagCondition::Ult,
+        "mi" => FlagCondition::Neg,
+        "vs" => FlagCondition::Overflow,
+        "hi" => FlagCondition::Ugt,
+        "ls" => FlagCondition::Ule,
+        "ge" => FlagCondition::Sge,
+        "lt" => FlagCondition::Slt,
+        "gt" => FlagCondition::Sgt,
+        "le" => FlagCondition::Sle,
+        _ => return None,
+    })
 }
 
 fn lift_call(func: &mut LlilFunction, ops: &[&str]) -> Vec<LlilStmt> {
@@ -535,14 +630,55 @@ mod tests {
     }
 
     #[test]
-    fn lift_push_pop_generate_stores_and_loads() {
+    fn lift_push_pop_adjust_sp_per_slot() {
         let mut func = LlilFunction::new("t".into(), 0);
+        // Each pushed register gets its own `sp -= 4; *(sp) = reg` pair, so
+        // the slots no longer alias a single address.
         let push = lift_instruction(&mut func, &mk(0, "push", "{r4, lr}"));
-        assert_eq!(push.len(), 2);
-        assert!(matches!(push[0], LlilStmt::Store { .. }));
+        assert_eq!(push.len(), 4);
+        assert!(matches!(&push[0], LlilStmt::SetReg { dest, .. } if dest == "sp"));
+        assert!(matches!(push[1], LlilStmt::Store { .. }));
+        // `pop {.., pc}` restores then returns.
         let pop = lift_instruction(&mut func, &mk(4, "pop", "{r4, pc}"));
-        assert_eq!(pop.len(), 2);
-        assert!(matches!(pop[0], LlilStmt::SetReg { .. }));
+        assert!(matches!(&pop[0], LlilStmt::SetReg { dest, .. } if dest == "r4"));
+        assert_eq!(pop.last(), Some(&LlilStmt::Return));
+    }
+
+    #[test]
+    fn direct_branch_parses_hash_prefixed_target() {
+        // Capstone prints `b #0x1c`; the target must parse, not collapse to 0.
+        let mut func = LlilFunction::new("t".into(), 0);
+        let stmts = lift_instruction(&mut func, &mk(0, "b", "#0x1c"));
+        match &stmts[0] {
+            LlilStmt::Jump { target } => {
+                assert_eq!(func.exprs[*target], LlilExpr::Const(0x1c));
+            }
+            other => panic!("expected Jump, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn conditional_branch_keeps_its_condition() {
+        // `bne #0x2000` must lift to a BranchIf on Ne — flattening it to an
+        // unconditional Jump corrupts every if/loop.
+        let mut func = LlilFunction::new("t".into(), 0);
+        let stmts = lift_instruction(&mut func, &mk(0, "bne", "#0x2000"));
+        match &stmts[0] {
+            LlilStmt::BranchIf { cond, target } => {
+                assert_eq!(func.exprs[*cond], LlilExpr::Flag(FlagCondition::Ne));
+                assert_eq!(func.exprs[*target], LlilExpr::Const(0x2000));
+            }
+            other => panic!("expected BranchIf, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cmp_defines_the_shared_flags_register() {
+        // MLIL's condition folding and DSE only recognize `__flags`; the old
+        // bare `flags` name was both unfoldable and DSE-deletable.
+        let mut func = LlilFunction::new("t".into(), 0);
+        let stmts = lift_instruction(&mut func, &mk(0, "cmp", "r0, r1"));
+        assert!(matches!(&stmts[0], LlilStmt::SetReg { dest, .. } if dest == "__flags"));
     }
 
     #[test]
