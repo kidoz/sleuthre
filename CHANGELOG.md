@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **GDB Remote debugger hardening (review follow-ups to 0.6).** A hostile or
+  buggy stub could crash the GUI with a char-boundary panic via a non-ASCII
+  marker byte in the `qXfer` module-list reply. Resume waits (`c`/`s`) no
+  longer inherit the 5-second socket read timeout, so a continue that runs
+  longer than that no longer fails spuriously and desynchronizes the protocol
+  (the Stop button's unframed `0x03` remains the escape hatch, and the UI now
+  polls for the stop reply instead of waiting for an input event). `Z`/`z`
+  breakpoint packets send architecture-correct kinds (4 for ARM/AArch64/
+  MIPS/RISC-V instead of a hardcoded x86 `1`, which gdbserver rejects).
+  Watchpoints can now be removed from the breakpoint list (removal previously
+  only tried the execute kinds, leaving `Z2..Z4` armed in the stub). Thread
+  enumeration and the backtrace are cached per stop instead of issuing RSP
+  round-trips on every rendered frame. A scripted RSP-stub test now covers the
+  handshake, breakpoint wire format, and resume replies over a real socket.
+
 ### Changed
 
 - **Decompiler quality on 32-bit x86.** Conditional branches are folded back into
