@@ -1377,6 +1377,31 @@ impl McpServer {
     }
 }
 
+fn main() -> Result<()> {
+    let mut server = McpServer::new();
+    let stdin = io::stdin();
+    for line in stdin.lock().lines() {
+        let line = line?;
+        match serde_json::from_str::<Value>(&line) {
+            Ok(request) => {
+                let response = server.handle_request(request);
+                if response != Value::Null {
+                    println!("{}", serde_json::to_string(&response)?);
+                }
+            }
+            Err(e) => {
+                let error_response = json!({
+                    "jsonrpc": "2.0",
+                    "id": Value::Null,
+                    "error": { "code": -32700, "message": format!("Parse error: {}", e) }
+                });
+                println!("{}", serde_json::to_string(&error_response)?);
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1465,29 +1490,4 @@ mod tests {
         let msg = resp["error"]["message"].as_str().unwrap();
         assert!(msg.contains("path"));
     }
-}
-
-fn main() -> Result<()> {
-    let mut server = McpServer::new();
-    let stdin = io::stdin();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        match serde_json::from_str::<Value>(&line) {
-            Ok(request) => {
-                let response = server.handle_request(request);
-                if response != Value::Null {
-                    println!("{}", serde_json::to_string(&response)?);
-                }
-            }
-            Err(e) => {
-                let error_response = json!({
-                    "jsonrpc": "2.0",
-                    "id": Value::Null,
-                    "error": { "code": -32700, "message": format!("Parse error: {}", e) }
-                });
-                println!("{}", serde_json::to_string(&error_response)?);
-            }
-        }
-    }
-    Ok(())
 }

@@ -3645,8 +3645,10 @@ mod tests {
     // ---- Tests for Struct/Array Propagation ----
 
     fn make_test_types_with_structs() -> TypeManager {
-        let mut types = TypeManager::default();
-        types.arch = crate::arch::Architecture::X86_64;
+        let mut types = TypeManager {
+            arch: crate::arch::Architecture::X86_64,
+            ..Default::default()
+        };
 
         // struct Point { int32_t x; int32_t y; } — size 8
         types.add_type(crate::types::CompoundType::Struct {
