@@ -304,6 +304,14 @@ pub(crate) struct SleuthreApp {
     /// Loaded modules `(name, base)` cached at the last refresh, so the panel
     /// doesn't issue a `qXfer` round-trip every repaint.
     pub(crate) debugger_modules: Vec<(String, u64)>,
+    /// Thread ids cached at the last refresh (one `qfThreadInfo` walk per
+    /// stop, not per repaint).
+    pub(crate) debugger_threads: Vec<u64>,
+    /// Backtrace frames cached at the last refresh — unwinding issues `m`
+    /// memory reads per frame, which must never run on the render path —
+    /// plus the strategy label ("DWARF .eh_frame" / "frame-pointer").
+    pub(crate) debugger_backtrace: Vec<u64>,
+    pub(crate) debugger_backtrace_source: &'static str,
 }
 
 /// Async operation in flight on the debugger.
@@ -708,6 +716,9 @@ impl Default for SleuthreApp {
             debugger_child: None,
             debugger_interrupt: None,
             debugger_modules: Vec::new(),
+            debugger_threads: Vec::new(),
+            debugger_backtrace: Vec::new(),
+            debugger_backtrace_source: "",
         }
     }
 }

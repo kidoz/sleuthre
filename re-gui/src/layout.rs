@@ -195,6 +195,12 @@ impl eframe::App for SleuthreApp {
         self.poll_plugin_results();
         self.apply_inbound_collab_events();
         self.poll_debugger_op();
+        // A blocking debugger op completes on a worker thread; with egui's
+        // reactive repainting the stop reply would sit unread in the channel
+        // until the next input event. Poll at a coarse interval instead.
+        if self.debugger_pending.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
     }
 }
 

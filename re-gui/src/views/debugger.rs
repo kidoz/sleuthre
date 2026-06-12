@@ -357,12 +357,10 @@ impl SleuthreApp {
 
         ui.separator();
 
-        // Thread selector — only shown when the stub reports more than one.
-        let threads: Vec<u64> = self
-            .debugger_remote
-            .as_ref()
-            .map(|d| d.threads())
-            .unwrap_or_default();
+        // Thread selector — only shown when the stub reported more than one
+        // at the last refresh (enumeration is cached there; it's an RSP
+        // round-trip we must not repeat per frame).
+        let threads = self.debugger_threads.clone();
         if threads.len() > 1 {
             let mut selected = self.debugger_active_thread;
             ui.horizontal(|ui| {
@@ -393,31 +391,11 @@ impl SleuthreApp {
             }
         }
 
-        // Backtrace — DWARF first (works on optimized release builds), fall
-        // back to the frame-pointer chain when no `.eh_frame` is available
-        // for the current PC.
-        let arch = self
-            .project
-            .as_ref()
-            .map(|p| p.arch)
-            .unwrap_or(re_core::arch::Architecture::X86_64);
-        let (frames, source): (Vec<u64>, &str) = match (
-            self.debugger_remote.as_ref(),
-            self.debugger_unwinder.as_ref(),
-        ) {
-            (Some(d), Some(uw)) => {
-                let regs = d.registers();
-                let unwound =
-                    uw.unwind(arch, &regs, 32, |addr, size| d.read_memory(addr, size).ok());
-                if unwound.len() > 1 {
-                    (unwound, "DWARF .eh_frame")
-                } else {
-                    (d.frame_pointer_backtrace(arch, 32), "frame-pointer")
-                }
-            }
-            (Some(d), None) => (d.frame_pointer_backtrace(arch, 32), "frame-pointer"),
-            _ => (Vec::new(), ""),
-        };
+        // Backtrace — computed (DWARF first, frame-pointer fallback) and
+        // cached in `debugger_refresh`; unwinding reads target memory, which
+        // is far too expensive for the render path.
+        let frames = self.debugger_backtrace.clone();
+        let source = self.debugger_backtrace_source;
         if !frames.is_empty() {
             ui.label(
                 egui::RichText::new(format!("Backtrace ({}):", source))
@@ -826,6 +804,29 @@ impl SleuthreApp {
         self.debugger_regs = d.registers();
         // Cache the module list (one qXfer round-trip per refresh, not per frame).
         self.debugger_modules = d.modules();
+        // Cache threads and the backtrace too — thread enumeration and the
+        // unwinder's `m` memory reads are RSP round-trips that must never run
+        // on the per-frame render path (each blocks the UI thread, and a slow
+        // or non-loopback stub turns that into a frozen UI).
+        self.debugger_threads = d.threads();
+        let arch = self.debugger_effective_arch();
+        // DWARF first (works on optimized release builds), fall back to the
+        // frame-pointer chain when no `.eh_frame` covers the current PC.
+        let (frames, source) = match self.debugger_unwinder.as_ref() {
+            Some(uw) => {
+                let unwound = uw.unwind(arch, &self.debugger_regs, 32, |addr, size| {
+                    d.read_memory(addr, size).ok()
+                });
+                if unwound.len() > 1 {
+                    (unwound, "DWARF .eh_frame")
+                } else {
+                    (d.frame_pointer_backtrace(arch, 32), "frame-pointer")
+                }
+            }
+            None => (d.frame_pointer_backtrace(arch, 32), "frame-pointer"),
+        };
+        self.debugger_backtrace = frames;
+        self.debugger_backtrace_source = source;
         // Repopulate the editable mirror so typed-but-uncommitted edits don't
         // linger across stops.
         self.debugger_reg_edit = self
@@ -1046,27 +1047,13 @@ impl SleuthreApp {
     /// Step out of the current function: set a one-shot breakpoint at the
     /// caller's return address (frame #1 of the backtrace) and continue.
     fn debugger_step_out(&mut self) {
-        let arch = self.project.as_ref().map(|p| p.arch).unwrap_or_default();
-        let ret = {
-            let Some(d) = self.debugger_remote.as_ref() else {
-                return;
-            };
-            let regs = d.registers();
-            // Same DWARF-first / frame-pointer-fallback as the backtrace panel.
-            let frames = match self.debugger_unwinder.as_ref() {
-                Some(uw) => {
-                    let unwound = uw.unwind(arch, &regs, 32, |a, s| d.read_memory(a, s).ok());
-                    if unwound.len() > 1 {
-                        unwound
-                    } else {
-                        d.frame_pointer_backtrace(arch, 32)
-                    }
-                }
-                None => d.frame_pointer_backtrace(arch, 32),
-            };
-            frames.get(1).copied()
-        };
-        let Some(ret) = ret else {
+        if self.debugger_remote.is_none() {
+            return;
+        }
+        // Frame #1 of the backtrace cached at the last stop/refresh is the
+        // caller's return address (register writes also trigger a refresh, so
+        // the cache tracks user edits to SP/PC).
+        let Some(ret) = self.debugger_backtrace.get(1).copied() else {
             self.add_toast(ToastKind::Warning, "No caller frame to return to.".into());
             return;
         };
