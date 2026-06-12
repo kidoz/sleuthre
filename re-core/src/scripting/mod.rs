@@ -84,6 +84,16 @@ impl ScriptEngine {
     pub fn new() -> Self {
         let mut engine = Engine::new();
 
+        // Execution limits: scripts are user-supplied and may be buggy or
+        // hostile. Without an operation cap a `loop {}` hangs the host (the
+        // console engine evaluates on the UI thread) and unbounded
+        // strings/arrays can OOM it. Limits are generous for real scripts.
+        engine.set_max_operations(10_000_000);
+        engine.set_max_string_size(1_000_000);
+        engine.set_max_array_size(100_000);
+        engine.set_max_map_size(100_000);
+        engine.set_max_call_levels(64);
+
         // Register hex formatting helper
         engine.register_fn("hex", |n: i64| format!("0x{:x}", n));
 
@@ -452,6 +462,28 @@ mod tests {
         let mut project = Project::new("test".into(), PathBuf::from("/tmp/test"));
         let result = engine.eval("40 + 2", &mut project).unwrap();
         assert_eq!(result.output, "42");
+    }
+
+    /// A runaway script must hit the operation cap and return an error
+    /// instead of hanging the host (the console engine runs on the UI thread).
+    #[test]
+    fn eval_infinite_loop_is_terminated() {
+        let mut engine = ScriptEngine::new();
+        let mut project = Project::new("test".into(), PathBuf::from("/tmp/test"));
+        let result = engine.eval("loop { }", &mut project);
+        assert!(result.is_err(), "unbounded loop must be cut off");
+    }
+
+    /// Unbounded string growth must be rejected by the size cap, not OOM.
+    #[test]
+    fn eval_string_blowup_is_terminated() {
+        let mut engine = ScriptEngine::new();
+        let mut project = Project::new("test".into(), PathBuf::from("/tmp/test"));
+        let result = engine.eval(
+            "let s = \"x\"; loop { s += s; }",
+            &mut project,
+        );
+        assert!(result.is_err(), "string growth must be cut off");
     }
 
     #[test]

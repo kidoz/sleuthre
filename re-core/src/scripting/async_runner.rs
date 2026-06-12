@@ -128,6 +128,15 @@ fn worker_loop(job_rx: Receiver<Option<ScriptJob>>, result_tx: Sender<ScriptResu
         let actions: Rc<RefCell<Vec<ScriptAction>>> = Rc::new(RefCell::new(Vec::new()));
         let mut engine = Engine::new();
 
+        // Same execution limits as the console engine: a hostile or buggy
+        // plugin must not occupy the single worker forever (Drop joins the
+        // worker thread, so an unbounded script would hang app exit).
+        engine.set_max_operations(10_000_000);
+        engine.set_max_string_size(1_000_000);
+        engine.set_max_array_size(100_000);
+        engine.set_max_map_size(100_000);
+        engine.set_max_call_levels(64);
+
         // Capture closures that push into a local actions list.
         {
             let actions = actions.clone();
