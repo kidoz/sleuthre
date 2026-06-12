@@ -277,9 +277,14 @@ fn load_elf(elf: elf::Elf, bytes: &[u8]) -> Result<LoadedBinary> {
                 ));
             }
             let mut data = vec![0u8; size as usize];
-            let end_offset = file_offset.saturating_add(file_size);
+            // `p_filesz` and `p_memsz` are independent attacker-controlled
+            // fields (goblin does not enforce filesz <= memsz), so the copy
+            // must be clamped to the allocation as well as the file bounds —
+            // a crafted filesz > memsz would otherwise panic the slice below.
+            let copy_len = file_size.min(size as usize);
+            let end_offset = file_offset.saturating_add(copy_len);
             if end_offset <= bytes.len() {
-                data[..file_size].copy_from_slice(&bytes[file_offset..end_offset]);
+                data[..copy_len].copy_from_slice(&bytes[file_offset..end_offset]);
             }
 
             memory_map.add_segment(MemorySegment {
@@ -517,7 +522,12 @@ fn load_macho_single(macho: mach::MachO, bytes: &[u8]) -> Result<LoadedBinary> {
             ));
         }
         let mut data = vec![0u8; vm_size as usize];
-        let copy_size = file_size.min(bytes.len().saturating_sub(file_off));
+        // Clamp to the allocation too: `filesize` is independent of `vmsize`
+        // and attacker-controlled; a crafted filesize > vmsize would
+        // otherwise panic the slice below.
+        let copy_size = file_size
+            .min(vm_size as usize)
+            .min(bytes.len().saturating_sub(file_off));
         if copy_size > 0 && file_off < bytes.len() {
             data[..copy_size].copy_from_slice(&bytes[file_off..file_off + copy_size]);
         }
@@ -718,6 +728,69 @@ mod tests {
         h[20..24].copy_from_slice(&(elf::header::EV_CURRENT as u32).to_le_bytes());
         h[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
         h
+    }
+
+    /// A crafted PT_LOAD with `p_filesz > p_memsz` (goblin permits it) must
+    /// not panic the segment copy; the copy is clamped to the allocation.
+    #[test]
+    fn elf_filesz_exceeding_memsz_is_clamped() {
+        let mut bytes = minimal_elf64(elf::header::EM_X86_64);
+        bytes[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        bytes[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        bytes[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+        let mut ph = Vec::new();
+        ph.extend_from_slice(&1u32.to_le_bytes()); // p_type = PT_LOAD
+        ph.extend_from_slice(&5u32.to_le_bytes()); // p_flags = R|X
+        ph.extend_from_slice(&0u64.to_le_bytes()); // p_offset
+        ph.extend_from_slice(&0x400000u64.to_le_bytes()); // p_vaddr
+        ph.extend_from_slice(&0x400000u64.to_le_bytes()); // p_paddr
+        ph.extend_from_slice(&0x40u64.to_le_bytes()); // p_filesz (> memsz)
+        ph.extend_from_slice(&0x10u64.to_le_bytes()); // p_memsz
+        ph.extend_from_slice(&0x1000u64.to_le_bytes()); // p_align
+        bytes.extend_from_slice(&ph);
+
+        let loaded = load_binary_from_bytes(&bytes).expect("clamped load must succeed");
+        let seg = &loaded.memory_map.segments[0];
+        assert_eq!(seg.size, 0x10);
+        assert_eq!(seg.data.len(), 0x10);
+        // The copy is bounded by memsz: the first 0x10 file bytes only.
+        assert_eq!(seg.data[..4], [0x7f, b'E', b'L', b'F']);
+    }
+
+    /// Same class for Mach-O: a crafted segment with `filesize > vmsize`
+    /// must not panic the copy into the vmsize-sized allocation.
+    #[test]
+    fn macho_filesize_exceeding_vmsize_is_clamped() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0xfeed_facf_u32.to_le_bytes()); // MH_MAGIC_64
+        bytes.extend_from_slice(&0x0100_0007_u32.to_le_bytes()); // CPU_TYPE_X86_64
+        bytes.extend_from_slice(&3u32.to_le_bytes()); // cpusubtype
+        bytes.extend_from_slice(&2u32.to_le_bytes()); // MH_EXECUTE
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // ncmds
+        bytes.extend_from_slice(&72u32.to_le_bytes()); // sizeofcmds
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // flags
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        bytes.extend_from_slice(&0x19u32.to_le_bytes()); // LC_SEGMENT_64
+        bytes.extend_from_slice(&72u32.to_le_bytes()); // cmdsize
+        let mut segname = [0u8; 16];
+        segname[..6].copy_from_slice(b"__TEXT");
+        bytes.extend_from_slice(&segname);
+        bytes.extend_from_slice(&0x1000u64.to_le_bytes()); // vmaddr
+        bytes.extend_from_slice(&0x10u64.to_le_bytes()); // vmsize
+        // filesize must stay within the file (goblin checks that) while
+        // exceeding vmsize — the case goblin does NOT check. The file is
+        // 104 bytes (32-byte header + 72-byte load command).
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // fileoff
+        bytes.extend_from_slice(&0x60u64.to_le_bytes()); // filesize (> vmsize)
+        bytes.extend_from_slice(&7u32.to_le_bytes()); // maxprot
+        bytes.extend_from_slice(&5u32.to_le_bytes()); // initprot
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // nsects
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // flags
+
+        let loaded = load_binary_from_bytes(&bytes).expect("clamped load must succeed");
+        let seg = &loaded.memory_map.segments[0];
+        assert_eq!(seg.size, 0x10);
+        assert_eq!(seg.data.len(), 0x10);
     }
 
     #[test]
