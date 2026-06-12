@@ -395,11 +395,25 @@ fn bp_kind_byte(kind: BreakpointKind) -> u8 {
     }
 }
 
-/// Length argument supplied with `Z2..Z4`. Watchpoints need a meaningful
-/// region size; for execute breakpoints the stub silently corrects 1.
-fn bp_kind_length(kind: BreakpointKind) -> u32 {
+/// The `kind` argument of a `Z`/`z` packet.
+///
+/// For execute breakpoints (Z0/Z1) it encodes the breakpoint instruction size
+/// the stub should plant, which is architecture-specific — gdbserver rejects a
+/// mismatch (`E01`), so a hardcoded x86 `1` breaks software breakpoints on
+/// every fixed-width-instruction target. For watchpoints (Z2..Z4) it is the
+/// size of the watched region instead.
+fn bp_kind_length(arch: crate::arch::Architecture, kind: BreakpointKind) -> u32 {
+    use crate::arch::Architecture::*;
     match kind {
-        BreakpointKind::Software | BreakpointKind::Hardware => 1,
+        BreakpointKind::Software | BreakpointKind::Hardware => match arch {
+            // 4-byte breakpoint instructions (BRK / BKPT / BREAK / EBREAK).
+            // 32-bit ARM assumes ARM mode — Thumb sites would need kind 2/3,
+            // which requires mode knowledge we don't track yet. RISC-V stubs
+            // accept 4 (non-compressed EBREAK) as the safe default.
+            Arm | Arm64 | Mips | Mips64 | RiscV32 | RiscV64 => 4,
+            // x86 `int3` and anything unknown.
+            _ => 1,
+        },
         // Default to a 4-byte watch region — the most common case for ints
         // and pointer-low halves on 32-bit targets. Users can customize via
         // a future API; for now this matches `gdb`'s default.
@@ -677,7 +691,7 @@ impl Debugger for GdbRemoteDebugger {
 
     fn remove_breakpoint(&mut self, address: u64, kind: BreakpointKind) -> Result<()> {
         let z = bp_kind_byte(kind);
-        let len = bp_kind_length(kind);
+        let len = bp_kind_length(self.arch, kind);
         let pkt = format!("z{},{:x},{}", z, address, len);
         let reply = self.send_recv(&pkt)?;
         if reply == "OK" || reply.is_empty() {
@@ -880,7 +894,7 @@ impl GdbRemoteDebugger {
         thread_id: Option<u64>,
     ) -> Result<()> {
         let z = bp_kind_byte(kind);
-        let len = bp_kind_length(kind);
+        let len = bp_kind_length(self.arch, kind);
         let pkt = match thread_id {
             Some(tid) => format!("Z{},{:x},{};X{:x}", z, address, len, tid),
             None => format!("Z{},{:x},{}", z, address, len),
@@ -1083,7 +1097,21 @@ mod tests {
 
     #[test]
     fn watchpoints_use_4_byte_region() {
-        assert_eq!(bp_kind_length(BreakpointKind::WriteWatch), 4);
-        assert_eq!(bp_kind_length(BreakpointKind::Hardware), 1);
+        use crate::arch::Architecture::X86_64;
+        assert_eq!(bp_kind_length(X86_64, BreakpointKind::WriteWatch), 4);
+        assert_eq!(bp_kind_length(X86_64, BreakpointKind::Hardware), 1);
+    }
+
+    #[test]
+    fn execute_breakpoint_kind_tracks_instruction_width() {
+        use crate::arch::Architecture::*;
+        // x86 plants a 1-byte int3; fixed-width ISAs need their instruction
+        // size or gdbserver rejects the Z packet with E01.
+        assert_eq!(bp_kind_length(X86, BreakpointKind::Software), 1);
+        assert_eq!(bp_kind_length(X86_64, BreakpointKind::Hardware), 1);
+        for arch in [Arm, Arm64, Mips, Mips64, RiscV32, RiscV64] {
+            assert_eq!(bp_kind_length(arch, BreakpointKind::Software), 4);
+            assert_eq!(bp_kind_length(arch, BreakpointKind::Hardware), 4);
+        }
     }
 }
