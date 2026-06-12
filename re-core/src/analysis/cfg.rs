@@ -104,15 +104,30 @@ impl ControlFlowGraph {
 
             let mut succ: Vec<(u64, EdgeKind)> = Vec::new();
             if is_branch {
+                // Classification covers every lifted architecture, not just
+                // x86: ARM `b`/`bl`/`bx lr`, ARM64 `br`/`blr`, RISC-V
+                // `j`/`jal`/`jalr` — an unconditional branch misread as
+                // conditional gets a bogus fall-through edge, and a call
+                // misread as conditional severs the call-graph shape.
                 let mnemonic = insn.mnemonic.to_lowercase();
-                if mnemonic == "ret" || mnemonic == "retn" {
+                let op = insn.op_str.trim();
+                let is_return = mnemonic == "ret"
+                    || mnemonic == "retn"
+                    || (mnemonic == "bx" && op.eq_ignore_ascii_case("lr"));
+                let is_call = matches!(
+                    mnemonic.as_str(),
+                    "call" | "bl" | "blx" | "blr" | "jal" | "jalr"
+                );
+                let is_unconditional =
+                    matches!(mnemonic.as_str(), "jmp" | "b" | "j" | "br" | "bx");
+                if is_return {
                     // End of path — no successors.
-                } else if mnemonic == "call" {
+                } else if is_call {
                     succ.push((next, EdgeKind::CallFallthrough));
-                } else if mnemonic == "jmp" {
-                    if let Some(target) = parse_target(&insn.op_str) {
+                } else if is_unconditional {
+                    if let Some(target) = parse_target(op) {
                         succ.push((target, EdgeKind::Unconditional));
-                    } else if let Some(base) = parse_jump_table_base(&insn.op_str) {
+                    } else if let Some(base) = parse_jump_table_base(op) {
                         // Indirect jump through a compiler-emitted jump table
                         // (`jmp [reg*scale + base]`); a bare `[reg]` indirect
                         // jump has no statically recoverable target.
@@ -120,9 +135,12 @@ impl ControlFlowGraph {
                             succ.push((case, EdgeKind::Switch));
                         }
                     }
+                    // An indirect unconditional branch (`br x16`, `bx r3`)
+                    // with no recoverable target gets *no* successors — in
+                    // particular not a fall-through edge.
                 } else {
                     // Conditional: branch target (true) and fall-through (false).
-                    if let Some(target) = parse_target(&insn.op_str) {
+                    if let Some(target) = parse_target(op) {
                         succ.push((target, EdgeKind::ConditionalTrue));
                     }
                     succ.push((next, EdgeKind::ConditionalFalse));
@@ -255,8 +273,11 @@ pub fn detect_jump_table(memory: &MemoryMap, table_addr: u64, max_entries: usize
 }
 
 fn parse_target(op_str: &str) -> Option<u64> {
+    // ARM/ARM64/RISC-V immediates print with a `#` prefix (`b #0x2000`),
+    // which must strip before the hex parse or every ARM branch target fails.
     let cleaned = op_str
         .trim()
+        .trim_start_matches('#')
         .trim_start_matches("0x")
         .trim_start_matches("loc_");
     u64::from_str_radix(cleaned, 16).ok()
@@ -397,6 +418,63 @@ mod tests {
                 edges
             );
         }
+    }
+
+    /// ARM64 `b` is unconditional: it must produce exactly one Unconditional
+    /// edge and *no* fall-through (the old x86-only classification treated it
+    /// as conditional, fabricating a ConditionalFalse edge and failing to
+    /// parse the `#`-prefixed target).
+    #[test]
+    fn arm64_unconditional_branch_single_edge() {
+        let mut code = vec![
+            0x02, 0x00, 0x00, 0x14, // 0x1000: b 0x1008
+            0x1f, 0x20, 0x03, 0xd5, // 0x1004: nop (skipped)
+            0xc0, 0x03, 0x5f, 0xd6, // 0x1008: ret
+        ];
+        code.resize(32, 0);
+        let mut map = MemoryMap::default();
+        map.add_segment(MemorySegment {
+            name: "code".to_string(),
+            start: 0x1000,
+            size: code.len() as u64,
+            data: code,
+            permissions: Permissions::READ | Permissions::EXECUTE,
+        })
+        .unwrap();
+        let disasm = Disassembler::new(Architecture::Arm64).unwrap();
+        let mut cfg = ControlFlowGraph::new();
+        cfg.build_for_function(&map, &disasm, 0x1000).unwrap();
+
+        let kinds: Vec<EdgeKind> = cfg.graph.edge_weights().copied().collect();
+        assert_eq!(kinds, vec![EdgeKind::Unconditional], "got {:?}", kinds);
+    }
+
+    /// ARM64 `bl` is a call: the block continues at the fall-through, not at
+    /// the callee.
+    #[test]
+    fn arm64_bl_is_call_fallthrough() {
+        let mut code = vec![
+            0x03, 0x00, 0x00, 0x94, // 0x1000: bl 0x100c
+            0xc0, 0x03, 0x5f, 0xd6, // 0x1004: ret
+            0x1f, 0x20, 0x03, 0xd5, // 0x1008: nop
+            0xc0, 0x03, 0x5f, 0xd6, // 0x100c: ret (callee)
+        ];
+        code.resize(32, 0);
+        let mut map = MemoryMap::default();
+        map.add_segment(MemorySegment {
+            name: "code".to_string(),
+            start: 0x1000,
+            size: code.len() as u64,
+            data: code,
+            permissions: Permissions::READ | Permissions::EXECUTE,
+        })
+        .unwrap();
+        let disasm = Disassembler::new(Architecture::Arm64).unwrap();
+        let mut cfg = ControlFlowGraph::new();
+        cfg.build_for_function(&map, &disasm, 0x1000).unwrap();
+
+        let kinds: Vec<EdgeKind> = cfg.graph.edge_weights().copied().collect();
+        assert_eq!(kinds, vec![EdgeKind::CallFallthrough], "got {:?}", kinds);
     }
 
     #[test]
