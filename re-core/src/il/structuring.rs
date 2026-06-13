@@ -2651,8 +2651,147 @@ fn fold_field_accesses(
     inferred_types: &HashMap<String, TypeRef>,
     types: &TypeManager,
 ) {
+    // Variables dereferenced at multiple distinct offsets are struct pointers
+    // even when no concrete type is known; their accesses fold to synthetic
+    // `base->field_<offset>` so the pseudocode reads as field access rather
+    // than raw pointer arithmetic (the lightweight form of struct recovery).
+    let struct_ptrs = collect_struct_pointer_bases(stmts);
+    fold_field_accesses_inner(stmts, type_info, inferred_types, types, &struct_ptrs);
+}
+
+fn fold_field_accesses_inner(
+    stmts: &mut [HlilStmt],
+    type_info: Option<&FunctionTypeInfo>,
+    inferred_types: &HashMap<String, TypeRef>,
+    types: &TypeManager,
+    struct_ptrs: &HashSet<String>,
+) {
     for stmt in stmts {
-        fold_field_accesses_stmt(stmt, type_info, inferred_types, types);
+        fold_field_accesses_stmt(stmt, type_info, inferred_types, types, struct_ptrs);
+    }
+}
+
+/// Collect names of variables that look like struct pointers: dereferenced as
+/// `*(var + const)` at two or more distinct offsets, or at a single offset
+/// large enough (>= 0x10) to be a struct field rather than a plain
+/// pointer-to-scalar deref.
+fn collect_struct_pointer_bases(stmts: &[HlilStmt]) -> HashSet<String> {
+    let mut offsets: HashMap<String, HashSet<u64>> = HashMap::new();
+    for stmt in stmts {
+        collect_offset_accesses_stmt(stmt, &mut offsets);
+    }
+    offsets
+        .into_iter()
+        .filter(|(_, offs)| offs.len() >= 2 || offs.iter().any(|&o| o >= 0x10))
+        .map(|(name, _)| name)
+        .collect()
+}
+
+fn collect_offset_accesses_stmt(stmt: &HlilStmt, out: &mut HashMap<String, HashSet<u64>>) {
+    match stmt {
+        HlilStmt::Assign { dest, src } => {
+            collect_offset_accesses_expr(dest, out);
+            collect_offset_accesses_expr(src, out);
+        }
+        HlilStmt::Store { addr, value } => {
+            collect_offset_accesses_expr(addr, out);
+            collect_offset_accesses_expr(value, out);
+        }
+        HlilStmt::Expr(e) => collect_offset_accesses_expr(e, out),
+        HlilStmt::Return(Some(e)) => collect_offset_accesses_expr(e, out),
+        HlilStmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            collect_offset_accesses_expr(cond, out);
+            for s in then_body.iter().chain(else_body) {
+                collect_offset_accesses_stmt(s, out);
+            }
+        }
+        HlilStmt::While { cond, body } | HlilStmt::DoWhile { body, cond } => {
+            collect_offset_accesses_expr(cond, out);
+            for s in body {
+                collect_offset_accesses_stmt(s, out);
+            }
+        }
+        HlilStmt::For {
+            init,
+            cond,
+            update,
+            body,
+        } => {
+            collect_offset_accesses_stmt(init, out);
+            collect_offset_accesses_expr(cond, out);
+            collect_offset_accesses_stmt(update, out);
+            for s in body {
+                collect_offset_accesses_stmt(s, out);
+            }
+        }
+        HlilStmt::Switch {
+            cond,
+            cases,
+            default,
+        } => {
+            collect_offset_accesses_expr(cond, out);
+            for (_, body) in cases {
+                for s in body {
+                    collect_offset_accesses_stmt(s, out);
+                }
+            }
+            for s in default {
+                collect_offset_accesses_stmt(s, out);
+            }
+        }
+        HlilStmt::Block(inner) => {
+            for s in inner {
+                collect_offset_accesses_stmt(s, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_offset_accesses_expr(expr: &HlilExpr, out: &mut HashMap<String, HashSet<u64>>) {
+    if let HlilExpr::Deref { addr, .. } = expr
+        && let HlilExpr::BinOp { op, left, right } = &**addr
+        && *op == crate::il::llil::BinOp::Add
+    {
+        if let (HlilExpr::Var(name), HlilExpr::Const(off)) = (&**left, &**right) {
+            out.entry(name.clone()).or_default().insert(*off);
+        } else if let (HlilExpr::Const(off), HlilExpr::Var(name)) = (&**left, &**right) {
+            out.entry(name.clone()).or_default().insert(*off);
+        }
+    }
+    // Recurse into children.
+    match expr {
+        HlilExpr::Deref { addr, .. } | HlilExpr::AddrOf(addr) => {
+            collect_offset_accesses_expr(addr, out)
+        }
+        HlilExpr::BinOp { left, right, .. } => {
+            collect_offset_accesses_expr(left, out);
+            collect_offset_accesses_expr(right, out);
+        }
+        HlilExpr::UnaryOp { operand, .. } | HlilExpr::Cast { operand, .. } => {
+            collect_offset_accesses_expr(operand, out)
+        }
+        HlilExpr::Call { target, args } => {
+            collect_offset_accesses_expr(target, out);
+            for a in args {
+                collect_offset_accesses_expr(a, out);
+            }
+        }
+        HlilExpr::FieldAccess { base, .. } => collect_offset_accesses_expr(base, out),
+        HlilExpr::ArrayAccess { base, index } => {
+            collect_offset_accesses_expr(base, out);
+            collect_offset_accesses_expr(index, out);
+        }
+        HlilExpr::VectorOp { operands, .. } => {
+            for o in operands {
+                collect_offset_accesses_expr(o, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -2661,20 +2800,23 @@ fn fold_field_accesses_stmt(
     type_info: Option<&FunctionTypeInfo>,
     inferred_types: &HashMap<String, TypeRef>,
     types: &TypeManager,
+    struct_ptrs: &HashSet<String>,
 ) {
     match stmt {
         HlilStmt::Assign { dest, src } => {
-            fold_field_accesses_expr(dest, type_info, inferred_types, types);
-            fold_field_accesses_expr(src, type_info, inferred_types, types);
+            fold_field_accesses_expr(dest, type_info, inferred_types, types, struct_ptrs);
+            fold_field_accesses_expr(src, type_info, inferred_types, types, struct_ptrs);
         }
         HlilStmt::Store { addr, value } => {
-            fold_field_accesses_expr(addr, type_info, inferred_types, types);
-            fold_field_accesses_expr(value, type_info, inferred_types, types);
+            fold_field_accesses_expr(addr, type_info, inferred_types, types, struct_ptrs);
+            fold_field_accesses_expr(value, type_info, inferred_types, types, struct_ptrs);
         }
-        HlilStmt::Expr(e) => fold_field_accesses_expr(e, type_info, inferred_types, types),
+        HlilStmt::Expr(e) => {
+            fold_field_accesses_expr(e, type_info, inferred_types, types, struct_ptrs)
+        }
         HlilStmt::Return(opt) => {
             if let Some(e) = opt {
-                fold_field_accesses_expr(e, type_info, inferred_types, types);
+                fold_field_accesses_expr(e, type_info, inferred_types, types, struct_ptrs);
             }
         }
         HlilStmt::If {
@@ -2682,17 +2824,17 @@ fn fold_field_accesses_stmt(
             then_body,
             else_body,
         } => {
-            fold_field_accesses_expr(cond, type_info, inferred_types, types);
-            fold_field_accesses(then_body, type_info, inferred_types, types);
-            fold_field_accesses(else_body, type_info, inferred_types, types);
+            fold_field_accesses_expr(cond, type_info, inferred_types, types, struct_ptrs);
+            fold_field_accesses_inner(then_body, type_info, inferred_types, types, struct_ptrs);
+            fold_field_accesses_inner(else_body, type_info, inferred_types, types, struct_ptrs);
         }
         HlilStmt::While { cond, body } => {
-            fold_field_accesses_expr(cond, type_info, inferred_types, types);
-            fold_field_accesses(body, type_info, inferred_types, types);
+            fold_field_accesses_expr(cond, type_info, inferred_types, types, struct_ptrs);
+            fold_field_accesses_inner(body, type_info, inferred_types, types, struct_ptrs);
         }
         HlilStmt::DoWhile { body, cond } => {
-            fold_field_accesses(body, type_info, inferred_types, types);
-            fold_field_accesses_expr(cond, type_info, inferred_types, types);
+            fold_field_accesses_inner(body, type_info, inferred_types, types, struct_ptrs);
+            fold_field_accesses_expr(cond, type_info, inferred_types, types, struct_ptrs);
         }
         HlilStmt::For {
             init,
@@ -2700,22 +2842,24 @@ fn fold_field_accesses_stmt(
             update,
             body,
         } => {
-            fold_field_accesses_stmt(init, type_info, inferred_types, types);
-            fold_field_accesses_expr(cond, type_info, inferred_types, types);
-            fold_field_accesses_stmt(update, type_info, inferred_types, types);
-            fold_field_accesses(body, type_info, inferred_types, types);
+            fold_field_accesses_stmt(init, type_info, inferred_types, types, struct_ptrs);
+            fold_field_accesses_expr(cond, type_info, inferred_types, types, struct_ptrs);
+            fold_field_accesses_stmt(update, type_info, inferred_types, types, struct_ptrs);
+            fold_field_accesses_inner(body, type_info, inferred_types, types, struct_ptrs);
         }
-        HlilStmt::Block(inner) => fold_field_accesses(inner, type_info, inferred_types, types),
+        HlilStmt::Block(inner) => {
+            fold_field_accesses_inner(inner, type_info, inferred_types, types, struct_ptrs)
+        }
         HlilStmt::Switch {
             cond,
             cases,
             default,
         } => {
-            fold_field_accesses_expr(cond, type_info, inferred_types, types);
+            fold_field_accesses_expr(cond, type_info, inferred_types, types, struct_ptrs);
             for (_, body) in cases {
-                fold_field_accesses(body, type_info, inferred_types, types);
+                fold_field_accesses_inner(body, type_info, inferred_types, types, struct_ptrs);
             }
-            fold_field_accesses(default, type_info, inferred_types, types);
+            fold_field_accesses_inner(default, type_info, inferred_types, types, struct_ptrs);
         }
         HlilStmt::Break
         | HlilStmt::Continue
@@ -2730,11 +2874,12 @@ fn fold_field_accesses_expr(
     type_info: Option<&FunctionTypeInfo>,
     inferred_types: &HashMap<String, TypeRef>,
     types: &TypeManager,
+    struct_ptrs: &HashSet<String>,
 ) {
     // Post-order traversal
     match expr {
         HlilExpr::Deref { addr, .. } => {
-            fold_field_accesses_expr(addr, type_info, inferred_types, types);
+            fold_field_accesses_expr(addr, type_info, inferred_types, types, struct_ptrs);
 
             if let HlilExpr::BinOp { op, left, right } = &**addr
                 && *op == crate::il::llil::BinOp::Add
@@ -2756,6 +2901,21 @@ fn fold_field_accesses_expr(
                     return;
                 }
 
+                // Pattern 1b: synthetic field access on an inferred struct
+                // pointer with no concrete type — `base->field_<offset>`.
+                if let (HlilExpr::Var(name), HlilExpr::Const(offset)) = (&**left, &**right)
+                    && struct_ptrs.contains(name)
+                {
+                    *expr = synthetic_field_access(name, *offset);
+                    return;
+                }
+                if let (HlilExpr::Const(offset), HlilExpr::Var(name)) = (&**left, &**right)
+                    && struct_ptrs.contains(name)
+                {
+                    *expr = synthetic_field_access(name, *offset);
+                    return;
+                }
+
                 // Pattern 2: *(base + index * elem_size) → array access
                 if let Some(result) =
                     try_array_access(left, right, type_info, inferred_types, types)
@@ -2765,34 +2925,46 @@ fn fold_field_accesses_expr(
             }
         }
         HlilExpr::BinOp { left, right, .. } => {
-            fold_field_accesses_expr(left, type_info, inferred_types, types);
-            fold_field_accesses_expr(right, type_info, inferred_types, types);
+            fold_field_accesses_expr(left, type_info, inferred_types, types, struct_ptrs);
+            fold_field_accesses_expr(right, type_info, inferred_types, types, struct_ptrs);
         }
         HlilExpr::UnaryOp { operand, .. } => {
-            fold_field_accesses_expr(operand, type_info, inferred_types, types);
+            fold_field_accesses_expr(operand, type_info, inferred_types, types, struct_ptrs);
+        }
+        HlilExpr::Cast { operand, .. } => {
+            fold_field_accesses_expr(operand, type_info, inferred_types, types, struct_ptrs);
         }
         HlilExpr::Call { target, args } => {
-            fold_field_accesses_expr(target, type_info, inferred_types, types);
+            fold_field_accesses_expr(target, type_info, inferred_types, types, struct_ptrs);
             for arg in args {
-                fold_field_accesses_expr(arg, type_info, inferred_types, types);
+                fold_field_accesses_expr(arg, type_info, inferred_types, types, struct_ptrs);
             }
         }
         HlilExpr::AddrOf(inner) => {
-            fold_field_accesses_expr(inner, type_info, inferred_types, types);
+            fold_field_accesses_expr(inner, type_info, inferred_types, types, struct_ptrs);
         }
         HlilExpr::FieldAccess { base, .. } => {
-            fold_field_accesses_expr(base, type_info, inferred_types, types);
+            fold_field_accesses_expr(base, type_info, inferred_types, types, struct_ptrs);
         }
         HlilExpr::ArrayAccess { base, index } => {
-            fold_field_accesses_expr(base, type_info, inferred_types, types);
-            fold_field_accesses_expr(index, type_info, inferred_types, types);
+            fold_field_accesses_expr(base, type_info, inferred_types, types, struct_ptrs);
+            fold_field_accesses_expr(index, type_info, inferred_types, types, struct_ptrs);
         }
         HlilExpr::VectorOp { operands, .. } => {
             for op in operands {
-                fold_field_accesses_expr(op, type_info, inferred_types, types);
+                fold_field_accesses_expr(op, type_info, inferred_types, types, struct_ptrs);
             }
         }
         _ => {}
+    }
+}
+
+/// Build `base->field_<offset>` for an inferred (typeless) struct pointer.
+fn synthetic_field_access(base: &str, offset: u64) -> HlilExpr {
+    HlilExpr::FieldAccess {
+        base: Box::new(HlilExpr::Var(base.to_string())),
+        field_name: format!("field_{:x}", offset),
+        is_ptr: true,
     }
 }
 
@@ -2850,6 +3022,75 @@ impl HlilStmt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typeless_struct_pointer_folds_to_field_access() {
+        use crate::il::llil::BinOp;
+        // `var` dereferenced at two distinct offsets -> a struct pointer; both
+        // accesses fold to `var->field_<offset>` without a concrete type.
+        let deref = |off: u64| HlilExpr::Deref {
+            addr: Box::new(HlilExpr::BinOp {
+                op: BinOp::Add,
+                left: Box::new(HlilExpr::Var("obj".into())),
+                right: Box::new(HlilExpr::Const(off)),
+            }),
+            size: 4,
+        };
+        let mut stmts = vec![
+            HlilStmt::Assign {
+                dest: HlilExpr::Var("a".into()),
+                src: deref(0x10),
+            },
+            HlilStmt::Assign {
+                dest: HlilExpr::Var("b".into()),
+                src: deref(0x20),
+            },
+        ];
+        let types = TypeManager::default();
+        fold_field_accesses(&mut stmts, None, &HashMap::new(), &types);
+        match &stmts[0] {
+            HlilStmt::Assign {
+                src:
+                    HlilExpr::FieldAccess {
+                        field_name, is_ptr, ..
+                    },
+                ..
+            } => {
+                assert_eq!(field_name, "field_10");
+                assert!(*is_ptr);
+            }
+            other => panic!("expected field access, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn single_small_offset_deref_is_not_a_struct_pointer() {
+        use crate::il::llil::BinOp;
+        // A lone `*(p + 4)` is an ordinary pointer deref, not a struct access.
+        let mut stmts = vec![HlilStmt::Assign {
+            dest: HlilExpr::Var("a".into()),
+            src: HlilExpr::Deref {
+                addr: Box::new(HlilExpr::BinOp {
+                    op: BinOp::Add,
+                    left: Box::new(HlilExpr::Var("p".into())),
+                    right: Box::new(HlilExpr::Const(4)),
+                }),
+                size: 4,
+            },
+        }];
+        let types = TypeManager::default();
+        fold_field_accesses(&mut stmts, None, &HashMap::new(), &types);
+        assert!(
+            matches!(
+                &stmts[0],
+                HlilStmt::Assign {
+                    src: HlilExpr::Deref { .. },
+                    ..
+                }
+            ),
+            "single small-offset deref must stay a deref"
+        );
+    }
 
     #[test]
     fn redundant_goto_to_next_label_is_removed() {
@@ -3934,7 +4175,7 @@ mod tests {
             size: 4,
         };
 
-        fold_field_accesses_expr(&mut expr, None, &inferred, &types);
+        fold_field_accesses_expr(&mut expr, None, &inferred, &types, &HashSet::new());
 
         assert!(
             matches!(&expr, HlilExpr::FieldAccess { field_name, is_ptr: true, .. } if field_name == "y"),
@@ -3963,7 +4204,7 @@ mod tests {
             size: 4,
         };
 
-        fold_field_accesses_expr(&mut expr, None, &inferred, &types);
+        fold_field_accesses_expr(&mut expr, None, &inferred, &types, &HashSet::new());
 
         // Should be rect_ptr->size.y
         if let HlilExpr::FieldAccess {
@@ -4014,7 +4255,7 @@ mod tests {
             size: 4,
         };
 
-        fold_field_accesses_expr(&mut expr, None, &inferred, &types);
+        fold_field_accesses_expr(&mut expr, None, &inferred, &types, &HashSet::new());
 
         assert!(
             matches!(&expr, HlilExpr::ArrayAccess { .. }),
@@ -4049,7 +4290,7 @@ mod tests {
             size: 8,
         };
 
-        fold_field_accesses_expr(&mut expr, None, &inferred, &types);
+        fold_field_accesses_expr(&mut expr, None, &inferred, &types, &HashSet::new());
 
         assert!(
             matches!(&expr, HlilExpr::ArrayAccess { .. }),
@@ -4080,7 +4321,7 @@ mod tests {
             size: 1,
         };
 
-        fold_field_accesses_expr(&mut expr, None, &inferred, &types);
+        fold_field_accesses_expr(&mut expr, None, &inferred, &types, &HashSet::new());
 
         assert!(
             matches!(&expr, HlilExpr::ArrayAccess { .. }),
@@ -4108,7 +4349,7 @@ mod tests {
             size: 4,
         };
 
-        fold_field_accesses_expr(&mut expr, None, &inferred, &types);
+        fold_field_accesses_expr(&mut expr, None, &inferred, &types, &HashSet::new());
 
         assert!(
             matches!(&expr, HlilExpr::FieldAccess { field_name, is_ptr: false, .. } if field_name == "y"),
