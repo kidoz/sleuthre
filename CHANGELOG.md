@@ -2,8 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- Evidence-based function naming: a function whose body is a single imported call (`jmp [IAT]`) is named after that import
+- Lightweight struct recovery in the decompiler: a variable dereferenced at multiple distinct offsets renders as `base->field_<offset>` instead of raw pointer arithmetic, even when no concrete struct type is known
+
 ### Changed
 
+- PE imports resolve to their real IAT slot address (the address call sites dereference), so import calls render as direct calls (`GetVersion()`) and import-call resolution works
+- Read-before-written registers are recovered as named parameters using the body's display name, so incoming values bind to the signature instead of appearing as uninitialized locals
 - Decompiler folds conditional branches back into relational expressions (`cmp a,b; jl` → `a < b`; `test eax,eax; je` → `eax == 0`) instead of leaking opaque `flag_*` pseudo-variables
 - Registers, parameters, and return values are typed by the target word size (`int32_t` on 32-bit x86) instead of always `int64_t`; a bare integer literal no longer forces `uint64_t`
 - LIFO stack simulation reconstructs stack operations: callee-saved save/restore boilerplate elided, `push x; pop reg` folds to `reg = x`, and stack-passed (cdecl/stdcall) call arguments render as `f(a, b, c)` instead of orphaned `push` statements
@@ -15,6 +22,7 @@
 
 ### Fixed
 
+- Decompiler eliminates gotos that target the immediately-following statement (`if (c) {..} else { goto L } L:` collapses), removing the dominant branch-structuring goto noise
 - MLIL dataflow soundness: uses with no known reaching definition carry a sentinel version, so dead-store elimination keeps branch-side assignments feeding a join and value propagation can no longer rewrite a use with a definition that follows it
 - Unlifted instructions survive as an `Unimplemented` dataflow barrier (rendered as a pseudocode comment) instead of being erased to `Nop`; remaining silent skips (zero-statement lifts, 1-operand `imul`, unknown ALU arities) are surfaced the same way
 - Dead-store elimination's return-register allowlist covers ARM32 (`r0`), MIPS (`v0`/`v1`), RISC-V (`a0`/`a1`), and ARM64 `w0`
