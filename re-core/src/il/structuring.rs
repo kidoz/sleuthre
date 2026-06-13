@@ -598,6 +598,89 @@ fn prune_unreachable_statements(stmts: &mut Vec<HlilStmt>) {
     *stmts = result;
 }
 
+/// Remove control-flow noise where a `goto` targets the statement that
+/// immediately follows it — the most common artifact of branch-based
+/// structuring. Two shapes are collapsed, recursively and at every nesting
+/// level:
+///
+/// - a bare `goto L;` directly before `L:` (the jump is a fall-through);
+/// - an `if (c) { ... } else { goto L }` directly before `L:` — the else
+///   branch is equivalent to no else, since control reaches `L` regardless.
+///
+/// A trailing `goto L` as the last statement of a `then`/`else` body is also
+/// dropped when `L` is the statement right after the enclosing `if`. This is
+/// purely cosmetic and order-preserving; `remove_unused_labels` then deletes
+/// any label left with no referent.
+fn eliminate_redundant_gotos(stmts: &mut Vec<HlilStmt>) {
+    // First recurse so inner bodies are simplified before we look across the
+    // boundary between a body's tail and the following label.
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            HlilStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                eliminate_redundant_gotos(then_body);
+                eliminate_redundant_gotos(else_body);
+            }
+            HlilStmt::While { body, .. }
+            | HlilStmt::DoWhile { body, .. }
+            | HlilStmt::For { body, .. } => eliminate_redundant_gotos(body),
+            HlilStmt::Block(inner) => eliminate_redundant_gotos(inner),
+            HlilStmt::Switch { cases, default, .. } => {
+                for (_, body) in cases.iter_mut() {
+                    eliminate_redundant_gotos(body);
+                }
+                eliminate_redundant_gotos(default);
+            }
+            _ => {}
+        }
+    }
+
+    // The label following statement `i` (skipping the goto we may drop) is the
+    // first `Label` reachable as the next statement.
+    let mut i = 0;
+    while i < stmts.len() {
+        let next_label = match stmts.get(i + 1) {
+            Some(HlilStmt::Label(addr)) => Some(*addr),
+            _ => None,
+        };
+
+        // Shape 1: bare `goto L;` right before `L:`.
+        if let HlilStmt::Goto(addr) = &stmts[i]
+            && next_label == Some(*addr)
+        {
+            stmts.remove(i);
+            continue;
+        }
+
+        // Shape 2: `if (...) {..} else { goto L }` right before `L:` — drop
+        // the else; and a trailing `goto L` at the end of either branch.
+        if let HlilStmt::If {
+            then_body,
+            else_body,
+            ..
+        } = &mut stmts[i]
+            && let Some(label) = next_label
+        {
+            drop_trailing_goto_to(then_body, label);
+            drop_trailing_goto_to(else_body, label);
+        }
+
+        i += 1;
+    }
+}
+
+/// Drop a `goto label` that is the last statement of `body`.
+fn drop_trailing_goto_to(body: &mut Vec<HlilStmt>, label: u64) {
+    if let Some(HlilStmt::Goto(addr)) = body.last()
+        && *addr == label
+    {
+        body.pop();
+    }
+}
+
 fn remove_unused_labels(stmts: &mut Vec<HlilStmt>) {
     // 1. Collect used labels
     let mut used = HashSet::new();
@@ -2348,8 +2431,10 @@ pub fn decompile(
     // Phase 2 (Roadmap): Combine nested if statements
     combine_nested_if_statements(&mut hlil_stmts);
 
-    // Drop statements made unreachable by a preceding return/goto/break/continue,
-    // then prune any labels that are no longer targeted.
+    // Collapse gotos that jump to the immediately-following label (the
+    // dominant goto-soup source: `if (c) {..} else { goto L } L: ..`), then
+    // drop unreachable statements and unused labels.
+    eliminate_redundant_gotos(&mut hlil_stmts);
     prune_unreachable_statements(&mut hlil_stmts);
     remove_unused_labels(&mut hlil_stmts);
 
@@ -2765,6 +2850,59 @@ impl HlilStmt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redundant_goto_to_next_label_is_removed() {
+        // `goto 0x10; label 0x10;` -> the goto is a fall-through, drop it.
+        let mut stmts = vec![
+            HlilStmt::Goto(0x10),
+            HlilStmt::Label(0x10),
+            HlilStmt::Return(None),
+        ];
+        eliminate_redundant_gotos(&mut stmts);
+        assert!(
+            !stmts.iter().any(|s| matches!(s, HlilStmt::Goto(_))),
+            "fall-through goto must be removed: {:?}",
+            stmts
+        );
+    }
+
+    #[test]
+    fn else_goto_to_next_label_is_dropped() {
+        // if (c) {..} else { goto L }  L:  ->  the else is redundant.
+        let mut stmts = vec![
+            HlilStmt::If {
+                cond: HlilExpr::Const(1),
+                then_body: vec![HlilStmt::Return(None)],
+                else_body: vec![HlilStmt::Goto(0x20)],
+            },
+            HlilStmt::Label(0x20),
+            HlilStmt::Return(None),
+        ];
+        eliminate_redundant_gotos(&mut stmts);
+        match &stmts[0] {
+            HlilStmt::If { else_body, .. } => {
+                assert!(else_body.is_empty(), "else-goto-to-next must be dropped");
+            }
+            other => panic!("expected If, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn goto_to_distant_label_is_preserved() {
+        // A goto that does NOT target the next statement is real control flow.
+        let mut stmts = vec![
+            HlilStmt::Goto(0x99),
+            HlilStmt::Label(0x10),
+            HlilStmt::Label(0x99),
+        ];
+        eliminate_redundant_gotos(&mut stmts);
+        assert!(
+            stmts.iter().any(|s| matches!(s, HlilStmt::Goto(0x99))),
+            "distant goto must be preserved"
+        );
+    }
+
     use crate::disasm::Instruction;
 
     #[test]
