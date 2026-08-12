@@ -36,6 +36,17 @@ UPDATE_GOLDEN=1 cargo test -p re-core --test golden_decompile
 This rewrites every golden file with the current output and passes. Review the
 resulting `git diff` before committing.
 
+## C compiler gate
+
+`golden_output_is_compilable_c` feeds the golden output (minus `field_access`,
+whose synthetic `base->field_<offset>` members stand in for an unrecovered
+struct type) to `cc -fsyntax-only`. It skips when no compiler is on `PATH`, so
+local runs stay usable, but CI sets `SLEUTHRE_REQUIRE_CC=1`, which turns a
+missing compiler into a hard failure. The same switch guards
+`il::hlil::tests::generated_c_is_compilable` and
+`analysis::recompile_diff::tests::recompile_roundtrips_real_c`, so none of the
+three compiler-backed gates can quietly stop running.
+
 ## Review policy
 
 **A golden diff in a pull request is a behavior change, not a chore.** These
