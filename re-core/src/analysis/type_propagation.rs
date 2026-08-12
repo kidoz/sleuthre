@@ -139,16 +139,18 @@ impl<'a> TypePropagator<'a> {
             else if let Some(sig) = types.function_signatures.get(&addr) {
                 info.signature = Some(sig.clone());
             }
-            // Priority 3: import name → type library lookup
+            // Priority 3: import name → type library lookup. Import names
+            // carry linker decoration (`_GetVersion@0`, `__imp_CreateFileW`),
+            // so match through the undecorated spellings too.
             else if let Some(import_name) = self.find_import_name(addr)
-                && let Some(lib_sig) = self.type_libs.resolve_function(&import_name)
+                && let Some(lib_sig) = self.type_libs.resolve_symbol(&import_name)
             {
                 info.signature = Some(lib_sig.clone());
             }
             // Priority 4: function name → type library lookup
             else if let Some(func) = self.functions.functions.get(&addr)
                 && !func.name.starts_with("sub_")
-                && let Some(lib_sig) = self.type_libs.resolve_function(&func.name)
+                && let Some(lib_sig) = self.type_libs.resolve_symbol(&func.name)
             {
                 info.signature = Some(lib_sig.clone());
             }
@@ -602,6 +604,37 @@ mod tests {
         let sig = result[&0x2000].signature.as_ref().unwrap();
         assert_eq!(sig.name, "printf");
         assert!(sig.is_variadic);
+    }
+
+    #[test]
+    fn seeds_decorated_import_names_from_the_type_library() {
+        // A PE-style stdcall-decorated import must still find its signature.
+        let mut functions = FunctionManager::default();
+        functions.add_function(Function {
+            name: "sub_2000".to_string(),
+            start_address: 0x2000,
+            end_address: Some(0x2010),
+            calling_convention: Default::default(),
+            stack_frame_size: 0,
+        });
+
+        let xrefs = XrefManager::new();
+        let mut type_libs = TypeLibraryManager::default();
+        type_libs.load_for_platform("windows_x86");
+
+        let imports = vec![Import {
+            name: "_VirtualAlloc@16".to_string(),
+            library: "KERNEL32.dll".to_string(),
+            address: 0x2000,
+        }];
+
+        let debug_info = DebugInfo::default();
+        let types = TypeManager::default();
+        let propagator = TypePropagator::new(&functions, &xrefs, &type_libs, &imports);
+        let result = propagator.propagate(&debug_info, &types);
+
+        let sig = result[&0x2000].signature.as_ref().unwrap();
+        assert_eq!(sig.name, "VirtualAlloc");
     }
 
     #[test]
