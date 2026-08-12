@@ -38,6 +38,14 @@ fn exercise(data: &[u8]) {
     // loader itself.
     let _ = re_core::debuginfo::extract_debug_info(data, re_core::arch::Architecture::X86_64);
 
+    // PDB extraction runs on any .pdb sitting next to an analyzed PE, so the
+    // MSF container parser is just as exposed to hostile bytes.
+    let _ = re_core::debuginfo::extract_pdb_from_bytes(
+        data,
+        re_core::arch::Architecture::X86_64,
+        0x40_0000,
+    );
+
     let images = re_core::formats::image::default_image_registry();
     for ext in ["x.bmp", "x.tga", "x.pcx"] {
         let _ = images.decode(data, ext);
@@ -55,13 +63,14 @@ fn parsers_never_panic_on_random_or_mutated_input() {
 
     // Real magic prefixes so mutation reaches deeper parser paths than pure
     // random noise usually would.
-    let seeds: [&[u8]; 6] = [
-        b"\x7fELF",                // ELF
-        b"MZ",                     // PE/DOS
-        &[0xCF, 0xFA, 0xED, 0xFE], // Mach-O 64-bit little-endian
-        b"BM",                     // BMP
+    let seeds: [&[u8]; 7] = [
+        b"\x7fELF",                                        // ELF
+        b"MZ",                                             // PE/DOS
+        &[0xCF, 0xFA, 0xED, 0xFE],                         // Mach-O 64-bit little-endian
+        b"BM",                                             // BMP
         &[0x0A, 0x05, 0x01, 0x08], // PCX (manufacturer/version/encoding/bpp)
         &[0x4C, 0x4F, 0x44, 0x00], // "LOD\0"
+        b"Microsoft C/C++ MSF 7.00\r\n\x1aDS\x00\x00\x00", // PDB (MSF container)
     ];
 
     for _ in 0..4000 {

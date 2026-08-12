@@ -41,17 +41,33 @@ pub fn extract_pdb_info(
     pdb_parser::extract_pdb_info(pdb_path, arch, image_base)
 }
 
+/// Extract debug info from in-memory PDB (MSF container) bytes. Same as
+/// [`extract_pdb_info`] without touching the filesystem — also the entry
+/// point the fuzz harness drives with arbitrary bytes.
+pub fn extract_pdb_from_bytes(
+    bytes: &[u8],
+    arch: crate::arch::Architecture,
+    image_base: u64,
+) -> crate::Result<DebugInfo> {
+    pdb_parser::extract_pdb_from_bytes(bytes, arch, image_base)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn extract_from_empty_returns_default() {
-        // Non-object data should return empty debug info, not crash
-        let result =
-            extract_debug_info(&[0x7f, 0x45, 0x4c, 0x46], crate::arch::Architecture::X86_64);
-        // May error on truncated ELF — that's fine
-        assert!(result.is_ok() || result.is_err());
+        // A bare ELF magic with no headers is not an object file — extraction
+        // must yield an empty result, never a panic.
+        let info = extract_debug_info(&[0x7f, 0x45, 0x4c, 0x46], crate::arch::Architecture::X86_64)
+            .expect("truncated ELF magic yields empty debug info");
+        assert!(info.function_signatures.is_empty());
+        assert!(info.types.is_empty());
+        assert!(info.global_variables.is_empty());
+        assert!(info.local_variables.is_empty());
+        assert!(info.source_lines.is_empty());
+        assert!(info.classes.is_empty());
     }
 
     #[test]
@@ -60,5 +76,12 @@ mod tests {
         let info = result.unwrap();
         assert!(info.function_signatures.is_empty());
         assert!(info.types.is_empty());
+    }
+
+    #[test]
+    fn extract_pdb_from_garbage_errors_cleanly() {
+        let result =
+            extract_pdb_from_bytes(b"not a pdb", crate::arch::Architecture::X86_64, 0x40_0000);
+        assert!(result.is_err());
     }
 }

@@ -24,15 +24,25 @@ const MAX_PDB_ENUM_VARIANTS: usize = 10_000;
 /// continuation chains in a crafted PDB).
 const MAX_FIELD_LIST_CHAIN: usize = 1_000;
 
-/// Extract debug info from a PDB file.
+/// Extract debug info from a PDB file on disk.
 pub fn extract_pdb_info(
     pdb_path: &Path,
     arch: crate::arch::Architecture,
     image_base: u64,
 ) -> crate::Result<DebugInfo> {
-    let file = std::fs::File::open(pdb_path).map_err(Error::Io)?;
+    let bytes = std::fs::read(pdb_path).map_err(Error::Io)?;
+    extract_pdb_from_bytes(&bytes, arch, image_base)
+}
+
+/// Extract debug info from in-memory PDB (MSF container) bytes.
+pub fn extract_pdb_from_bytes(
+    bytes: &[u8],
+    arch: crate::arch::Architecture,
+    image_base: u64,
+) -> crate::Result<DebugInfo> {
+    let cursor = std::io::Cursor::new(bytes);
     let mut pdb =
-        PDB::open(file).map_err(|e| Error::DebugInfo(format!("PDB open error: {}", e)))?;
+        PDB::open(cursor).map_err(|e| Error::DebugInfo(format!("PDB open error: {}", e)))?;
 
     // Maps section-relative symbol offsets to RVAs. Without it, symbol
     // addresses below would be wrong (raw `offset.offset` drops the section).
