@@ -170,6 +170,12 @@ impl Database {
                 count INTEGER NOT NULL,
                 PRIMARY KEY (address, label)
             );
+            CREATE TABLE IF NOT EXISTS struct_candidates (
+                function INTEGER NOT NULL,
+                base TEXT NOT NULL,
+                data TEXT NOT NULL,
+                PRIMARY KEY (function, base)
+            );
             CREATE TABLE IF NOT EXISTS classes (
                 name TEXT PRIMARY KEY,
                 base TEXT,
@@ -493,6 +499,7 @@ impl Database {
                  DELETE FROM decompilation_cache;
                  DELETE FROM tags;
                  DELETE FROM struct_overlays;
+                 DELETE FROM struct_candidates;
                  DELETE FROM classes;
                  DELETE FROM debug_profiles;",
             )
@@ -826,6 +833,45 @@ impl Database {
             overlays.push(row.map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?);
         }
         Ok(overlays)
+    }
+
+    // --- Struct-inference candidate persistence ---
+
+    pub fn save_struct_candidate(
+        &self,
+        cand: &crate::analysis::struct_inference::StructCandidate,
+    ) -> Result<()> {
+        let data = serde_json::to_string(cand)
+            .map_err(|e| Error::Database(format!("JSON error: {}", e)))?;
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO struct_candidates (function, base, data) \
+                 VALUES (?1, ?2, ?3)",
+                params![as_i64(cand.function), cand.base, data],
+            )
+            .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn load_struct_candidates(
+        &self,
+    ) -> Result<Vec<crate::analysis::struct_inference::StructCandidate>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT data FROM struct_candidates ORDER BY function, base")
+            .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
+
+        let mut candidates = Vec::new();
+        for row in rows {
+            let data = row.map_err(|e: rusqlite::Error| Error::Database(e.to_string()))?;
+            if let Ok(cand) = serde_json::from_str(&data) {
+                candidates.push(cand);
+            }
+        }
+        Ok(candidates)
     }
 
     // --- Debugger profile persistence ---
@@ -1209,6 +1255,44 @@ mod tests {
         assert_eq!(loaded[0].end_address, Some(0x401100));
         assert_eq!(loaded[0].calling_convention, CallingConvention::Win64);
         assert_eq!(loaded[0].stack_frame_size, 0x40);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn round_trip_struct_candidates() {
+        use crate::analysis::struct_inference::{
+            AccessKind, AccessSite, EvidenceStatus, FieldEvidence, StructCandidate,
+        };
+        let (db, path) = temp_db();
+        let cand = StructCandidate {
+            function: 0x401000,
+            function_name: "sub_401000".to_string(),
+            base: "rdi".to_string(),
+            fields: vec![FieldEvidence {
+                offset: 8,
+                size: 4,
+                accesses: vec![AccessSite {
+                    address: 0x401004,
+                    kind: AccessKind::Write,
+                    size: 4,
+                }],
+            }],
+            confidence: 0.7,
+            status: EvidenceStatus::Accepted,
+            accepted_type: Some("struct_401000_rdi".to_string()),
+        };
+        db.save_struct_candidate(&cand).unwrap();
+        let loaded = db.load_struct_candidates().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].function, 0x401000);
+        assert_eq!(loaded[0].base, "rdi");
+        assert_eq!(loaded[0].status, EvidenceStatus::Accepted);
+        assert_eq!(
+            loaded[0].accepted_type.as_deref(),
+            Some("struct_401000_rdi")
+        );
+        assert_eq!(loaded[0].fields[0].accesses[0].address, 0x401004);
+        assert_eq!(loaded[0].fields[0].accesses[0].kind, AccessKind::Write);
         let _ = std::fs::remove_file(path);
     }
 

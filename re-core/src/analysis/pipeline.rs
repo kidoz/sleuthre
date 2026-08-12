@@ -9,7 +9,6 @@ use crate::Result;
 use crate::analysis::passes::{
     HeuristicNamePass, ImportThunkNamePass, SignaturePass, SuspiciousNamePass,
 };
-use crate::analysis::struct_inference::StructInferencePass;
 use crate::analysis::type_propagation::{FunctionIl, TypePropagator};
 use crate::arch::Architecture;
 use crate::debuginfo;
@@ -453,7 +452,6 @@ fn analyze_loaded_with_bytes(
         pm.register_analysis_pass(Box::new(SuspiciousNamePass));
         pm.register_analysis_pass(Box::new(HeuristicNamePass));
         pm.register_analysis_pass(Box::new(ImportThunkNamePass::new(&project.imports)));
-        pm.register_analysis_pass(Box::new(StructInferencePass::new(project.arch)));
 
         let sig_db = match loaded.arch {
             Architecture::X86_64 => SignatureDatabase::builtin_x86_64(),
@@ -470,6 +468,23 @@ fn analyze_loaded_with_bytes(
                 &project.strings,
             )
             .unwrap_or_default();
+
+        // Struct-pointer inference runs outside the plugin manager so its full
+        // per-access evidence lands on the project (reviewable in the UI), not
+        // just prose findings. Prior review statuses are carried over.
+        let mut candidates = crate::analysis::struct_inference::infer_struct_candidates(
+            &project.memory_map,
+            &project.functions,
+            project.arch,
+        );
+        crate::analysis::struct_inference::merge_candidate_statuses(
+            &mut candidates,
+            &project.struct_candidates,
+        );
+        findings.extend(crate::analysis::struct_inference::findings_from_candidates(
+            &candidates,
+        ));
+        project.struct_candidates = candidates;
     }
 
     // --- Build xref counts ---
@@ -649,7 +664,6 @@ pub fn reanalyze_with_cancellation(
         pm.register_analysis_pass(Box::new(SuspiciousNamePass));
         pm.register_analysis_pass(Box::new(HeuristicNamePass));
         pm.register_analysis_pass(Box::new(ImportThunkNamePass::new(&project.imports)));
-        pm.register_analysis_pass(Box::new(StructInferencePass::new(project.arch)));
 
         let sig_db = match project.arch {
             Architecture::X86_64 => SignatureDatabase::builtin_x86_64(),
@@ -666,6 +680,22 @@ pub fn reanalyze_with_cancellation(
                 &project.strings,
             )
             .unwrap_or_default();
+
+        // Re-run struct-pointer inference with evidence, preserving the
+        // analyst's accept/reject decisions from the previous run.
+        let mut candidates = crate::analysis::struct_inference::infer_struct_candidates(
+            &project.memory_map,
+            &project.functions,
+            project.arch,
+        );
+        crate::analysis::struct_inference::merge_candidate_statuses(
+            &mut candidates,
+            &project.struct_candidates,
+        );
+        findings.extend(crate::analysis::struct_inference::findings_from_candidates(
+            &candidates,
+        ));
+        project.struct_candidates = candidates;
     }
 
     // Clear decompilation cache since analysis may have changed things

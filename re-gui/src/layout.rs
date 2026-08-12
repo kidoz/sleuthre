@@ -2308,6 +2308,43 @@ fn collab_event_to_undo(
             let tag = payload.get("tag").and_then(|v| v.as_str())?.to_string();
             Some(re_core::project::UndoCommand::RemoveTag { address, tag })
         }
+        "accept_struct_candidate" => {
+            let function = parse_addr("function")?;
+            let base = payload.get("base").and_then(|v| v.as_str())?;
+            let type_name = payload.get("type_name").and_then(|v| v.as_str())?;
+            // Rebuilt from this peer's own candidate evidence so both sides
+            // materialize the same state.
+            project.build_accept_struct_candidate(function, base, type_name)
+        }
+        "set_candidate_status" => {
+            let function = parse_addr("function")?;
+            let base = payload.get("base").and_then(|v| v.as_str())?;
+            let status = evidence_status_from_str(payload.get("status").and_then(|v| v.as_str())?)?;
+            project.build_set_candidate_status(function, base, status)
+        }
+        _ => None,
+    }
+}
+
+fn evidence_status_str(
+    status: re_core::analysis::struct_inference::EvidenceStatus,
+) -> &'static str {
+    use re_core::analysis::struct_inference::EvidenceStatus;
+    match status {
+        EvidenceStatus::Proposed => "proposed",
+        EvidenceStatus::Accepted => "accepted",
+        EvidenceStatus::Rejected => "rejected",
+    }
+}
+
+fn evidence_status_from_str(
+    s: &str,
+) -> Option<re_core::analysis::struct_inference::EvidenceStatus> {
+    use re_core::analysis::struct_inference::EvidenceStatus;
+    match s {
+        "proposed" => Some(EvidenceStatus::Proposed),
+        "accepted" => Some(EvidenceStatus::Accepted),
+        "rejected" => Some(EvidenceStatus::Rejected),
         _ => None,
     }
 }
@@ -2362,6 +2399,32 @@ fn undo_command_to_event(cmd: &re_core::project::UndoCommand) -> re_core::collab
         UndoCommand::RemoveTag { address, tag } => (
             "remove_tag",
             serde_json::json!({"address": format!("0x{:x}", address), "tag": tag}),
+        ),
+        UndoCommand::AcceptStructCandidate {
+            function,
+            base,
+            type_name,
+            ..
+        } => (
+            "accept_struct_candidate",
+            serde_json::json!({
+                "function": format!("0x{:x}", function),
+                "base": base,
+                "type_name": type_name,
+            }),
+        ),
+        UndoCommand::SetCandidateStatus {
+            function,
+            base,
+            new_status,
+            ..
+        } => (
+            "set_candidate_status",
+            serde_json::json!({
+                "function": format!("0x{:x}", function),
+                "base": base,
+                "status": evidence_status_str(*new_status),
+            }),
         ),
     };
     re_core::collab::CollabEvent {

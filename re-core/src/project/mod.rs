@@ -2,6 +2,7 @@ use crate::Result;
 use crate::analysis::constants::ConstantScanner;
 use crate::analysis::functions::FunctionManager;
 use crate::analysis::strings::StringsManager;
+use crate::analysis::struct_inference::{EvidenceStatus, StructCandidate};
 use crate::analysis::xrefs::XrefManager;
 use crate::arch::Architecture;
 use crate::db::Database;
@@ -69,6 +70,27 @@ pub enum UndoCommand {
         address: u64,
         tag: String,
     },
+    /// Accept a struct-inference candidate: mark it accepted and materialize
+    /// the struct type built from its evidence (unless a type with that name
+    /// already existed — then `materialized` is `None` and undo keeps it).
+    /// When the candidate's base register is an ABI argument register with a
+    /// known signature parameter, that parameter is retyped to point at the
+    /// struct; `param_retype` holds the parameter index and its old type.
+    AcceptStructCandidate {
+        function: u64,
+        base: String,
+        type_name: String,
+        old_status: EvidenceStatus,
+        materialized: Option<crate::types::CompoundType>,
+        param_retype: Option<(usize, crate::types::TypeRef)>,
+    },
+    /// Change a struct-inference candidate's review status (reject / reset).
+    SetCandidateStatus {
+        function: u64,
+        base: String,
+        old_status: EvidenceStatus,
+        new_status: EvidenceStatus,
+    },
 }
 
 pub struct Project {
@@ -104,6 +126,9 @@ pub struct Project {
     pub image_base: u64,
     pub struct_overlays: Vec<StructOverlay>,
     pub debug_profiles: Vec<DebugProfile>,
+    /// Struct-pointer inference evidence, reviewable in the UI. Statuses
+    /// survive re-analysis (merged by function + base register) and saves.
+    pub struct_candidates: Vec<StructCandidate>,
 }
 
 /// Tracks which functions a cached decompilation depends on so a single edit
@@ -273,14 +298,17 @@ impl Project {
             image_base: 0,
             struct_overlays: Vec::new(),
             debug_profiles: Vec::new(),
+            struct_candidates: Vec::new(),
         }
     }
 
     /// Execute a command and push it onto the undo stack, clearing redo.
-    pub fn execute(&mut self, cmd: UndoCommand) {
-        self.apply_command(&cmd, false);
+    /// Returns a description for the output log.
+    pub fn execute(&mut self, cmd: UndoCommand) -> String {
+        let desc = self.apply_command(&cmd, false);
         self.undo_stack.push(cmd);
         self.redo_stack.clear();
+        desc
     }
 
     /// Undo the most recent command. Returns a description for the output log.
@@ -445,7 +473,192 @@ impl Project {
                     format!("Removed tag '{}' at {:08X}", tag, address)
                 }
             }
+            UndoCommand::AcceptStructCandidate {
+                function,
+                base,
+                type_name,
+                old_status,
+                materialized,
+                param_retype,
+            } => {
+                if let Some(c) = self
+                    .struct_candidates
+                    .iter_mut()
+                    .find(|c| c.function == *function && c.base == *base)
+                {
+                    if undo {
+                        c.status = *old_status;
+                        c.accepted_type = None;
+                    } else {
+                        c.status = EvidenceStatus::Accepted;
+                        c.accepted_type = Some(type_name.clone());
+                    }
+                }
+                if let Some(ty) = materialized {
+                    if undo {
+                        self.types.types.remove(type_name);
+                    } else {
+                        self.types.add_type(ty.clone());
+                    }
+                }
+                if let Some((idx, old_type)) = param_retype
+                    && let Some(sig) = self.types.function_signatures.get_mut(function)
+                    && let Some(param) = sig.parameters.get_mut(*idx)
+                {
+                    param.type_ref = if undo {
+                        old_type.clone()
+                    } else {
+                        crate::types::TypeRef::Pointer(Box::new(crate::types::TypeRef::Named(
+                            type_name.clone(),
+                        )))
+                    };
+                }
+                let mut to_invalidate = self.cache_deps.dependents_of_type(type_name);
+                to_invalidate.insert(*function);
+                for addr in to_invalidate {
+                    self.decompilation_cache.remove(&addr);
+                    self.cache_deps.forget(addr);
+                }
+                if undo {
+                    format!(
+                        "Undo accept struct candidate '{}' at {:08X}",
+                        base, function
+                    )
+                } else {
+                    format!(
+                        "Accepted struct candidate '{}' at {:08X} as {}",
+                        base, function, type_name
+                    )
+                }
+            }
+            UndoCommand::SetCandidateStatus {
+                function,
+                base,
+                old_status,
+                new_status,
+            } => {
+                let status = if undo { old_status } else { new_status };
+                if let Some(c) = self
+                    .struct_candidates
+                    .iter_mut()
+                    .find(|c| c.function == *function && c.base == *base)
+                {
+                    c.status = *status;
+                }
+                self.decompilation_cache.remove(function);
+                self.cache_deps.forget(*function);
+                let verb = match status {
+                    EvidenceStatus::Proposed => "Reset",
+                    EvidenceStatus::Accepted => "Accepted",
+                    EvidenceStatus::Rejected => "Rejected",
+                };
+                format!("{} struct candidate '{}' at {:08X}", verb, base, function)
+            }
         }
+    }
+
+    /// Build the command that accepts a struct-inference candidate, capturing
+    /// everything undo needs (whether the type is newly materialized, and the
+    /// old parameter type when the base register maps to a signature
+    /// parameter). Returns `None` for an unknown or already-accepted
+    /// candidate. Shared by the UI and by collab event replication so both
+    /// sides compute the same state from their own project.
+    pub fn build_accept_struct_candidate(
+        &self,
+        function: u64,
+        base: &str,
+        type_name: &str,
+    ) -> Option<UndoCommand> {
+        let cand = self
+            .struct_candidates
+            .iter()
+            .find(|c| c.function == function && c.base == base)?;
+        if cand.status == EvidenceStatus::Accepted {
+            return None;
+        }
+        let materialized = if self.types.get_type(type_name).is_none() {
+            Some(cand.materialize_type(type_name))
+        } else {
+            None
+        };
+        let param_retype = self.candidate_param_index(function, base).and_then(|idx| {
+            self.types
+                .function_signatures
+                .get(&function)
+                .and_then(|sig| sig.parameters.get(idx))
+                .map(|p| (idx, p.type_ref.clone()))
+        });
+        Some(UndoCommand::AcceptStructCandidate {
+            function,
+            base: base.to_string(),
+            type_name: type_name.to_string(),
+            old_status: cand.status,
+            materialized,
+            param_retype,
+        })
+    }
+
+    /// Accept a struct-inference candidate (undoable). Returns the log
+    /// description, or `None` if the candidate is unknown or already accepted.
+    pub fn accept_struct_candidate(
+        &mut self,
+        function: u64,
+        base: &str,
+        type_name: &str,
+    ) -> Option<String> {
+        let cmd = self.build_accept_struct_candidate(function, base, type_name)?;
+        Some(self.execute(cmd))
+    }
+
+    /// Build the command that sets a candidate's review status. `None` when
+    /// the candidate is unknown or already has that status.
+    pub fn build_set_candidate_status(
+        &self,
+        function: u64,
+        base: &str,
+        new_status: EvidenceStatus,
+    ) -> Option<UndoCommand> {
+        let cand = self
+            .struct_candidates
+            .iter()
+            .find(|c| c.function == function && c.base == base)?;
+        if cand.status == new_status {
+            return None;
+        }
+        Some(UndoCommand::SetCandidateStatus {
+            function,
+            base: base.to_string(),
+            old_status: cand.status,
+            new_status,
+        })
+    }
+
+    /// Set a candidate's review status (undoable). Returns the log
+    /// description, or `None` if nothing changed.
+    pub fn set_struct_candidate_status(
+        &mut self,
+        function: u64,
+        base: &str,
+        new_status: EvidenceStatus,
+    ) -> Option<String> {
+        let cmd = self.build_set_candidate_status(function, base, new_status)?;
+        Some(self.execute(cmd))
+    }
+
+    /// Map a candidate's base register to the function's ABI argument-register
+    /// position, if it has one under the detected calling convention.
+    fn candidate_param_index(&self, function: u64, base: &str) -> Option<usize> {
+        let cc = self
+            .functions
+            .functions
+            .get(&function)
+            .map(|f| f.calling_convention)
+            .unwrap_or_default();
+        let abi = crate::analysis::abi::abi_registers(self.arch, cc, self.binary_format)?;
+        let canon = crate::il::mlil::canonical_register(base);
+        abi.arg_regs
+            .iter()
+            .position(|r| crate::il::mlil::canonical_register(r) == canon)
     }
 
     /// Get all unique tags used across the project.
@@ -596,6 +809,11 @@ impl Project {
                 db.save_struct_overlay(overlay)?;
             }
 
+            // Persist struct-inference candidates (evidence + review status)
+            for cand in &self.struct_candidates {
+                db.save_struct_candidate(cand)?;
+            }
+
             // Persist class metadata (vtable address + base class).
             for (name, info) in &self.types.classes {
                 db.save_class(name, info)?;
@@ -720,6 +938,9 @@ impl Project {
 
         // Restore struct overlays
         project.struct_overlays = db.load_struct_overlays()?;
+
+        // Restore struct-inference candidates
+        project.struct_candidates = db.load_struct_candidates()?;
 
         // Restore class metadata.
         project.types.classes = db.load_classes()?;
@@ -1202,6 +1423,141 @@ mod tests {
 
         p.redo();
         assert_eq!(p.functions.functions[&0x1000].name, "main");
+    }
+
+    fn candidate_fixture() -> StructCandidate {
+        use crate::analysis::struct_inference::{AccessKind, AccessSite, FieldEvidence};
+        StructCandidate {
+            function: 0x1000,
+            function_name: "sub_1000".into(),
+            base: "rdi".into(),
+            fields: vec![
+                FieldEvidence {
+                    offset: 8,
+                    size: 8,
+                    accesses: vec![AccessSite {
+                        address: 0x1002,
+                        kind: AccessKind::Read,
+                        size: 8,
+                    }],
+                },
+                FieldEvidence {
+                    offset: 0x10,
+                    size: 4,
+                    accesses: vec![AccessSite {
+                        address: 0x1006,
+                        kind: AccessKind::Write,
+                        size: 4,
+                    }],
+                },
+            ],
+            confidence: 0.7,
+            status: EvidenceStatus::Proposed,
+            accepted_type: None,
+        }
+    }
+
+    #[test]
+    fn accept_struct_candidate_materializes_type_and_retypes_param() {
+        use crate::types::{
+            FunctionParameter, FunctionSignature, PrimitiveType, SignatureSource, TypeRef,
+        };
+        let mut p = test_project();
+        p.struct_candidates.push(candidate_fixture());
+        p.types.function_signatures.insert(
+            0x1000,
+            FunctionSignature {
+                name: "sub_1000".into(),
+                return_type: TypeRef::Primitive(PrimitiveType::I64),
+                parameters: vec![FunctionParameter {
+                    name: "a".into(),
+                    type_ref: TypeRef::Primitive(PrimitiveType::I64),
+                }],
+                calling_convention: String::new(),
+                is_variadic: false,
+                source: SignatureSource::Manual,
+            },
+        );
+
+        // x86_64 + unknown cc + Raw format resolves to SysV: rdi is arg 0.
+        let desc = p
+            .accept_struct_candidate(0x1000, "rdi", "struct_test")
+            .unwrap();
+        assert!(desc.contains("struct_test"));
+
+        let ty = p.types.get_type("struct_test").expect("type materialized");
+        let crate::types::CompoundType::Struct { fields, .. } = ty else {
+            panic!("expected struct");
+        };
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name, "field_8");
+        let sig = &p.types.function_signatures[&0x1000];
+        assert_eq!(
+            sig.parameters[0].type_ref,
+            TypeRef::Pointer(Box::new(TypeRef::Named("struct_test".into())))
+        );
+        assert_eq!(p.struct_candidates[0].status, EvidenceStatus::Accepted);
+        assert_eq!(
+            p.struct_candidates[0].accepted_type.as_deref(),
+            Some("struct_test")
+        );
+        // Accepting again is a no-op.
+        assert!(
+            p.accept_struct_candidate(0x1000, "rdi", "struct_test")
+                .is_none()
+        );
+
+        p.undo();
+        assert!(p.types.get_type("struct_test").is_none());
+        assert_eq!(
+            p.types.function_signatures[&0x1000].parameters[0].type_ref,
+            TypeRef::Primitive(PrimitiveType::I64)
+        );
+        assert_eq!(p.struct_candidates[0].status, EvidenceStatus::Proposed);
+        assert_eq!(p.struct_candidates[0].accepted_type, None);
+
+        p.redo();
+        assert!(p.types.get_type("struct_test").is_some());
+        assert_eq!(p.struct_candidates[0].status, EvidenceStatus::Accepted);
+    }
+
+    #[test]
+    fn reject_struct_candidate_is_undoable() {
+        let mut p = test_project();
+        p.struct_candidates.push(candidate_fixture());
+
+        let desc = p
+            .set_struct_candidate_status(0x1000, "rdi", EvidenceStatus::Rejected)
+            .unwrap();
+        assert!(desc.contains("Rejected"));
+        assert_eq!(p.struct_candidates[0].status, EvidenceStatus::Rejected);
+        // Same status again is a no-op.
+        assert!(
+            p.set_struct_candidate_status(0x1000, "rdi", EvidenceStatus::Rejected)
+                .is_none()
+        );
+
+        p.undo();
+        assert_eq!(p.struct_candidates[0].status, EvidenceStatus::Proposed);
+    }
+
+    #[test]
+    fn accept_does_not_clobber_existing_type_on_undo() {
+        use crate::types::CompoundType;
+        let mut p = test_project();
+        p.struct_candidates.push(candidate_fixture());
+        // A type with the target name already exists (user-defined).
+        p.types.add_type(CompoundType::Struct {
+            name: "struct_test".into(),
+            fields: Vec::new(),
+            size: 4,
+        });
+
+        p.accept_struct_candidate(0x1000, "rdi", "struct_test")
+            .unwrap();
+        p.undo();
+        // The pre-existing type must survive the undo.
+        assert!(p.types.get_type("struct_test").is_some());
     }
 
     #[test]

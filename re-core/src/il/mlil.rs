@@ -141,7 +141,7 @@ pub struct MlilFunction {
 /// naming is unchanged. `sp` and `ip` are deliberately NOT mapped — as
 /// operand text those names are ARM's stack pointer and r12, not the 16-bit
 /// x86 aliases.
-fn canonical_register(name: &str) -> String {
+pub(crate) fn canonical_register(name: &str) -> String {
     // ARM64: w-registers are the 32-bit views of the x-registers.
     if let Some(num) = name.strip_prefix('w')
         && !num.is_empty()
