@@ -162,7 +162,7 @@ fn analyze_function_signature(
     arch: crate::arch::Architecture,
     _symbols: &HashMap<u64, String>,
     type_info: Option<&FunctionTypeInfo>,
-    _types: &TypeManager,
+    types: &TypeManager,
     cc: CallingConvention,
 ) -> (DecompileInfo, HashMap<(StackBase, i64), StackVariable>) {
     let mut params = detect_parameters(mlil, arch, cc);
@@ -197,12 +197,34 @@ fn analyze_function_signature(
         }
     }
 
-    let stack_vars = recover_locals(instructions, arch);
+    let mut stack_vars = recover_locals(instructions, arch);
 
-    let locals: Vec<(String, String)> = stack_vars
+    // Debug info, when present, is authoritative over the heuristic scan: an
+    // imported local replaces the synthetic `var_<offset>` name and type at
+    // the same stack slot, so pseudocode reads with the original source names.
+    let func_addr = instructions.first().map(|i| i.address).unwrap_or(0);
+    let debug_locals = types.local_variables.get(&func_addr);
+    let mut local_types: Vec<(String, String)> = Vec::new();
+    if let Some(vars) = debug_locals {
+        apply_debug_locals(&mut stack_vars, vars, &mut required_types);
+        // Register- and address-located debug locals have no stack slot to
+        // attach to, but still belong in the declaration list.
+        for v in vars {
+            if !matches!(v.location, crate::types::VariableLocation::Stack(_)) {
+                collect_required_types(&v.type_ref, &mut required_types);
+                local_types.push((v.type_ref.display_name(), v.name.clone()));
+            }
+        }
+    }
+
+    let mut locals: Vec<(String, String)> = stack_vars
         .iter()
-        .map(|v| (format!("{}", v.type_hint), v.name.clone()))
+        .map(|v| match &v.debug_type {
+            Some(ty) => (ty.clone(), v.name.clone()),
+            None => (format!("{}", v.type_hint), v.name.clone()),
+        })
         .collect();
+    locals.extend(local_types);
 
     let mut stack_map = HashMap::new();
     for var in &stack_vars {
@@ -219,6 +241,38 @@ fn analyze_function_signature(
         },
         stack_map,
     )
+}
+
+/// Overlay debug-info locals onto heuristically recovered stack slots.
+///
+/// Matching is by stack offset. DWARF `DW_OP_fbreg` offsets and PDB
+/// `S_REGREL32` offsets are frame-base relative, which may or may not be the
+/// same base register the disassembly scan saw, so an exact `(base, offset)`
+/// hit wins and an unambiguous offset (recorded under exactly one base) is
+/// accepted as a fallback — the same rule [`lookup_stack_slot`] uses when
+/// lifting. Ambiguous offsets are left to the heuristic name.
+fn apply_debug_locals(
+    stack_vars: &mut [StackVariable],
+    debug_locals: &[crate::types::VariableInfo],
+    required_types: &mut BTreeSet<String>,
+) {
+    for var in debug_locals {
+        let crate::types::VariableLocation::Stack(offset) = var.location else {
+            continue;
+        };
+        let matches: Vec<usize> = stack_vars
+            .iter()
+            .enumerate()
+            .filter(|(_, sv)| sv.offset == offset)
+            .map(|(i, _)| i)
+            .collect();
+        let [idx] = matches[..] else {
+            continue; // no slot, or an ambiguous one — keep the recovered name
+        };
+        stack_vars[idx].name = var.name.clone();
+        stack_vars[idx].debug_type = Some(var.type_ref.display_name());
+        collect_required_types(&var.type_ref, required_types);
+    }
 }
 
 fn collect_required_types(ty: &TypeRef, required: &mut BTreeSet<String>) {
@@ -3634,6 +3688,124 @@ mod tests {
     }
 
     #[test]
+    fn imported_debug_locals_rename_and_retype_stack_slots() {
+        use crate::types::{PrimitiveType, VariableInfo, VariableLocation};
+        // `mov dword ptr [rbp - 8], eax` recovers a slot the heuristic names
+        // `var_8` and types `int32_t`. A DWARF/PDB local at the same offset
+        // must replace both.
+        let insns = vec![
+            make_insn(0x1000, "push", "rbp"),
+            make_insn(0x1001, "mov", "rbp, rsp"),
+            make_insn(0x1004, "mov", "dword ptr [rbp - 8], eax"),
+            make_insn(0x1007, "pop", "rbp"),
+            make_insn(0x1008, "ret", ""),
+        ];
+
+        let mut types = TypeManager::default();
+        types.local_variables.insert(
+            0x1000,
+            vec![VariableInfo {
+                name: "retry_count".to_string(),
+                type_ref: TypeRef::Primitive(PrimitiveType::U16),
+                location: VariableLocation::Stack(-8),
+            }],
+        );
+
+        let code = decompile(
+            "f",
+            &insns,
+            crate::arch::Architecture::X86_64,
+            &HashMap::new(),
+            None,
+            &types,
+            &crate::memory::MemoryMap::default(),
+            &HashMap::new(),
+        );
+        assert!(
+            code.text.contains("uint16_t retry_count"),
+            "debug-info local name/type missing: {}",
+            code.text
+        );
+        assert!(
+            !code.text.contains("var_8"),
+            "heuristic name survived the debug-info local: {}",
+            code.text
+        );
+    }
+
+    #[test]
+    fn debug_locals_without_a_matching_slot_are_still_declared() {
+        use crate::types::{PrimitiveType, VariableInfo, VariableLocation};
+        // A register-located debug local has no stack slot to overlay, but it
+        // is still part of the function's recovered locals.
+        let insns = vec![
+            make_insn(0x1000, "xor", "eax, eax"),
+            make_insn(0x1002, "ret", ""),
+        ];
+        let mut types = TypeManager::default();
+        types.local_variables.insert(
+            0x1000,
+            vec![VariableInfo {
+                name: "cursor".to_string(),
+                type_ref: TypeRef::Pointer(Box::new(TypeRef::Primitive(PrimitiveType::Char))),
+                location: VariableLocation::Register("rbx".to_string()),
+            }],
+        );
+
+        let code = decompile(
+            "f",
+            &insns,
+            crate::arch::Architecture::X86_64,
+            &HashMap::new(),
+            None,
+            &types,
+            &crate::memory::MemoryMap::default(),
+            &HashMap::new(),
+        );
+        assert!(
+            code.text.contains("char* cursor"),
+            "register-located debug local not declared: {}",
+            code.text
+        );
+    }
+
+    #[test]
+    fn debug_locals_do_not_apply_to_other_functions() {
+        use crate::types::{PrimitiveType, VariableInfo, VariableLocation};
+        // Locals are keyed by function entry; a different function's entry
+        // must not pick them up.
+        let insns = vec![
+            make_insn(0x2000, "push", "rbp"),
+            make_insn(0x2001, "mov", "rbp, rsp"),
+            make_insn(0x2004, "mov", "dword ptr [rbp - 8], eax"),
+            make_insn(0x2007, "pop", "rbp"),
+            make_insn(0x2008, "ret", ""),
+        ];
+        let mut types = TypeManager::default();
+        types.local_variables.insert(
+            0x1000,
+            vec![VariableInfo {
+                name: "retry_count".to_string(),
+                type_ref: TypeRef::Primitive(PrimitiveType::U16),
+                location: VariableLocation::Stack(-8),
+            }],
+        );
+
+        let code = decompile(
+            "f",
+            &insns,
+            crate::arch::Architecture::X86_64,
+            &HashMap::new(),
+            None,
+            &types,
+            &crate::memory::MemoryMap::default(),
+            &HashMap::new(),
+        );
+        assert!(!code.text.contains("retry_count"), "leaked: {}", code.text);
+        assert!(code.text.contains("var_8"), "expected heuristic name");
+    }
+
+    #[test]
     fn decompile_simple_function() {
         let insns = vec![
             make_insn(0x1000, "push", "rbp"),
@@ -3697,6 +3869,7 @@ mod tests {
             name: name.to_string(),
             type_hint: crate::analysis::stack::StackVarType::Int32,
             base,
+            debug_type: None,
         }
     }
 

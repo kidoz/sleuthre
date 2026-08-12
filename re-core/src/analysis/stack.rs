@@ -17,6 +17,10 @@ pub struct StackVariable {
     /// Register class the slot is addressed from.
     #[serde(default)]
     pub base: StackBase,
+    /// C type spelling imported from debug info, when this slot was matched to
+    /// a DWARF/PDB local. Overrides the heuristic `type_hint` in declarations.
+    #[serde(default)]
+    pub debug_type: Option<String>,
 }
 
 /// The register class a stack slot is addressed from.
@@ -178,6 +182,7 @@ fn extract_frame_accesses(
                     name: String::new(),
                     type_hint: StackVarType::from_access_size(size),
                     base,
+                    debug_type: None,
                 });
                 if (size as u64) > entry.size {
                     entry.size = size as u64;
@@ -194,6 +199,7 @@ fn extract_frame_accesses(
                     name: String::new(),
                     type_hint: StackVarType::from_access_size(size),
                     base,
+                    debug_type: None,
                 });
             }
         }
@@ -226,6 +232,7 @@ fn extract_stack_accesses(
                     name: String::new(),
                     type_hint: StackVarType::from_access_size(size),
                     base,
+                    debug_type: None,
                 });
             }
         }
@@ -282,6 +289,7 @@ fn extract_arm_frame_accesses(
                 name: String::new(),
                 type_hint: StackVarType::from_access_size(size as u8),
                 base,
+                debug_type: None,
             });
 
             // Handle Pair Load/Store (ldp/stp) - implies second variable at offset + size
@@ -293,6 +301,7 @@ fn extract_arm_frame_accesses(
                     name: String::new(),
                     type_hint: StackVarType::from_access_size(size as u8),
                     base,
+                    debug_type: None,
                 });
             }
         }
