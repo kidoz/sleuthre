@@ -937,6 +937,31 @@ fn lift_stack_refs(stmts: &mut [HlilStmt], stack_map: &HashMap<(StackBase, i64),
     }
 }
 
+/// Look up the variable for a `(base, offset)` slot referenced by the HLIL.
+///
+/// Recovery classifies slots from the disassembly text (`[ebp-0xc]` is
+/// frame-pointer-relative), but MLIL's stack simulation can rewrite the same
+/// access to be stack-pointer-relative, so the base kinds disagree even though
+/// the offset matches. When the offset is unambiguous — recorded under exactly
+/// one base — fall back to that variable rather than leaving the access as raw
+/// pointer arithmetic. A genuine collision (both bases carrying the same
+/// offset) keeps the slots distinct.
+fn lookup_stack_slot(
+    stack_map: &HashMap<(StackBase, i64), StackVariable>,
+    slot: (StackBase, i64),
+) -> Option<&StackVariable> {
+    if let Some(var) = stack_map.get(&slot) {
+        return Some(var);
+    }
+    let (_, offset) = slot;
+    let mut matches = stack_map
+        .iter()
+        .filter(|((_, off), _)| *off == offset)
+        .map(|(_, var)| var);
+    let only = matches.next()?;
+    matches.next().is_none().then_some(only)
+}
+
 fn lift_stack_refs_in_stmt(
     stmt: &mut HlilStmt,
     stack_map: &HashMap<(StackBase, i64), StackVariable>,
@@ -964,7 +989,7 @@ fn lift_stack_refs_in_stmt(
 
             // Fallback: check raw offset (unlikely if expr lifting worked, but for completeness)
             if let Some(slot) = extract_stack_offset(addr)
-                && let Some(var) = stack_map.get(&slot)
+                && let Some(var) = lookup_stack_slot(stack_map, slot)
             {
                 *stmt = HlilStmt::Assign {
                     dest: HlilExpr::Var(var.name.clone()),
@@ -1037,7 +1062,7 @@ fn lift_stack_refs_in_expr(
     // If matches `Deref(addr, size)`:
     if let HlilExpr::Deref { addr, .. } = expr
         && let Some(slot) = extract_stack_offset(addr)
-        && let Some(var) = stack_map.get(&slot)
+        && let Some(var) = lookup_stack_slot(stack_map, slot)
     {
         // Replace `*(sp + off)` with `var`
         *expr = HlilExpr::Var(var.name.clone());
@@ -1048,7 +1073,7 @@ fn lift_stack_refs_in_expr(
     // We can replace it with `AddrOf(Var)`?
     // HlilExpr has AddrOf.
     if let Some(slot) = extract_stack_offset(expr)
-        && let Some(var) = stack_map.get(&slot)
+        && let Some(var) = lookup_stack_slot(stack_map, slot)
     {
         *expr = HlilExpr::AddrOf(Box::new(HlilExpr::Var(var.name.clone())));
         return;
@@ -3660,6 +3685,81 @@ mod tests {
         );
         // Raw-address calls emit through a function-pointer cast to parse as C.
         assert!(code.text.contains("((void (*)(void))0x2000)()"));
+    }
+
+    fn stack_var(offset: i64, name: &str, base: StackBase) -> StackVariable {
+        StackVariable {
+            offset,
+            size: 4,
+            name: name.to_string(),
+            type_hint: crate::analysis::stack::StackVarType::Int32,
+            base,
+        }
+    }
+
+    /// `*(sp + offset)` as the decompiler renders a stack access.
+    fn sp_deref(offset: i64) -> HlilExpr {
+        use crate::il::llil::BinOp;
+        HlilExpr::Deref {
+            addr: Box::new(HlilExpr::BinOp {
+                op: if offset < 0 { BinOp::Sub } else { BinOp::Add },
+                left: Box::new(HlilExpr::Var("sp".into())),
+                right: Box::new(HlilExpr::Const(offset.unsigned_abs())),
+            }),
+            size: 4,
+        }
+    }
+
+    #[test]
+    fn stack_slot_lifts_when_only_the_base_kind_disagrees() {
+        // Recovery sees `[ebp-0xc]` (frame-pointer relative) but MLIL's stack
+        // simulation renders the same access as `sp - 0xc`. The offset is
+        // unambiguous, so it must still lift to the named local rather than
+        // leaking raw pointer arithmetic into the output.
+        let mut stack_map = HashMap::new();
+        stack_map.insert(
+            (StackBase::FramePointer, -0xc),
+            stack_var(-0xc, "var_c", StackBase::FramePointer),
+        );
+
+        let mut stmts = vec![HlilStmt::Assign {
+            dest: HlilExpr::Var("a".into()),
+            src: sp_deref(-0xc),
+        }];
+        lift_stack_refs(&mut stmts, &stack_map);
+        assert!(
+            matches!(&stmts[0], HlilStmt::Assign { src: HlilExpr::Var(n), .. } if n == "var_c"),
+            "unlifted stack access: {:?}",
+            stmts[0]
+        );
+    }
+
+    #[test]
+    fn colliding_offsets_under_two_bases_stay_distinct() {
+        // When both bases record the same offset the fallback must not guess:
+        // an exact base match still wins, and no cross-base substitution
+        // happens.
+        let mut stack_map = HashMap::new();
+        stack_map.insert(
+            (StackBase::FramePointer, -0x10),
+            stack_var(-0x10, "var_10", StackBase::FramePointer),
+        );
+        stack_map.insert(
+            (StackBase::StackPointer, -0x10),
+            stack_var(-0x10, "var_s10", StackBase::StackPointer),
+        );
+
+        let mut stmts = vec![HlilStmt::Assign {
+            dest: HlilExpr::Var("a".into()),
+            src: sp_deref(-0x10),
+        }];
+        lift_stack_refs(&mut stmts, &stack_map);
+        // `sp` maps to StackPointer, so the exact match must be chosen.
+        assert!(
+            matches!(&stmts[0], HlilStmt::Assign { src: HlilExpr::Var(n), .. } if n == "var_s10"),
+            "wrong slot chosen: {:?}",
+            stmts[0]
+        );
     }
 
     #[test]
