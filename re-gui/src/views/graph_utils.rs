@@ -266,14 +266,14 @@ impl GenericGraph {
             }
 
             // Sort outgoing by target center-x, incoming by source center-x
-            for (_, targets) in outgoing.iter_mut() {
+            for targets in outgoing.values_mut() {
                 targets.sort_by(|a, b| {
                     let ax = node_rects[&a.0].center().x;
                     let bx = node_rects[&b.0].center().x;
                     ax.partial_cmp(&bx).unwrap_or(std::cmp::Ordering::Equal)
                 });
             }
-            for (_, sources) in incoming.iter_mut() {
+            for sources in incoming.values_mut() {
                 sources.sort_by(|a, b| {
                     let ax = node_rects[&a.0].center().x;
                     let bx = node_rects[&b.0].center().x;
@@ -526,7 +526,7 @@ impl GenericGraph {
                 painter.rect_stroke(
                     minimap_rect,
                     4.0,
-                    egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 80, 80)),
+                    egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(80, 80, 80)),
                     egui::StrokeKind::Outside,
                 );
 

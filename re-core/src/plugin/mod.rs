@@ -260,7 +260,7 @@ impl PluginManager {
 impl Drop for PluginManager {
     fn drop(&mut self) {
         // Best-effort: call on_unload for every plugin still registered.
-        for (_name, plugin) in self.plugins.iter_mut() {
+        for plugin in self.plugins.values_mut() {
             let _ = plugin.on_unload();
         }
     }

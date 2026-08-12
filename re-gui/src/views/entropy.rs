@@ -86,7 +86,7 @@ impl SleuthreApp {
                 egui::pos2(rect.left(), rect.bottom()),
                 egui::pos2(rect.right(), rect.bottom()),
             ],
-            egui::Stroke::new(1.0, egui::Color32::GRAY),
+            egui::Stroke::new(1.0_f32, egui::Color32::GRAY),
         );
 
         // Hover tooltip — collect data before any mutable borrow
