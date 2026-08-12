@@ -5,7 +5,7 @@
 //! - back edges → while/do-while loops
 //! - Linear sequences → blocks
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::analysis::abi::abi_registers;
 use crate::analysis::functions::CallingConvention;
@@ -26,10 +26,13 @@ pub struct DecompileInfo {
     pub params: Vec<(String, String)>,
     /// Local variable declarations as (type, name) pairs.
     pub locals: Vec<(String, String)>,
-    /// Types that need to be defined before this function.
-    pub required_types: HashSet<String>,
-    /// Header files that need to be included.
-    pub includes: HashSet<String>,
+    /// Types that need to be defined before this function. Ordered so the
+    /// emitted declarations are byte-identical across runs — golden output
+    /// must not depend on hash iteration order, which varies per process.
+    pub required_types: BTreeSet<String>,
+    /// Header files that need to be included, ordered for the same reason as
+    /// `required_types`.
+    pub includes: BTreeSet<String>,
 }
 
 /// MLIL canonicalizes sub-registers to their widest architectural alias, so
@@ -164,8 +167,8 @@ fn analyze_function_signature(
 ) -> (DecompileInfo, HashMap<(StackBase, i64), StackVariable>) {
     let mut params = detect_parameters(mlil, arch, cc);
     let mut return_type = detect_return_type(mlil, arch, cc);
-    let mut required_types = HashSet::new();
-    let mut includes = HashSet::new();
+    let mut required_types = BTreeSet::new();
+    let mut includes = BTreeSet::new();
 
     // Default includes
     includes.insert("stdint.h".to_string());
@@ -218,7 +221,7 @@ fn analyze_function_signature(
     )
 }
 
-fn collect_required_types(ty: &TypeRef, required: &mut HashSet<String>) {
+fn collect_required_types(ty: &TypeRef, required: &mut BTreeSet<String>) {
     match ty {
         TypeRef::Primitive(p) => {
             if matches!(
@@ -4505,8 +4508,8 @@ mod tests {
                 ("int64_t".to_string(), "arg2".to_string()),
             ],
             locals: vec![("int32_t".to_string(), "var_1".to_string())],
-            required_types: HashSet::new(),
-            includes: HashSet::new(),
+            required_types: BTreeSet::new(),
+            includes: BTreeSet::new(),
         };
         let stmts = vec![HlilStmt::Return(Some(HlilExpr::Const(0)))];
         let code =
@@ -4531,8 +4534,8 @@ mod tests {
             return_type: "void".to_string(),
             params: vec![],
             locals: vec![],
-            required_types: HashSet::new(),
-            includes: HashSet::new(),
+            required_types: BTreeSet::new(),
+            includes: BTreeSet::new(),
         };
         let stmts = vec![HlilStmt::Return(None)];
         let code =

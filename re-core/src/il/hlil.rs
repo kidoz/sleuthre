@@ -411,10 +411,9 @@ pub fn render_pseudocode_with_info(
 
     // Includes. Entries prefixed with `<GUARDED>` are wrapped in a
     // preprocessor guard so that SIMD intrinsic headers do not break builds
-    // on non-x86 targets.
-    let mut includes: Vec<_> = info.includes.iter().collect();
-    includes.sort();
-    for inc in includes {
+    // on non-x86 targets. `info.includes` is an ordered set, so the emitted
+    // sequence is stable across runs.
+    for inc in &info.includes {
         if let Some(rest) = inc.strip_prefix("<GUARDED>") {
             w.write("#if defined(__x86_64__) || defined(__i386__)\n");
             w.write("#include <");
@@ -431,11 +430,9 @@ pub fn render_pseudocode_with_info(
         w.newline();
     }
 
-    // Type definitions
+    // Type definitions, in the ordered set's order for the same reason.
     if !info.required_types.is_empty() {
-        let mut sorted_types: Vec<_> = info.required_types.iter().collect();
-        sorted_types.sort();
-        for type_name in sorted_types {
+        for type_name in &info.required_types {
             if let Some(cty) = types.get_type(type_name) {
                 write_type_definition(&mut w, cty);
                 w.newline();
