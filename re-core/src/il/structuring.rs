@@ -2497,12 +2497,13 @@ pub fn decompile(
     let mut inferred_types = HashMap::new();
     infer_local_types(&hlil_stmts, &mut inferred_types, types);
 
-    // Phase 4: Field Access Recovery
-    fold_field_accesses(&mut hlil_stmts, type_info, &inferred_types, types);
-
-    // Phase 4b: Resolve indirect calls through known C++ vtables. After this
+    // Phase 4: Resolve indirect calls through known C++ vtables. After this
     // pass, `(*(void(**)())(obj+0x10))()` becomes `Widget_OnPaint(obj)` when
     // the type/vtable metadata is sufficient.
+    //
+    // This must run *before* field folding: the resolver matches on the raw
+    // `Deref { BinOp(Add, base, Const) }` shape, which folding would rewrite
+    // into a synthetic `base->field_<offset>` and thereby hide.
     resolve_vtable_calls(
         &mut hlil_stmts,
         &inferred_types,
@@ -2511,6 +2512,9 @@ pub fn decompile(
         symbols,
         arch,
     );
+
+    // Phase 4b: Field Access Recovery
+    fold_field_accesses(&mut hlil_stmts, type_info, &inferred_types, types);
 
     // Phase 2 (Roadmap): Combine nested if statements
     combine_nested_if_statements(&mut hlil_stmts);
@@ -2699,6 +2703,16 @@ fn base_class_name(expr: &HlilExpr, inferred_types: &HashMap<String, TypeRef>) -
     let var_name = match expr {
         HlilExpr::Var(n) => n.clone(),
         HlilExpr::Deref { addr, .. } => match addr.as_ref() {
+            HlilExpr::Var(n) => n.clone(),
+            // `*this->vtbl` — a field access already folded to a named field.
+            HlilExpr::FieldAccess { base, .. } => match base.as_ref() {
+                HlilExpr::Var(n) => n.clone(),
+                _ => return None,
+            },
+            _ => return None,
+        },
+        // `this->vtbl[i]` / `this->vtbl` reached without an explicit deref.
+        HlilExpr::FieldAccess { base, .. } => match base.as_ref() {
             HlilExpr::Var(n) => n.clone(),
             _ => return None,
         },
@@ -3106,6 +3120,190 @@ impl HlilStmt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Memory holding a 2-entry vtable at `vtable_addr` whose slots point at
+    /// `methods`, on x86-64 (8-byte pointers).
+    fn vtable_memory(vtable_addr: u64, methods: &[u64]) -> crate::memory::MemoryMap {
+        let mut data = Vec::new();
+        for m in methods {
+            data.extend_from_slice(&m.to_le_bytes());
+        }
+        let mut memory = crate::memory::MemoryMap::default();
+        memory
+            .add_segment(crate::memory::MemorySegment {
+                name: ".rdata".into(),
+                start: vtable_addr,
+                size: data.len() as u64,
+                data,
+                permissions: crate::memory::Permissions::READ,
+            })
+            .unwrap();
+        memory
+    }
+
+    /// `(*(obj + offset))()` — the raw indirect-call-through-vtable shape.
+    fn vtable_call(base: HlilExpr, offset: u64) -> HlilStmt {
+        use crate::il::llil::BinOp;
+        HlilStmt::Expr(HlilExpr::Call {
+            target: Box::new(HlilExpr::Deref {
+                addr: Box::new(HlilExpr::BinOp {
+                    op: BinOp::Add,
+                    left: Box::new(base),
+                    right: Box::new(HlilExpr::Const(offset)),
+                }),
+                size: 8,
+            }),
+            args: vec![],
+        })
+    }
+
+    fn widget_types(vtable_addr: u64) -> TypeManager {
+        let mut types = TypeManager {
+            arch: crate::arch::Architecture::X86_64,
+            ..Default::default()
+        };
+        types.classes.insert(
+            "Widget".to_string(),
+            crate::types::ClassInfo {
+                base: None,
+                vtable_label: Some("vtable_Widget".into()),
+                vtable_address: Some(vtable_addr),
+            },
+        );
+        types
+    }
+
+    #[test]
+    fn vtable_call_resolves_through_typed_this_pointer() {
+        let vtable_addr = 0x40_0000;
+        let types = widget_types(vtable_addr);
+        let memory = vtable_memory(vtable_addr, &[0x1000, 0x2000]);
+        let mut inferred = HashMap::new();
+        inferred.insert(
+            "obj".to_string(),
+            TypeRef::Pointer(Box::new(TypeRef::Named("Widget".into()))),
+        );
+        let mut symbols = HashMap::new();
+        symbols.insert(0x2000u64, "Widget_OnPaint".to_string());
+
+        // Slot 1 (offset 8) → 0x2000 → named symbol.
+        let mut stmts = vec![vtable_call(HlilExpr::Var("obj".into()), 8)];
+        resolve_vtable_calls(
+            &mut stmts,
+            &inferred,
+            &types,
+            &memory,
+            &symbols,
+            crate::arch::Architecture::X86_64,
+        );
+        let HlilStmt::Expr(HlilExpr::Call { target, .. }) = &stmts[0] else {
+            panic!("expected call");
+        };
+        assert!(
+            matches!(target.as_ref(), HlilExpr::Global(0x2000, name) if name == "Widget_OnPaint"),
+            "unresolved vtable call: {:?}",
+            target
+        );
+    }
+
+    #[test]
+    fn vtable_resolution_survives_field_folding_order() {
+        // Regression: field folding used to run first and rewrite the
+        // `*(obj + off)` call target into `obj->field_<off>`, after which the
+        // vtable resolver could never match. Decompiling the same shape
+        // end-to-end must still yield the resolved method name.
+        let vtable_addr = 0x40_0000;
+        let types = widget_types(vtable_addr);
+        let memory = vtable_memory(vtable_addr, &[0x1000, 0x2000]);
+        let mut inferred = HashMap::new();
+        inferred.insert(
+            "obj".to_string(),
+            TypeRef::Pointer(Box::new(TypeRef::Named("Widget".into()))),
+        );
+        let mut symbols = HashMap::new();
+        symbols.insert(0x2000u64, "Widget_OnPaint".to_string());
+
+        // Two distinct offsets make `obj` a struct-pointer candidate, so
+        // folding would otherwise claim the call target.
+        let mut stmts = vec![
+            vtable_call(HlilExpr::Var("obj".into()), 8),
+            HlilStmt::Assign {
+                dest: HlilExpr::Var("a".into()),
+                src: HlilExpr::Deref {
+                    addr: Box::new(HlilExpr::BinOp {
+                        op: crate::il::llil::BinOp::Add,
+                        left: Box::new(HlilExpr::Var("obj".into())),
+                        right: Box::new(HlilExpr::Const(0x20)),
+                    }),
+                    size: 4,
+                },
+            },
+        ];
+        resolve_vtable_calls(
+            &mut stmts,
+            &inferred,
+            &types,
+            &memory,
+            &symbols,
+            crate::arch::Architecture::X86_64,
+        );
+        fold_field_accesses(&mut stmts, None, &inferred, &types);
+
+        let HlilStmt::Expr(HlilExpr::Call { target, .. }) = &stmts[0] else {
+            panic!("expected call");
+        };
+        assert!(
+            matches!(target.as_ref(), HlilExpr::Global(0x2000, name) if name == "Widget_OnPaint"),
+            "field folding masked the vtable call: {:?}",
+            target
+        );
+        // The unrelated access still folds.
+        assert!(matches!(
+            &stmts[1],
+            HlilStmt::Assign {
+                src: HlilExpr::FieldAccess { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn vtable_base_resolves_through_a_folded_field_access() {
+        // `(*(this->vtbl + off))()` — the shape the resolver's own docs
+        // promised but did not handle.
+        let vtable_addr = 0x40_0000;
+        let types = widget_types(vtable_addr);
+        let memory = vtable_memory(vtable_addr, &[0x1000, 0x2000]);
+        let mut inferred = HashMap::new();
+        inferred.insert(
+            "this".to_string(),
+            TypeRef::Pointer(Box::new(TypeRef::Named("Widget".into()))),
+        );
+        let symbols = HashMap::new();
+
+        let base = HlilExpr::FieldAccess {
+            base: Box::new(HlilExpr::Var("this".into())),
+            field_name: "vtbl".into(),
+            is_ptr: true,
+        };
+        let mut stmts = vec![vtable_call(base, 8)];
+        resolve_vtable_calls(
+            &mut stmts,
+            &inferred,
+            &types,
+            &memory,
+            &symbols,
+            crate::arch::Architecture::X86_64,
+        );
+        let HlilStmt::Expr(HlilExpr::Call { target, .. }) = &stmts[0] else {
+            panic!("expected call");
+        };
+        assert!(
+            matches!(target.as_ref(), HlilExpr::Global(0x2000, name) if name == "Widget::method_8"),
+            "vtbl field base unresolved: {:?}",
+            target
+        );
+    }
 
     #[test]
     fn typeless_struct_pointer_folds_to_field_access() {
