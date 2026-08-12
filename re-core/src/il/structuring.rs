@@ -7,10 +7,13 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::analysis::abi::abi_registers;
+use crate::analysis::functions::CallingConvention;
 use crate::analysis::stack::{StackBase, StackVariable};
 use crate::analysis::type_propagation::FunctionTypeInfo;
 use crate::il::hlil::{self, HlilExpr, HlilStmt};
 use crate::il::mlil::{MlilExpr, MlilFunction, MlilStmt, SsaVar};
+use crate::loader::BinaryFormat;
 use crate::types::{PrimitiveType, TypeManager, TypeRef};
 
 /// Information recovered about a function's signature: return type, parameters,
@@ -29,22 +32,70 @@ pub struct DecompileInfo {
     pub includes: HashSet<String>,
 }
 
-/// ABI argument registers for SysV x86_64 calling convention.
-const X86_64_ARG_REGS: &[&str] = &["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
+/// MLIL canonicalizes sub-registers to their widest architectural alias, so
+/// ABI tables written with 32-bit x86 names must be widened before matching
+/// MLIL variable names (`ecx` → `rcx`).
+fn widen_to_mlil_name(reg: &str) -> String {
+    match reg {
+        "eax" => "rax",
+        "ecx" => "rcx",
+        "edx" => "rdx",
+        _ => reg,
+    }
+    .to_string()
+}
 
-/// ABI argument registers for ARM64 (AAPCS64) calling convention.
-const ARM64_ARG_REGS: &[&str] = &["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"];
+/// Resolve the ABI register model for `(arch, cc)`, deferring to
+/// [`crate::analysis::abi::abi_registers`] as the single source of ABI truth.
+///
+/// A known calling convention is looked up directly; `Unknown` falls back to
+/// the historical per-arch guesses (SysV on x86-64, AAPCS64 on ARM64, the
+/// fastcall-shaped `ecx`/`edx` candidates on x86) so undetected functions
+/// keep their current shape. The `format` argument of `abi_registers` only
+/// disambiguates x86-64 with an *unknown* convention, which never reaches it
+/// here, so a neutral `Raw` is passed.
+fn resolve_abi(
+    arch: crate::arch::Architecture,
+    cc: CallingConvention,
+) -> Option<crate::analysis::abi::AbiRegisters> {
+    let known = match cc {
+        CallingConvention::Unknown => None,
+        _ => abi_registers(arch, cc, BinaryFormat::Raw),
+    };
+    known.or_else(|| {
+        let fallback_cc = match arch {
+            crate::arch::Architecture::X86_64 => CallingConvention::SysVAmd64,
+            crate::arch::Architecture::Arm64 => CallingConvention::ArmAapcs,
+            crate::arch::Architecture::X86 => CallingConvention::Fastcall,
+            _ => return None,
+        };
+        abi_registers(arch, fallback_cc, BinaryFormat::Raw)
+    })
+}
 
-/// Registers that hold the return value on x86/x86_64.
-const X86_64_RETURN_REGS: &[&str] = &["rax", "eax"];
+/// Argument registers used to order detected parameters, in MLIL-canonical
+/// naming and ABI position order. Empty when nothing is known (stack-only
+/// conventions, unmodelled arches).
+fn abi_arg_regs(arch: crate::arch::Architecture, cc: CallingConvention) -> Vec<String> {
+    resolve_abi(arch, cc)
+        .map(|abi| abi.arg_regs.iter().map(|r| widen_to_mlil_name(r)).collect())
+        .unwrap_or_default()
+}
 
-/// ABI argument registers for x86 (thiscall/fastcall potential registers). Cdecl uses stack.
-// MLIL canonicalizes sub-registers to their widest alias, so 32-bit ecx/edx
-// appear as rcx/rdx here.
-const X86_ARG_REGS: &[&str] = &["rcx", "rdx"];
-
-/// Registers that hold the return value on ARM64.
-const ARM64_RETURN_REGS: &[&str] = &["x0"];
+/// Registers that carry the integer return value, in MLIL-canonical naming.
+/// The 32-bit `eax` alias is accepted alongside `rax` because MLIL built
+/// outside the canonicalizing lowering path may still use it. Empty means
+/// "treat as void".
+fn abi_return_regs(arch: crate::arch::Architecture, cc: CallingConvention) -> Vec<String> {
+    let Some(abi) = resolve_abi(arch, cc) else {
+        return Vec::new();
+    };
+    let mut regs = vec![widen_to_mlil_name(abi.ret_reg)];
+    if regs[0] == "rax" {
+        regs.push("eax".to_string());
+    }
+    regs
+}
 
 /// The default integer C type for a target's natural word size: `int32_t` on
 /// 32-bit targets (x86, ARM, MIPS32, RISC-V32), `int64_t` on 64-bit ones. Used
@@ -109,9 +160,10 @@ fn analyze_function_signature(
     _symbols: &HashMap<u64, String>,
     type_info: Option<&FunctionTypeInfo>,
     _types: &TypeManager,
+    cc: CallingConvention,
 ) -> (DecompileInfo, HashMap<(StackBase, i64), StackVariable>) {
-    let mut params = detect_parameters(mlil, arch);
-    let mut return_type = detect_return_type(mlil, arch);
+    let mut params = detect_parameters(mlil, arch, cc);
+    let mut return_type = detect_return_type(mlil, arch, cc);
     let mut required_types = HashSet::new();
     let mut includes = HashSet::new();
 
@@ -236,19 +288,16 @@ fn is_param_candidate_register(name: &str) -> bool {
 /// pass it in a register, or it is a register-args `__usercall`-style
 /// function). Each parameter is named with the same display name the body
 /// uses for that register, so the reads bind to the declaration instead of
-/// appearing as phantom uninitialized locals. ABI argument registers are
-/// ordered first (in ABI order); other incoming registers follow in
-/// first-seen order.
+/// appearing as phantom uninitialized locals. ABI argument registers of the
+/// function's detected calling convention are ordered first (in ABI order,
+/// so Win64 functions get `rcx, rdx, r8, r9` rather than SysV); other
+/// incoming registers follow in first-seen order.
 fn detect_parameters(
     mlil: &MlilFunction,
     arch: crate::arch::Architecture,
+    cc: CallingConvention,
 ) -> Vec<(String, String)> {
-    let abi_regs: &[&str] = match arch {
-        crate::arch::Architecture::Arm64 => ARM64_ARG_REGS,
-        crate::arch::Architecture::X86_64 => X86_64_ARG_REGS,
-        crate::arch::Architecture::X86 => X86_ARG_REGS,
-        _ => &[],
-    };
+    let abi_regs = abi_arg_regs(arch, cc);
 
     let mut written: HashSet<String> = HashSet::new();
     // (register, first-seen index), preserving discovery order.
@@ -347,17 +396,20 @@ fn collect_reads_from_expr(expr: &MlilExpr) -> Vec<String> {
 }
 
 /// Detect whether the function returns a value by looking for assignments to
-/// the return register (rax/eax on x86_64, x0 on ARM64) just before a Return
-/// statement. A special case: `xor eax, eax` (which folds to `eax = 0`) is a
-/// common "return 0" idiom, but in many cases it is simply clearing the
-/// register before `ret` -- we treat it as void unless there is a non-zero
-/// assignment.
-fn detect_return_type(mlil: &MlilFunction, arch: crate::arch::Architecture) -> String {
-    let return_regs: &[&str] = match arch {
-        crate::arch::Architecture::Arm64 => ARM64_RETURN_REGS,
-        crate::arch::Architecture::X86_64 | crate::arch::Architecture::X86 => X86_64_RETURN_REGS,
-        _ => return "void".to_string(),
-    };
+/// the calling convention's return register (rax/eax on x86_64, x0 on ARM64,
+/// r0 on ARM32, a0 on RISC-V) just before a Return statement. A special
+/// case: `xor eax, eax` (which folds to `eax = 0`) is a common "return 0"
+/// idiom, but in many cases it is simply clearing the register before `ret`
+/// -- we treat it as void unless there is a non-zero assignment.
+fn detect_return_type(
+    mlil: &MlilFunction,
+    arch: crate::arch::Architecture,
+    cc: CallingConvention,
+) -> String {
+    let return_regs = abi_return_regs(arch, cc);
+    if return_regs.is_empty() {
+        return "void".to_string();
+    }
 
     // Walk instructions backwards looking for Return preceded by an assignment
     // to a return register.
@@ -366,7 +418,7 @@ fn detect_return_type(mlil: &MlilFunction, arch: crate::arch::Architecture) -> S
         for stmt in &inst.stmts {
             if matches!(stmt, MlilStmt::Return) {
                 // Look backwards from this Return for an assignment to a return reg.
-                if let Some(assign_value) = find_return_assign(insts, idx, return_regs) {
+                if let Some(assign_value) = find_return_assign(insts, idx, &return_regs) {
                     // xor eax, eax folds to const 0 — treat as void.
                     if is_zero_const(&assign_value) {
                         continue;
@@ -385,14 +437,14 @@ fn detect_return_type(mlil: &MlilFunction, arch: crate::arch::Architecture) -> S
 fn find_return_assign(
     insts: &[crate::il::mlil::MlilInst],
     ret_idx: usize,
-    return_regs: &[&str],
+    return_regs: &[String],
 ) -> Option<MlilExpr> {
     // Check the same instruction first, then walk backwards up to 3 instructions.
     let start = ret_idx.saturating_sub(3);
     for i in (start..=ret_idx).rev() {
         for stmt in insts[i].stmts.iter().rev() {
             if let MlilStmt::Assign { dest, src } = stmt
-                && return_regs.iter().any(|&r| r == dest.name)
+                && return_regs.contains(&dest.name)
             {
                 return Some(src.clone());
             }
@@ -416,13 +468,24 @@ fn is_zero_const(expr: &MlilExpr) -> bool {
 /// own block (reset at branch targets). Must run after [`version_defs_and_uses`]
 /// so the injected argument variables name their reaching definitions.
 fn recover_register_call_args(func: &mut MlilFunction, arch: crate::arch::Architecture) {
+    // Callee conventions are unknown at this point, so use the platform
+    // default register file (SysV / AAPCS64) from the shared ABI model.
     let arg_regs: &[&str] = match arch {
-        crate::arch::Architecture::X86_64 => X86_64_ARG_REGS,
-        crate::arch::Architecture::Arm64 => ARM64_ARG_REGS,
+        crate::arch::Architecture::X86_64 => {
+            abi_registers(arch, CallingConvention::SysVAmd64, BinaryFormat::Raw)
+        }
+        crate::arch::Architecture::Arm64 => {
+            abi_registers(arch, CallingConvention::ArmAapcs, BinaryFormat::Raw)
+        }
         // x86 (cdecl/stdcall) passes on the stack — handled during MLIL stack
         // reconstruction. Other targets are not modeled here.
-        _ => return,
-    };
+        _ => None,
+    }
+    .map(|abi| abi.arg_regs)
+    .unwrap_or_default();
+    if arg_regs.is_empty() {
+        return;
+    }
 
     let mut targets: HashSet<u64> = HashSet::new();
     for inst in &func.instructions {
@@ -480,9 +543,8 @@ fn recover_register_call_args(func: &mut MlilFunction, arch: crate::arch::Archit
 fn recover_x86_this_arguments(
     func: &mut MlilFunction,
     arch: crate::arch::Architecture,
-    conventions: &HashMap<u64, crate::analysis::functions::CallingConvention>,
+    conventions: &HashMap<u64, CallingConvention>,
 ) {
-    use crate::analysis::functions::CallingConvention;
     if arch != crate::arch::Architecture::X86 {
         return;
     }
@@ -2390,7 +2452,7 @@ pub fn decompile(
     type_info: Option<&FunctionTypeInfo>,
     types: &TypeManager,
     memory: &crate::memory::MemoryMap,
-    conventions: &HashMap<u64, crate::analysis::functions::CallingConvention>,
+    conventions: &HashMap<u64, CallingConvention>,
 ) -> hlil::DecompiledCode {
     if instructions.is_empty() {
         return hlil::DecompiledCode {
@@ -2409,8 +2471,14 @@ pub fn decompile(
     crate::il::mlil::propagate_values(&mut mlil);
     crate::il::mlil::eliminate_dead_stores_ssa(&mut mlil);
 
+    // The function's own convention drives parameter/return detection; its
+    // entry is the first instruction's address.
+    let cc = conventions
+        .get(&instructions[0].address)
+        .copied()
+        .unwrap_or_default();
     let (mut info, stack_map) =
-        analyze_function_signature(&mlil, instructions, arch, symbols, type_info, types);
+        analyze_function_signature(&mlil, instructions, arch, symbols, type_info, types, cc);
     let mut hlil_stmts = structure_function(&mlil, memory, arch);
     detect_for_loops(&mut hlil_stmts);
     fold_return_values(&mut hlil_stmts);
@@ -3685,7 +3753,11 @@ mod tests {
                 stmts: vec![MlilStmt::Return],
             },
         ]);
-        let params = detect_parameters(&func, crate::arch::Architecture::X86_64);
+        let params = detect_parameters(
+            &func,
+            crate::arch::Architecture::X86_64,
+            CallingConvention::Unknown,
+        );
         assert_eq!(params.len(), 2, "expected 2 params, got {:?}", params);
         // Parameters are named by the register's display name so the body's
         // reads bind to them (rdi -> dst, rsi -> src).
@@ -3725,7 +3797,11 @@ mod tests {
                 stmts: vec![MlilStmt::Return],
             },
         ]);
-        let params = detect_parameters(&func, crate::arch::Architecture::X86_64);
+        let params = detect_parameters(
+            &func,
+            crate::arch::Architecture::X86_64,
+            CallingConvention::Unknown,
+        );
         assert!(
             params.is_empty(),
             "rdi written before read should not be a param, got {:?}",
@@ -3752,7 +3828,11 @@ mod tests {
                 stmts: vec![MlilStmt::Return],
             },
         ]);
-        let ret = detect_return_type(&func, crate::arch::Architecture::X86_64);
+        let ret = detect_return_type(
+            &func,
+            crate::arch::Architecture::X86_64,
+            CallingConvention::Unknown,
+        );
         assert_eq!(ret, "int64_t");
     }
 
@@ -3779,11 +3859,19 @@ mod tests {
             ])
         };
         assert_eq!(
-            detect_return_type(&make(), crate::arch::Architecture::X86),
+            detect_return_type(
+                &make(),
+                crate::arch::Architecture::X86,
+                CallingConvention::Unknown
+            ),
             "int32_t"
         );
         assert_eq!(
-            detect_return_type(&make(), crate::arch::Architecture::X86_64),
+            detect_return_type(
+                &make(),
+                crate::arch::Architecture::X86_64,
+                CallingConvention::Unknown
+            ),
             "int64_t"
         );
     }
@@ -3810,9 +3898,143 @@ mod tests {
                 stmts: vec![MlilStmt::Return],
             },
         ]);
-        let params = detect_parameters(&func, crate::arch::Architecture::X86);
+        let params = detect_parameters(
+            &func,
+            crate::arch::Architecture::X86,
+            CallingConvention::Unknown,
+        );
         assert_eq!(params.len(), 1, "expected 1 param, got {:?}", params);
         assert_eq!(params[0], ("int32_t".to_string(), "counter".to_string()));
+    }
+
+    /// An MLIL function whose statements read `regs` (in order) before any
+    /// of them is written — every one is an incoming value.
+    fn func_reading_regs(regs: &[&str]) -> MlilFunction {
+        let mut stmts: Vec<MlilStmt> = regs
+            .iter()
+            .enumerate()
+            .map(|(i, reg)| MlilStmt::Assign {
+                dest: SsaVar {
+                    name: format!("tmp{}", i),
+                    version: 1,
+                },
+                src: MlilExpr::Var(SsaVar {
+                    name: (*reg).to_string(),
+                    version: 0,
+                }),
+            })
+            .collect();
+        stmts.push(MlilStmt::Return);
+        make_mlil_func(vec![MlilInst {
+            address: 0x1000,
+            stmts,
+        }])
+    }
+
+    fn param_names(params: &[(String, String)]) -> Vec<&str> {
+        params.iter().map(|(_, n)| n.as_str()).collect()
+    }
+
+    #[test]
+    fn win64_convention_orders_params_differently_from_sysv() {
+        // The same body reads rcx first, then rdi. Under Win64 rcx is the
+        // first argument register; under SysV it is rdi.
+        let arch = crate::arch::Architecture::X86_64;
+        let win = detect_parameters(
+            &func_reading_regs(&["rcx", "rdi"]),
+            arch,
+            CallingConvention::Win64,
+        );
+        assert_eq!(
+            param_names(&win),
+            vec!["counter", "dst"],
+            "Win64: rcx first"
+        );
+
+        let sysv = detect_parameters(
+            &func_reading_regs(&["rcx", "rdi"]),
+            arch,
+            CallingConvention::SysVAmd64,
+        );
+        assert_eq!(
+            param_names(&sysv),
+            vec!["dst", "counter"],
+            "SysV: rdi first"
+        );
+    }
+
+    #[test]
+    fn unknown_convention_keeps_sysv_fallback_ordering() {
+        // No detected convention -> the historical SysV guess on x86-64.
+        let params = detect_parameters(
+            &func_reading_regs(&["rcx", "rdi"]),
+            crate::arch::Architecture::X86_64,
+            CallingConvention::Unknown,
+        );
+        assert_eq!(param_names(&params), vec!["dst", "counter"]);
+    }
+
+    #[test]
+    fn non_abi_register_stays_trailing_parameter() {
+        // rbx is not an argument register in any x86-64 convention; it must
+        // still be bound as a parameter, after the ABI-ordered ones.
+        let params = detect_parameters(
+            &func_reading_regs(&["rbx", "rsi"]),
+            crate::arch::Architecture::X86_64,
+            CallingConvention::SysVAmd64,
+        );
+        assert_eq!(param_names(&params), vec!["src", "base"]);
+    }
+
+    #[test]
+    fn arm32_params_ordered_by_aapcs() {
+        // ARM32 previously had no ABI ordering at all; with a detected
+        // AAPCS convention r0..r3 order comes from the shared abi model.
+        let params = detect_parameters(
+            &func_reading_regs(&["r1", "r0"]),
+            crate::arch::Architecture::Arm,
+            CallingConvention::ArmAapcs,
+        );
+        assert_eq!(
+            params,
+            vec![
+                ("int32_t".to_string(), "arg0".to_string()),
+                ("int32_t".to_string(), "arg1".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn arm32_return_value_needs_known_convention() {
+        let make = || {
+            make_mlil_func(vec![
+                MlilInst {
+                    address: 0x1000,
+                    stmts: vec![MlilStmt::Assign {
+                        dest: SsaVar {
+                            name: "r0".into(),
+                            version: 1,
+                        },
+                        src: MlilExpr::Const(42),
+                    }],
+                },
+                MlilInst {
+                    address: 0x1004,
+                    stmts: vec![MlilStmt::Return],
+                },
+            ])
+        };
+        let arch = crate::arch::Architecture::Arm;
+        // With a detected AAPCS convention the r0 assignment is a return
+        // value; without one the historical behavior (void) is kept.
+        assert_eq!(
+            detect_return_type(&make(), arch, CallingConvention::ArmAapcs),
+            "int32_t"
+        );
+        assert_eq!(
+            detect_return_type(&make(), arch, CallingConvention::Unknown),
+            "void"
+        );
     }
 
     #[test]
@@ -3834,7 +4056,11 @@ mod tests {
                 stmts: vec![MlilStmt::Return],
             },
         ]);
-        let ret = detect_return_type(&func, crate::arch::Architecture::X86_64);
+        let ret = detect_return_type(
+            &func,
+            crate::arch::Architecture::X86_64,
+            CallingConvention::Unknown,
+        );
         assert_eq!(ret, "void");
     }
 
@@ -3845,7 +4071,11 @@ mod tests {
             address: 0x1000,
             stmts: vec![MlilStmt::Return],
         }]);
-        let ret = detect_return_type(&func, crate::arch::Architecture::X86_64);
+        let ret = detect_return_type(
+            &func,
+            crate::arch::Architecture::X86_64,
+            CallingConvention::Unknown,
+        );
         assert_eq!(ret, "void");
     }
 
