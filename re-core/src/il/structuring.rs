@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::analysis::stack::StackVariable;
+use crate::analysis::stack::{StackBase, StackVariable};
 use crate::analysis::type_propagation::FunctionTypeInfo;
 use crate::il::hlil::{self, HlilExpr, HlilStmt};
 use crate::il::mlil::{MlilExpr, MlilFunction, MlilStmt, SsaVar};
@@ -109,7 +109,7 @@ fn analyze_function_signature(
     _symbols: &HashMap<u64, String>,
     type_info: Option<&FunctionTypeInfo>,
     _types: &TypeManager,
-) -> (DecompileInfo, HashMap<i64, StackVariable>) {
+) -> (DecompileInfo, HashMap<(StackBase, i64), StackVariable>) {
     let mut params = detect_parameters(mlil, arch);
     let mut return_type = detect_return_type(mlil, arch);
     let mut required_types = HashSet::new();
@@ -151,7 +151,7 @@ fn analyze_function_signature(
 
     let mut stack_map = HashMap::new();
     for var in &stack_vars {
-        stack_map.insert(var.offset, var.clone());
+        stack_map.insert((var.base, var.offset), var.clone());
     }
 
     (
@@ -869,13 +869,16 @@ fn detect_for_loops(stmts: &mut Vec<HlilStmt>) {
 }
 
 /// Replace stack pointer dereferences with named local variables.
-fn lift_stack_refs(stmts: &mut [HlilStmt], stack_map: &HashMap<i64, StackVariable>) {
+fn lift_stack_refs(stmts: &mut [HlilStmt], stack_map: &HashMap<(StackBase, i64), StackVariable>) {
     for stmt in stmts {
         lift_stack_refs_in_stmt(stmt, stack_map);
     }
 }
 
-fn lift_stack_refs_in_stmt(stmt: &mut HlilStmt, stack_map: &HashMap<i64, StackVariable>) {
+fn lift_stack_refs_in_stmt(
+    stmt: &mut HlilStmt,
+    stack_map: &HashMap<(StackBase, i64), StackVariable>,
+) {
     match stmt {
         HlilStmt::Assign { dest, src } => {
             lift_stack_refs_in_expr(dest, stack_map);
@@ -898,8 +901,8 @@ fn lift_stack_refs_in_stmt(stmt: &mut HlilStmt, stack_map: &HashMap<i64, StackVa
             }
 
             // Fallback: check raw offset (unlikely if expr lifting worked, but for completeness)
-            if let Some(offset) = extract_stack_offset(addr)
-                && let Some(var) = stack_map.get(&offset)
+            if let Some(slot) = extract_stack_offset(addr)
+                && let Some(var) = stack_map.get(&slot)
             {
                 *stmt = HlilStmt::Assign {
                     dest: HlilExpr::Var(var.name.clone()),
@@ -961,15 +964,18 @@ fn lift_stack_refs_in_stmt(stmt: &mut HlilStmt, stack_map: &HashMap<i64, StackVa
     }
 }
 
-fn lift_stack_refs_in_expr(expr: &mut HlilExpr, stack_map: &HashMap<i64, StackVariable>) {
+fn lift_stack_refs_in_expr(
+    expr: &mut HlilExpr,
+    stack_map: &HashMap<(StackBase, i64), StackVariable>,
+) {
     // Top-down or bottom-up?
     // If we have `*(sp + 8)`, that is a Deref.
     // If we have `sp + 8`, that is a pointer calculation.
 
     // If matches `Deref(addr, size)`:
     if let HlilExpr::Deref { addr, .. } = expr
-        && let Some(offset) = extract_stack_offset(addr)
-        && let Some(var) = stack_map.get(&offset)
+        && let Some(slot) = extract_stack_offset(addr)
+        && let Some(var) = stack_map.get(&slot)
     {
         // Replace `*(sp + off)` with `var`
         *expr = HlilExpr::Var(var.name.clone());
@@ -979,8 +985,8 @@ fn lift_stack_refs_in_expr(expr: &mut HlilExpr, stack_map: &HashMap<i64, StackVa
     // If matches `sp + offset` (without deref), it might be `&var`.
     // We can replace it with `AddrOf(Var)`?
     // HlilExpr has AddrOf.
-    if let Some(offset) = extract_stack_offset(expr)
-        && let Some(var) = stack_map.get(&offset)
+    if let Some(slot) = extract_stack_offset(expr)
+        && let Some(var) = stack_map.get(&slot)
     {
         *expr = HlilExpr::AddrOf(Box::new(HlilExpr::Var(var.name.clone())));
         return;
@@ -1278,26 +1284,28 @@ fn resolve_globals_in_expr(expr: &mut HlilExpr, types: &TypeManager) {
     }
 }
 
-/// Try to extract a stack offset from an expression.
-/// Matches: `sp`, `sp + C`, `sp - C`.
-fn extract_stack_offset(expr: &HlilExpr) -> Option<i64> {
+/// Try to extract a stack slot (base kind + offset) from an expression.
+/// Matches: `sp`, `sp + C`, `sp - C` (and the frame-pointer equivalents).
+/// Keeping the base distinguishes `fp+0x10` (a stack argument) from
+/// `sp+0x10` (a local) even though the numeric offsets collide.
+fn extract_stack_offset(expr: &HlilExpr) -> Option<(StackBase, i64)> {
     match expr {
-        HlilExpr::Var(name) if is_stack_pointer(name) => Some(0),
+        HlilExpr::Var(name) => stack_base_of(name).map(|base| (base, 0)),
         HlilExpr::BinOp {
             op: crate::il::llil::BinOp::Add,
             left,
             right,
         } => {
             if let HlilExpr::Var(name) = &**left
-                && is_stack_pointer(name)
+                && let Some(base) = stack_base_of(name)
                 && let HlilExpr::Const(c) = &**right
             {
-                Some(*c as i64)
+                Some((base, *c as i64))
             } else if let HlilExpr::Var(name) = &**right
-                && is_stack_pointer(name)
+                && let Some(base) = stack_base_of(name)
                 && let HlilExpr::Const(c) = &**left
             {
-                Some(*c as i64)
+                Some((base, *c as i64))
             } else {
                 None
             }
@@ -1308,10 +1316,10 @@ fn extract_stack_offset(expr: &HlilExpr) -> Option<i64> {
             right,
         } => {
             if let HlilExpr::Var(name) = &**left
-                && is_stack_pointer(name)
+                && let Some(base) = stack_base_of(name)
                 && let HlilExpr::Const(c) = &**right
             {
-                Some(-(*c as i64))
+                Some((base, -(*c as i64)))
             } else {
                 None
             }
@@ -1320,11 +1328,19 @@ fn extract_stack_offset(expr: &HlilExpr) -> Option<i64> {
     }
 }
 
+/// The stack base a register (raw or display) name refers to, if any.
+/// `frame`/`sp` are the pseudocode display names for the frame and stack
+/// pointers across architectures.
+fn stack_base_of(name: &str) -> Option<StackBase> {
+    match name {
+        "sp" | "rsp" | "esp" => Some(StackBase::StackPointer),
+        "rbp" | "ebp" | "x29" | "fp" | "frame" => Some(StackBase::FramePointer),
+        _ => None,
+    }
+}
+
 fn is_stack_pointer(name: &str) -> bool {
-    matches!(
-        name,
-        "sp" | "rsp" | "esp" | "rbp" | "ebp" | "x29" | "fp" | "frame"
-    )
+    stack_base_of(name).is_some()
 }
 
 /// Collect all SSA variables used in the HLIL that are not already declared
