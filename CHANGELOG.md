@@ -4,11 +4,16 @@
 
 ### Added
 
+- **Struct/field inference evidence (roadmap 0.7).** Struct-pointer inference now records the concrete evidence behind every inferred field — each access site's address, direction (read/write), and width — instead of a single prose finding. A new **Inference Evidence** panel lists candidates with their fields, access sites, and confidence, and an analyst can accept (materializing a struct type whose `field_<offset>` names match the pseudocode, and retyping the matching ABI parameter to point at it), reject, or reset each one. Accept/reject go through the undo command stack, so they are undoable, cache-invalidating, and replicated over collaboration; review decisions survive re-analysis and are persisted with the project. The decompiler's "inferred signature" badge and the disassembly/pseudocode context menus link into the panel
 - Evidence-based function naming: a function whose body is a single imported call (`jmp [IAT]`) is named after that import
 - Lightweight struct recovery in the decompiler: a variable dereferenced at multiple distinct offsets renders as `base->field_<offset>` instead of raw pointer arithmetic, even when no concrete struct type is known
 
 ### Changed
 
+- Stack variables are named from their location instead of a discovery counter (`var_18`, `arg_0`, `var_s10`), so names are stable across re-analysis and unrelated edits no longer renumber every later variable; frame slots are classified by base register and offset, so saved frame-pointer/return-address slots and sp-relative locals stop being reported as arguments
+- Parameter ordering and return-register detection follow the function's detected calling convention through the shared ABI model rather than a duplicated x86-64/ARM64 table: Win64 binaries order `rcx, rdx, r8, r9` instead of the SysV sequence, and ARM32/RISC-V get argument ordering they previously lacked
+- Struct overlays applied to an address now project into a typed, named global, so an overlay actually reaches the decompiler instead of being persisted and ignored; removing the overlay retracts exactly what it added, and a global from debug info is never displaced
+- Import signatures resolve through undecorated symbol spellings (`_VirtualAlloc@16`, `@fn@8`, `__imp_CreateFileW`, `_malloc`, `memcpy@@GLIBC_2.14`, ANSI/wide `…A`/`…W` variants), so decorated PE and Mach-O imports match the bundled type libraries
 - PE imports resolve to their real IAT slot address (the address call sites dereference), so import calls render as direct calls (`GetVersion()`) and import-call resolution works
 - Read-before-written registers are recovered as named parameters using the body's display name, so incoming values bind to the signature instead of appearing as uninitialized locals
 - Decompiler folds conditional branches back into relational expressions (`cmp a,b; jl` → `a < b`; `test eax,eax; je` → `eax == 0`) instead of leaking opaque `flag_*` pseudo-variables
@@ -22,6 +27,7 @@
 
 ### Fixed
 
+- Virtual dispatch was never resolved in practice: field folding ran first and rewrote the `*(obj + offset)` call target into a synthetic `obj->field_<offset>`, which the vtable resolver could no longer match. Vtable resolution now runs before folding, and the resolver handles the `this->vtbl` field-access base its documentation already claimed
 - Decompiler eliminates gotos that target the immediately-following statement (`if (c) {..} else { goto L } L:` collapses), removing the dominant branch-structuring goto noise
 - MLIL dataflow soundness: uses with no known reaching definition carry a sentinel version, so dead-store elimination keeps branch-side assignments feeding a join and value propagation can no longer rewrite a use with a definition that follows it
 - Unlifted instructions survive as an `Unimplemented` dataflow barrier (rendered as a pseudocode comment) instead of being erased to `Nop`; remaining silent skips (zero-statement lifts, 1-operand `imul`, unknown ALU arities) are surfaced the same way
