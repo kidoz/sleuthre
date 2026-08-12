@@ -11,6 +11,19 @@ use std::path::Path;
 /// Upper bound on line-table rows collected across all modules.
 const MAX_PDB_LINE_ROWS: usize = 2_000_000;
 
+/// Upper bound on emitted compound types.
+const MAX_PDB_TOTAL_TYPES: usize = 200_000;
+
+/// Upper bound on fields parsed for one struct/union.
+const MAX_PDB_STRUCT_FIELDS: usize = 10_000;
+
+/// Upper bound on variants parsed for one enum.
+const MAX_PDB_ENUM_VARIANTS: usize = 10_000;
+
+/// Upper bound on `LF_FIELDLIST` continuation hops (guards against cyclic
+/// continuation chains in a crafted PDB).
+const MAX_FIELD_LIST_CHAIN: usize = 1_000;
+
 /// Extract debug info from a PDB file.
 pub fn extract_pdb_info(
     pdb_path: &Path,
@@ -37,11 +50,27 @@ pub fn extract_pdb_info(
         .map_err(|e| Error::DebugInfo(format!("PDB type info error: {}", e)))?;
     let mut type_finder = type_info.finder();
 
-    // First pass: index all types
+    // First pass: index all types, and map every non-forward-reference
+    // class/union/enum name to its defining record so forward references
+    // (`size == 0`, no field list) can be resolved by name later.
     {
         let mut iter = type_info.iter();
-        while let Ok(Some(_item)) = iter.next() {
+        while let Ok(Some(item)) = iter.next() {
             type_finder.update(&iter);
+            if let Ok(type_data) = item.parse() {
+                let (name, forward) = match &type_data {
+                    TypeData::Class(c) => (c.name, c.properties.forward_reference()),
+                    TypeData::Union(u) => (u.name, u.properties.forward_reference()),
+                    TypeData::Enumeration(e) => (e.name, e.properties.forward_reference()),
+                    _ => continue,
+                };
+                if !forward {
+                    let name = name.to_string().to_string();
+                    if !name.is_empty() {
+                        resolver.definitions.entry(name).or_insert(item.index());
+                    }
+                }
+            }
         }
     }
 
@@ -49,27 +78,41 @@ pub fn extract_pdb_info(
     {
         let mut iter = type_info.iter();
         while let Ok(Some(item)) = iter.next() {
+            if info.types.len() >= MAX_PDB_TOTAL_TYPES {
+                break;
+            }
             if let Ok(type_data) = item.parse() {
                 match type_data {
                     TypeData::Class(data) => {
                         let name = data.name.to_string().to_string();
-                        if !name.is_empty()
-                            && data.size > 0
-                            && let Some(field_list) = data.fields
-                        {
-                            let fields =
-                                resolve_field_list(&type_finder, &mut resolver, field_list, arch);
-                            info.types.push(CompoundType::Struct {
-                                name,
-                                fields,
-                                size: data.size as usize,
-                            });
+                        // Forward references carry no layout; the defining
+                        // occurrence (found by name in the first pass) is
+                        // emitted on its own iteration turn.
+                        if name.is_empty() || data.properties.forward_reference() {
+                            continue;
                         }
+                        let Some(field_list) = data.fields else {
+                            continue;
+                        };
+                        let (fields, base) =
+                            resolve_field_list(&type_finder, &mut resolver, field_list, arch);
+                        if let Some(base_name) = base {
+                            info.classes
+                                .entry(name.clone())
+                                .or_default()
+                                .base
+                                .get_or_insert(base_name);
+                        }
+                        info.types.push(CompoundType::Struct {
+                            name,
+                            fields,
+                            size: data.size as usize,
+                        });
                     }
                     TypeData::Union(data) => {
                         let name = data.name.to_string().to_string();
-                        if !name.is_empty() {
-                            let fields =
+                        if !name.is_empty() && !data.properties.forward_reference() {
+                            let (fields, _) =
                                 resolve_field_list(&type_finder, &mut resolver, data.fields, arch);
                             info.types.push(CompoundType::Union {
                                 name,
@@ -80,7 +123,7 @@ pub fn extract_pdb_info(
                     }
                     TypeData::Enumeration(data) => {
                         let name = data.name.to_string().to_string();
-                        if !name.is_empty() {
+                        if !name.is_empty() && !data.properties.forward_reference() {
                             let variants = resolve_enum_variants(&type_finder, data.fields);
                             let underlying_size = resolve_type_size(
                                 &type_finder,
@@ -198,6 +241,19 @@ pub fn extract_pdb_info(
                         type_ref,
                         location: VariableLocation::Address(addr),
                     });
+                }
+                pdb::SymbolData::UserDefinedType(udt) => {
+                    // S_UDT — a typedef in the source
+                    let name = udt.name.to_string().to_string();
+                    if name.is_empty() || info.types.len() >= MAX_PDB_TOTAL_TYPES {
+                        continue;
+                    }
+                    let target = resolver.resolve(&type_finder, udt.type_index, arch);
+                    // `typedef struct Foo Foo;` self-references add nothing
+                    if matches!(&target, TypeRef::Named(n) if *n == name) {
+                        continue;
+                    }
+                    info.types.push(CompoundType::Typedef { name, target });
                 }
                 // S_CONSTANT records carry a value but no address, so they
                 // cannot live in the address-keyed globals map.
@@ -508,6 +564,10 @@ fn register_relative_location(
 
 struct PdbTypeResolver {
     cache: HashMap<u32, TypeRef>,
+    /// Defining (non-forward-reference) record for each class/union/enum
+    /// name, used to resolve forward references — e.g. for array element
+    /// sizes — instead of skipping them.
+    definitions: HashMap<String, TypeIndex>,
     /// Current nesting depth of in-flight `resolve` calls — see the cap
     /// check in [`PdbTypeResolver::resolve`].
     depth: u32,
@@ -521,6 +581,7 @@ impl PdbTypeResolver {
     fn new() -> Self {
         Self {
             cache: HashMap::new(),
+            definitions: HashMap::new(),
             depth: 0,
         }
     }
@@ -596,9 +657,12 @@ impl PdbTypeResolver {
                     inner
                 }
             }
+            TypeData::Bitfield(bf) => self.resolve(type_finder, bf.underlying_type, arch),
             TypeData::Array(arr) => {
                 let element = self.resolve(type_finder, arr.element_type, arch);
-                let elem_size = type_size_hint(type_finder, arr.element_type, arch).max(1);
+                let elem_size =
+                    type_size_hint(type_finder, &self.definitions, arr.element_type, arch, 0)
+                        .max(1);
                 // Dimensions come from the PDB verbatim; saturate instead of
                 // overflowing on crafted values.
                 let total_size = arr
@@ -726,36 +790,74 @@ fn builtin_type_from_pdb_primitive(
     }
 }
 
+/// Resolve a `LF_FIELDLIST` chain into struct fields, following continuation
+/// records (large classes split their field list). Returns the fields and the
+/// name of the first `LF_BCLASS` base class, if any.
 fn resolve_field_list(
     type_finder: &TypeFinder,
     resolver: &mut PdbTypeResolver,
     field_list_index: TypeIndex,
     arch: crate::arch::Architecture,
-) -> Vec<StructField> {
+) -> (Vec<StructField>, Option<String>) {
     let mut fields = Vec::new();
+    let mut base: Option<String> = None;
 
-    let item = match type_finder.find(field_list_index) {
-        Ok(item) => item,
-        Err(_) => return fields,
-    };
-
-    if let Ok(TypeData::FieldList(fl)) = item.parse() {
+    let mut next = Some(field_list_index);
+    let mut hops = 0usize;
+    while let Some(index) = next {
+        hops += 1;
+        if hops > MAX_FIELD_LIST_CHAIN {
+            break;
+        }
+        let Ok(item) = type_finder.find(index) else {
+            break;
+        };
+        let Ok(TypeData::FieldList(fl)) = item.parse() else {
+            break;
+        };
         for field in &fl.fields {
-            if let TypeData::Member(member) = field {
-                let name = member.name.to_string().to_string();
-                let type_ref = resolver.resolve(type_finder, member.field_type, arch);
-                fields.push(StructField {
-                    name,
-                    type_ref,
-                    offset: member.offset as usize,
-                    bit_offset: None,
-                    bit_size: None,
-                });
+            match field {
+                TypeData::Member(member) => {
+                    if fields.len() >= MAX_PDB_STRUCT_FIELDS {
+                        break;
+                    }
+                    let name = member.name.to_string().to_string();
+                    let mut bit_offset = None;
+                    let mut bit_size = None;
+                    // A bitfield member's type is an LF_BITFIELD record
+                    // wrapping the underlying integer type.
+                    let type_ref = if let Ok(field_item) = type_finder.find(member.field_type)
+                        && let Ok(TypeData::Bitfield(bf)) = field_item.parse()
+                    {
+                        bit_offset = Some(bf.position);
+                        bit_size = Some(bf.length);
+                        resolver.resolve(type_finder, bf.underlying_type, arch)
+                    } else {
+                        resolver.resolve(type_finder, member.field_type, arch)
+                    };
+                    fields.push(StructField {
+                        name,
+                        type_ref,
+                        offset: member.offset as usize,
+                        bit_offset,
+                        bit_size,
+                    });
+                }
+                TypeData::BaseClass(bc) => {
+                    if base.is_none()
+                        && let TypeRef::Named(base_name) =
+                            resolver.resolve(type_finder, bc.base_class, arch)
+                    {
+                        base = Some(base_name);
+                    }
+                }
+                _ => {}
             }
         }
+        next = fl.continuation;
     }
 
-    fields
+    (fields, base)
 }
 
 fn resolve_enum_variants(
@@ -764,19 +866,30 @@ fn resolve_enum_variants(
 ) -> Vec<(String, i64)> {
     let mut variants = Vec::new();
 
-    let item = match type_finder.find(field_list_index) {
-        Ok(item) => item,
-        Err(_) => return variants,
-    };
-
-    if let Ok(TypeData::FieldList(fl)) = item.parse() {
+    let mut next = Some(field_list_index);
+    let mut hops = 0usize;
+    while let Some(index) = next {
+        hops += 1;
+        if hops > MAX_FIELD_LIST_CHAIN {
+            break;
+        }
+        let Ok(item) = type_finder.find(index) else {
+            break;
+        };
+        let Ok(TypeData::FieldList(fl)) = item.parse() else {
+            break;
+        };
         for field in &fl.fields {
             if let TypeData::Enumerate(en) = field {
+                if variants.len() >= MAX_PDB_ENUM_VARIANTS {
+                    break;
+                }
                 let name = en.name.to_string().to_string();
                 let value = variant_value(&en.value);
                 variants.push((name, value));
             }
         }
+        next = fl.continuation;
     }
 
     variants
@@ -922,11 +1035,30 @@ fn resolve_type_size(
     }
 }
 
+/// How many indirections `type_size_hint` may follow (forward reference →
+/// definition, modifier → underlying, enum → integer type).
+const MAX_SIZE_HINT_DEPTH: u32 = 8;
+
+/// Best-effort byte size of a type, used to derive array element counts from
+/// CodeView's byte-based array dimensions. Forward-referenced classes are
+/// resolved by name to their defining occurrence.
 fn type_size_hint(
     type_finder: &TypeFinder,
+    definitions: &HashMap<String, TypeIndex>,
     type_index: TypeIndex,
     arch: crate::arch::Architecture,
+    depth: u32,
 ) -> usize {
+    if depth >= MAX_SIZE_HINT_DEPTH {
+        return 1;
+    }
+    if type_index.0 < 0x1000 {
+        return match builtin_type(type_index.0) {
+            TypeRef::Primitive(p) => p.size(arch).max(1),
+            TypeRef::Pointer(_) => arch.pointer_size(),
+            _ => 1,
+        };
+    }
     let item = match type_finder.find(type_index) {
         Ok(item) => item,
         Err(_) => return 1,
@@ -934,11 +1066,40 @@ fn type_size_hint(
 
     match item.parse() {
         Ok(TypeData::Primitive(prim)) => {
-            let tr = builtin_type_from_pdb_primitive(prim.kind, None);
-            match tr {
+            match builtin_type_from_pdb_primitive(prim.kind, prim.indirection.as_ref()) {
                 TypeRef::Primitive(p) => p.size(arch).max(1),
+                TypeRef::Pointer(_) => arch.pointer_size(),
                 _ => 1,
             }
+        }
+        Ok(TypeData::Pointer(_)) => arch.pointer_size(),
+        Ok(TypeData::Modifier(m)) => {
+            type_size_hint(type_finder, definitions, m.underlying_type, arch, depth + 1)
+        }
+        Ok(TypeData::Class(c)) => {
+            if c.properties.forward_reference() {
+                let name = c.name.to_string();
+                definitions
+                    .get(name.as_ref())
+                    .map(|&def| type_size_hint(type_finder, definitions, def, arch, depth + 1))
+                    .unwrap_or(1)
+            } else {
+                (c.size as usize).max(1)
+            }
+        }
+        Ok(TypeData::Union(u)) => {
+            if u.properties.forward_reference() {
+                let name = u.name.to_string();
+                definitions
+                    .get(name.as_ref())
+                    .map(|&def| type_size_hint(type_finder, definitions, def, arch, depth + 1))
+                    .unwrap_or(1)
+            } else {
+                (u.size as usize).max(1)
+            }
+        }
+        Ok(TypeData::Enumeration(e)) => {
+            type_size_hint(type_finder, definitions, e.underlying_type, arch, depth + 1)
         }
         _ => 1,
     }
