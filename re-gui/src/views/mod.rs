@@ -13,6 +13,7 @@ pub(crate) mod graph_utils;
 mod hex;
 pub(crate) mod image_preview;
 mod imports;
+pub(crate) mod inference_evidence;
 mod signatures;
 mod source_compare;
 mod strings;

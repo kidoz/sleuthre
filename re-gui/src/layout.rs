@@ -44,6 +44,7 @@ impl TabViewer for SleuthreTabViewer<'_> {
             }
             Tab::Bytecode => self.app.show_bytecode(ui),
             Tab::Debugger => self.app.show_debugger(ui),
+            Tab::InferenceEvidence => self.app.show_inference_evidence(ui),
         }
     }
 }
@@ -803,6 +804,7 @@ impl SleuthreApp {
             Tab::ImagePreview,
             Tab::Bytecode,
             Tab::Debugger,
+            Tab::InferenceEvidence,
         ] {
             let label = tab.to_string();
             if fuzzy_match(&label, view_query) {
@@ -1043,6 +1045,7 @@ impl SleuthreApp {
                     ("Images", Tab::ImagePreview),
                     ("Bytecode", Tab::Bytecode),
                     ("Debugger", Tab::Debugger),
+                    ("Inference Evidence", Tab::InferenceEvidence),
                 ] {
                     if ui.button(name).clicked() {
                         self.focus_or_open_tab(tab);

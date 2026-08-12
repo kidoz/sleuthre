@@ -192,6 +192,19 @@ pub(crate) struct SleuthreApp {
     pub(crate) overlay_add_count: String,
     pub(crate) overlay_add_label: String,
 
+    // Inference evidence panel
+    pub(crate) inference_filter: String,
+    pub(crate) inference_show_rejected: bool,
+    pub(crate) inference_min_confidence: f32,
+    /// Candidates expanded in the evidence panel, keyed by (function, base register).
+    pub(crate) inference_expanded: std::collections::HashSet<(u64, String)>,
+    /// Editable type-name overrides for pending accepts, keyed like `inference_expanded`.
+    pub(crate) inference_type_names: std::collections::HashMap<(u64, String), String>,
+    /// Deferred accept/reject/reset from the evidence panel's scroll-area
+    /// closure — it can't call `&mut self` project methods while the
+    /// candidate list is borrowed, so clicks stash intent here.
+    pub(crate) pending_inference_action: Option<crate::views::inference_evidence::InferenceAction>,
+
     // Source compare
     pub(crate) source_compare_dir: Option<std::path::PathBuf>,
     pub(crate) source_compare_files: Vec<(String, String)>,
@@ -384,6 +397,7 @@ pub(crate) enum Tab {
     ImagePreview,
     Bytecode,
     Debugger,
+    InferenceEvidence,
 }
 
 impl std::fmt::Display for Tab {
@@ -409,6 +423,7 @@ impl std::fmt::Display for Tab {
             Tab::ImagePreview => write!(f, "Images"),
             Tab::Bytecode => write!(f, "Bytecode"),
             Tab::Debugger => write!(f, "Debugger"),
+            Tab::InferenceEvidence => write!(f, "Inference Evidence"),
         }
     }
 }
@@ -650,6 +665,12 @@ impl Default for SleuthreApp {
             overlay_add_type: String::new(),
             overlay_add_count: "1".into(),
             overlay_add_label: String::new(),
+            inference_filter: String::new(),
+            inference_show_rejected: false,
+            inference_min_confidence: 0.0,
+            inference_expanded: std::collections::HashSet::new(),
+            inference_type_names: std::collections::HashMap::new(),
+            pending_inference_action: None,
             source_compare_dir: None,
             source_compare_files: Vec::new(),
             source_compare_mappings: Vec::new(),
