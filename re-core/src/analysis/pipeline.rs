@@ -395,6 +395,12 @@ fn analyze_loaded_with_bytes(
         for (&addr, line_info) in &di.source_lines {
             project.types.source_lines.insert(addr, line_info.clone());
         }
+        for (name, class_info) in &di.classes {
+            project
+                .types
+                .classes
+                .insert(name.clone(), class_info.clone());
+        }
     }
 
     // --- Type libraries ---

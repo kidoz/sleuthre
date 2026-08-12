@@ -4,7 +4,7 @@ mod source_map;
 mod type_mapper;
 pub mod unwind;
 
-use crate::types::{CompoundType, FunctionSignature, SourceLineInfo, VariableInfo};
+use crate::types::{ClassInfo, CompoundType, FunctionSignature, SourceLineInfo, VariableInfo};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -16,6 +16,8 @@ pub struct DebugInfo {
     pub global_variables: BTreeMap<u64, VariableInfo>,
     pub local_variables: BTreeMap<u64, Vec<VariableInfo>>,
     pub source_lines: BTreeMap<u64, SourceLineInfo>,
+    /// C++ class metadata (base-class edges) keyed by qualified class name.
+    pub classes: BTreeMap<String, ClassInfo>,
 }
 
 /// Extract debug info from an ELF/Mach-O binary (DWARF format).

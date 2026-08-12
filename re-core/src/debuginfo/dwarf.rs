@@ -52,6 +52,7 @@ fn parse_dwarf<'a>(
 ) -> crate::Result<DebugInfo> {
     let mut info = DebugInfo::default();
     let mut type_ctx: TypeContext<SliceReader<'a>> = TypeContext::new(arch);
+    let mut prepass_budget = MAX_SCOPE_PREPASS_DIES;
 
     let mut units = dwarf.units();
     while let Ok(Some(header)) = units.next() {
@@ -63,6 +64,23 @@ fn parse_dwarf<'a>(
         // Parse source lines for this compilation unit
         let source_lines = parse_source_lines(dwarf, &unit);
         info.source_lines.extend(source_lines);
+
+        // Record namespace/class scopes before any type or subprogram is
+        // resolved, so every name can be qualified regardless of the order
+        // DIEs reference each other.
+        if let Ok(mut tree) = unit.entries_tree(None)
+            && let Ok(root) = tree.root()
+        {
+            record_scope_prefixes(
+                dwarf,
+                &unit,
+                root,
+                "",
+                &mut type_ctx,
+                &mut prepass_budget,
+                0,
+            );
+        }
 
         // Walk DIEs in this unit
         let mut entries = unit.entries();
@@ -80,6 +98,7 @@ fn parse_dwarf<'a>(
                     }
                 }
                 gimli::DW_TAG_structure_type
+                | gimli::DW_TAG_class_type
                 | gimli::DW_TAG_union_type
                 | gimli::DW_TAG_enumeration_type
                 | gimli::DW_TAG_typedef => {
@@ -91,7 +110,80 @@ fn parse_dwarf<'a>(
     }
 
     info.types = type_ctx.compound_types;
+    info.classes = type_ctx.classes.into_iter().collect();
     Ok(info)
+}
+
+/// Upper bound on DIEs visited by the scope prepass across the whole file —
+/// a crafted unit forest cannot pin the CPU indefinitely.
+const MAX_SCOPE_PREPASS_DIES: usize = 1_000_000;
+
+/// Deepest namespace/class nesting followed by the scope prepass.
+const MAX_SCOPE_NESTING: u32 = 64;
+
+/// Record the namespace/class qualification prefix for every type and
+/// subprogram DIE nested inside named scopes (`DW_TAG_namespace`,
+/// `DW_TAG_structure_type`, `DW_TAG_class_type`, `DW_TAG_union_type`).
+fn record_scope_prefixes<'a>(
+    dwarf: &'a Dwarf<SliceReader<'a>>,
+    unit: &gimli::Unit<SliceReader<'a>>,
+    node: gimli::EntriesTreeNode<'_, '_, SliceReader<'a>>,
+    prefix: &str,
+    type_ctx: &mut TypeContext<SliceReader<'a>>,
+    budget: &mut usize,
+    depth: u32,
+) {
+    let unit_off = unit.header.offset().0;
+    let mut children = node.children();
+    while let Ok(Some(child)) = children.next() {
+        if *budget == 0 {
+            return;
+        }
+        *budget -= 1;
+        let (tag, die_off) = {
+            let entry = child.entry();
+            (entry.tag(), entry.offset().0)
+        };
+        match tag {
+            gimli::DW_TAG_namespace
+            | gimli::DW_TAG_structure_type
+            | gimli::DW_TAG_class_type
+            | gimli::DW_TAG_union_type => {
+                if !prefix.is_empty() {
+                    type_ctx
+                        .scope_prefixes
+                        .insert((unit_off, die_off), prefix.to_string());
+                }
+                let name = die_name_string(dwarf, unit, child.entry());
+                // Unnamed scopes (anonymous namespaces/structs) contribute no
+                // path segment.
+                let child_prefix = if name.is_empty() {
+                    prefix.to_string()
+                } else {
+                    format!("{}{}::", prefix, name)
+                };
+                if depth < MAX_SCOPE_NESTING {
+                    record_scope_prefixes(
+                        dwarf,
+                        unit,
+                        child,
+                        &child_prefix,
+                        type_ctx,
+                        budget,
+                        depth + 1,
+                    );
+                }
+            }
+            gimli::DW_TAG_enumeration_type | gimli::DW_TAG_typedef | gimli::DW_TAG_subprogram
+                if !prefix.is_empty() =>
+            {
+                type_ctx
+                    .scope_prefixes
+                    .insert((unit_off, die_off), prefix.to_string());
+            }
+            _ => {}
+        }
+    }
 }
 
 /// How many `DW_AT_specification`/`DW_AT_abstract_origin` links to follow
@@ -101,14 +193,19 @@ const MAX_SPEC_CHAIN_DEPTH: u32 = 8;
 /// Look up an attribute on a DIE, following its
 /// `DW_AT_specification`/`DW_AT_abstract_origin` chain when the DIE itself
 /// lacks the attribute. C++ out-of-line definitions carry only a reference to
-/// their in-class declaration, which holds the name and type.
-fn chained_attr<'a>(
+/// their in-class declaration, which holds the name and type. Returns the
+/// offset of the DIE that carried the attribute alongside the value, so
+/// callers can qualify names by the *declaration's* scope.
+fn chained_attr_at<'a>(
     unit: &gimli::Unit<SliceReader<'a>>,
     die: &gimli::DebuggingInformationEntry<SliceReader<'a>>,
     attr: gimli::DwAt,
-) -> Option<gimli::AttributeValue<SliceReader<'a>>> {
+) -> Option<(
+    gimli::UnitOffset<usize>,
+    gimli::AttributeValue<SliceReader<'a>>,
+)> {
     if let Some(v) = die.attr_value(attr) {
-        return Some(v);
+        return Some((die.offset(), v));
     }
     let mut link = die
         .attr_value(gimli::DW_AT_specification)
@@ -117,7 +214,7 @@ fn chained_attr<'a>(
         let offset = attr_to_unit_offset(&link, unit)?;
         let entry = unit.entry(offset).ok()?;
         if let Some(v) = entry.attr_value(attr) {
-            return Some(v);
+            return Some((offset, v));
         }
         link = entry
             .attr_value(gimli::DW_AT_specification)
@@ -126,22 +223,38 @@ fn chained_attr<'a>(
     None
 }
 
+/// As [`chained_attr_at`] but discarding the carrying DIE's offset.
+fn chained_attr<'a>(
+    unit: &gimli::Unit<SliceReader<'a>>,
+    die: &gimli::DebuggingInformationEntry<SliceReader<'a>>,
+    attr: gimli::DwAt,
+) -> Option<gimli::AttributeValue<SliceReader<'a>>> {
+    chained_attr_at(unit, die, attr).map(|(_, v)| v)
+}
+
 /// Resolve a subprogram's display name: `DW_AT_name` on the DIE or its
-/// specification chain, falling back to the linkage (mangled) name when no
-/// source-level name exists.
+/// specification chain (qualified by the declaring scope, e.g.
+/// `ns::Class::method`), falling back to the linkage (mangled) name — which
+/// already encodes qualification — when no source-level name exists.
 fn subprogram_name<'a>(
     dwarf: &'a Dwarf<SliceReader<'a>>,
     unit: &gimli::Unit<SliceReader<'a>>,
     die: &gimli::DebuggingInformationEntry<SliceReader<'a>>,
+    type_ctx: &TypeContext<SliceReader<'a>>,
 ) -> String {
-    for attr in [gimli::DW_AT_name, gimli::DW_AT_linkage_name] {
-        if let Some(v) = chained_attr(unit, die, attr)
-            && let Ok(s) = dwarf.attr_string(unit, v)
-            && let Ok(s) = s.to_string()
-            && !s.is_empty()
-        {
-            return s.to_string();
-        }
+    if let Some((offset, v)) = chained_attr_at(unit, die, gimli::DW_AT_name)
+        && let Ok(s) = dwarf.attr_string(unit, v)
+        && let Ok(s) = s.to_string()
+        && !s.is_empty()
+    {
+        return format!("{}{}", type_ctx.scope_prefix(unit, offset), s);
+    }
+    if let Some(v) = chained_attr(unit, die, gimli::DW_AT_linkage_name)
+        && let Ok(s) = dwarf.attr_string(unit, v)
+        && let Ok(s) = s.to_string()
+        && !s.is_empty()
+    {
+        return s.to_string();
     }
     String::new()
 }
@@ -184,7 +297,7 @@ fn parse_subprogram<'a>(
         _ => return,
     };
 
-    let name = subprogram_name(dwarf, unit, die);
+    let name = subprogram_name(dwarf, unit, die, type_ctx);
     let name = if name.is_empty() {
         format!("sub_{:x}", addr)
     } else {
