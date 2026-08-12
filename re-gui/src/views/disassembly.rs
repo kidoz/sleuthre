@@ -140,6 +140,17 @@ impl SleuthreApp {
                         self.trigger_decompile = true;
                         ui.close();
                     }
+                    if ui.button("Show Inference Evidence").clicked() {
+                        // Pre-filter the panel to the function containing this
+                        // instruction (fall back to the raw address).
+                        self.inference_filter = project
+                            .functions
+                            .find_function_containing(addr)
+                            .map(|start| format!("{:x}", start))
+                            .unwrap_or_else(|| format!("{:x}", addr));
+                        self.trigger_inference_view = true;
+                        ui.close();
+                    }
                     // Debugger integrations only appear when a remote is
                     // connected — keeps the menu uncluttered for static-only
                     // sessions. We can't borrow `self` mutably here (the

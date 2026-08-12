@@ -71,6 +71,11 @@ impl eframe::App for SleuthreApp {
             self.trigger_decompile = false;
         }
 
+        if self.trigger_inference_view {
+            self.focus_or_open_tab(Tab::InferenceEvidence);
+            self.trigger_inference_view = false;
+        }
+
         // Deferred script execution (from file picker)
         if !self.script_input.is_empty() {
             let src = std::mem::take(&mut self.script_input);

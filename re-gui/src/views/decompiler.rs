@@ -31,15 +31,23 @@ impl SleuthreApp {
             ui.label(format!("Function: 0x{:X}", self.current_address));
             if signature_inferred {
                 ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new("⚠ inferred signature")
-                        .color(egui::Color32::from_rgb(200, 170, 90))
-                        .small(),
-                )
-                .on_hover_text(
-                    "This function's signature was inferred by analysis \
-                     (lower confidence) — not from debug info or user input.",
-                );
+                let badge = ui
+                    .add(
+                        egui::Label::new(
+                            egui::RichText::new("⚠ inferred signature")
+                                .color(crate::views::inference_evidence::INFERRED_AMBER)
+                                .small(),
+                        )
+                        .sense(egui::Sense::click()),
+                    )
+                    .on_hover_text(
+                        "This function's signature was inferred by analysis \
+                         (lower confidence) — not from debug info or user input. \
+                         Click to review the inference evidence.",
+                    );
+                if badge.clicked() {
+                    self.trigger_inference_view = true;
+                }
             }
         });
         ui.separator();
@@ -129,10 +137,16 @@ impl SleuthreApp {
                 }
             }
 
-            // Right-click "Run to cursor" — only enabled when a debugger is
-            // connected and the hover landed on an annotated address.
-            if self.debugger_remote.is_some() {
-                response.context_menu(|ui| {
+            response.context_menu(|ui| {
+                if ui.button("Show Inference Evidence").clicked() {
+                    self.trigger_inference_view = true;
+                    ui.close();
+                }
+                // "Run to cursor" — only shown when a debugger is connected,
+                // and only enabled when the hover landed on an annotated
+                // address.
+                if self.debugger_remote.is_some() {
+                    ui.separator();
                     let enabled = hover_addr.is_some();
                     if ui
                         .add_enabled(enabled, egui::Button::new("Run to Cursor"))
@@ -141,8 +155,8 @@ impl SleuthreApp {
                         pending_run_to = hover_addr;
                         ui.close();
                     }
-                });
-            }
+                }
+            });
         });
 
         if let Some(addr) = pending_run_to {

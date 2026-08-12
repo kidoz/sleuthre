@@ -32,6 +32,11 @@ pub(crate) struct SleuthreApp {
     pub(crate) approval_queue_open: bool,
     pub(crate) decompiled_code: re_core::il::hlil::DecompiledCode,
     pub(crate) trigger_decompile: bool,
+    /// When set, focus/open the Inference Evidence tab on the next frame.
+    /// Cross-links inside tab UIs must defer: during tab rendering
+    /// `dock_state` is swapped for a placeholder, so a direct
+    /// `focus_or_open_tab` call there would be silently overwritten.
+    pub(crate) trigger_inference_view: bool,
 
     pub(crate) command_input: String,
     pub(crate) import_filter: String,
@@ -554,6 +559,7 @@ impl Default for SleuthreApp {
                 annotations: vec![],
             },
             trigger_decompile: false,
+            trigger_inference_view: false,
             command_input: String::new(),
             import_filter: String::new(),
             export_filter: String::new(),
