@@ -33,7 +33,12 @@ jobs:
         run: cargo build --workspace
 
       - name: Test
+        # The generated-C and recompile-diff gates skip when no C compiler is
+        # on PATH, which is right for local runs but would let them go dark
+        # here. SLEUTHRE_REQUIRE_CC turns a missing compiler into a failure.
         run: cargo test --workspace
+        env:
+          SLEUTHRE_REQUIRE_CC: '1'
 
   bench-build:
     # Build the criterion bench binaries on every PR so a regression in the

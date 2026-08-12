@@ -342,3 +342,69 @@ fn decompile_is_deterministic_in_process() {
         }
     }
 }
+
+/// The generated-C gate the roadmap asks for: real decompiler output (not a
+/// synthetic HLIL tree) must survive a C compiler's syntax check.
+///
+/// Skips when no compiler is on PATH, unless `SLEUTHRE_REQUIRE_CC` is set (as
+/// it is in CI), where a missing compiler is a hard failure so the gate cannot
+/// silently go dark.
+#[test]
+fn golden_output_is_compilable_c() {
+    let Some(cc) = find_c_compiler() else {
+        assert!(
+            std::env::var_os("SLEUTHRE_REQUIRE_CC").is_none(),
+            "SLEUTHRE_REQUIRE_CC is set but no C compiler (cc/gcc/clang) is on PATH"
+        );
+        return;
+    };
+
+    // Prologue: a stub for the only callee any case references. The decompiler
+    // knows just its symbol name, so it is declared without a prototype and
+    // every recovered argument list is accepted.
+    let mut source = String::from("long long helper();\n\n");
+    for (name, code, symbols) in all_cases() {
+        // `field_access` is excluded on purpose: synthetic
+        // `base->field_<offset>` members stand in for an unrecovered struct
+        // type, so that output is pseudocode rather than compilable C.
+        if name == "field_access" {
+            continue;
+        }
+        source.push_str(&decompile_case(name, &code, &symbols));
+        source.push('\n');
+    }
+
+    let tmp = std::env::temp_dir().join(format!("sleuthre_golden_c_{}.c", std::process::id()));
+    std::fs::write(&tmp, source.as_bytes()).expect("write temp C source");
+    let output = std::process::Command::new(&cc)
+        .args([
+            "-std=c11",
+            "-fsyntax-only",
+            "-Werror=implicit-function-declaration",
+        ])
+        .arg(&tmp)
+        .output()
+        .expect("failed to spawn C compiler");
+    let _ = std::fs::remove_file(&tmp);
+    assert!(
+        output.status.success(),
+        "decompiled C failed to compile:\n--- source ---\n{source}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// Locate a C compiler for the generated-C gate, mirroring the lookup used by
+/// the in-crate compiler tests.
+fn find_c_compiler() -> Option<PathBuf> {
+    for candidate in ["cc", "gcc", "clang"] {
+        if let Ok(output) = std::process::Command::new("which").arg(candidate).output()
+            && output.status.success()
+        {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return Some(PathBuf::from(path));
+            }
+        }
+    }
+    None
+}

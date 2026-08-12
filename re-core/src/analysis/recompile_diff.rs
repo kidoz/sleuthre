@@ -385,8 +385,14 @@ mod tests {
 
     #[test]
     fn recompile_roundtrips_real_c() {
-        // Skip silently if no C compiler is on PATH.
+        // Local runs without a compiler skip; CI sets `SLEUTHRE_REQUIRE_CC`
+        // so a missing toolchain fails loudly instead of quietly disabling
+        // the recompile-diff gate.
         if find_c_compiler().is_none() {
+            assert!(
+                std::env::var_os("SLEUTHRE_REQUIRE_CC").is_none(),
+                "SLEUTHRE_REQUIRE_CC is set but no C compiler (cc/gcc/clang) is on PATH"
+            );
             return;
         }
         let source = "\

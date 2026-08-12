@@ -1300,9 +1300,14 @@ mod tests {
     #[test]
     fn generated_c_is_compilable() {
         // Build a non-trivial HLIL function and verify that the emitted text
-        // compiles with a real C toolchain (syntax-only). Skipped silently if
-        // no compiler is on PATH so CI hosts without one still pass.
+        // compiles with a real C toolchain (syntax-only). Local runs without a
+        // compiler skip; CI sets `SLEUTHRE_REQUIRE_CC` so the gate cannot
+        // silently go dark there.
         let Some(cc) = find_c_compiler() else {
+            assert!(
+                std::env::var_os("SLEUTHRE_REQUIRE_CC").is_none(),
+                "SLEUTHRE_REQUIRE_CC is set but no C compiler (cc/gcc/clang) is on PATH"
+            );
             return;
         };
 
