@@ -1,12 +1,15 @@
 use crate::debuginfo::DebugInfo;
 use crate::error::Error;
 use crate::types::{
-    CompoundType, FunctionParameter, FunctionSignature, PrimitiveType, StructField, TypeRef,
-    VariableInfo, VariableLocation,
+    CompoundType, FunctionParameter, FunctionSignature, PrimitiveType, SourceLineInfo, StructField,
+    TypeRef, VariableInfo, VariableLocation,
 };
 use pdb::{FallibleIterator, PDB, TypeData, TypeFinder, TypeIndex};
 use std::collections::HashMap;
 use std::path::Path;
+
+/// Upper bound on line-table rows collected across all modules.
+const MAX_PDB_LINE_ROWS: usize = 2_000_000;
 
 /// Extract debug info from a PDB file.
 pub fn extract_pdb_info(
@@ -21,6 +24,9 @@ pub fn extract_pdb_info(
     // Maps section-relative symbol offsets to RVAs. Without it, symbol
     // addresses below would be wrong (raw `offset.offset` drops the section).
     let address_map = pdb.address_map().ok();
+
+    // The "/names" stream: line-program file names are references into it.
+    let string_table = pdb.string_table().ok();
 
     let mut info = DebugInfo::default();
     let mut resolver = PdbTypeResolver::new();
@@ -95,58 +101,153 @@ pub fn extract_pdb_info(
         }
     }
 
-    // Parse debug info stream for functions, locals, and globals
+    // Parse debug info stream for functions, locals, globals, and line tables
+    let mut line_budget = MAX_PDB_LINE_ROWS;
     if let Ok(debug_info) = pdb.debug_information()
         && let Ok(mut modules) = debug_info.modules()
     {
         while let Ok(Some(module)) = modules.next() {
-            if let Ok(Some(module_info)) = pdb.module_info(&module)
-                && let Ok(mut symbols) = module_info.symbols()
-            {
-                parse_module_symbols(
-                    &mut symbols,
-                    &type_finder,
-                    &mut resolver,
-                    address_map.as_ref(),
-                    image_base,
-                    arch,
-                    &mut info,
-                );
-            }
-        }
-    }
-
-    // Parse global symbols
-    if let Ok(global_symbols) = pdb.global_symbols() {
-        let mut iter = global_symbols.iter();
-        while let Ok(Some(symbol)) = iter.next() {
-            if let Ok(symbol_data) = symbol.parse()
-                && let pdb::SymbolData::Public(public) = symbol_data
-            {
-                let name = public.name.to_string().to_string();
-                let Some(addr) =
-                    section_offset_to_va(public.offset, address_map.as_ref(), image_base)
-                else {
-                    continue;
-                };
-                if public.function && !info.function_signatures.contains_key(&addr) {
-                    info.function_signatures.insert(
-                        addr,
-                        FunctionSignature {
-                            name,
-                            return_type: TypeRef::Primitive(PrimitiveType::Void),
-                            parameters: Vec::new(),
-                            calling_convention: String::new(),
-                            is_variadic: false,
-                            source: crate::types::SignatureSource::DebugInfo,
-                        },
+            if let Ok(Some(module_info)) = pdb.module_info(&module) {
+                if let Ok(mut symbols) = module_info.symbols() {
+                    parse_module_symbols(
+                        &mut symbols,
+                        &type_finder,
+                        &mut resolver,
+                        address_map.as_ref(),
+                        image_base,
+                        arch,
+                        &mut info,
+                    );
+                }
+                if let Ok(line_program) = module_info.line_program() {
+                    collect_module_lines(
+                        &line_program,
+                        string_table.as_ref(),
+                        address_map.as_ref(),
+                        image_base,
+                        &mut info,
+                        &mut line_budget,
                     );
                 }
             }
         }
     }
 
+    // Parse global symbols: public functions plus S_GDATA32/S_LDATA32 and
+    // thread-local statics that only appear in the globals stream.
+    if let Ok(global_symbols) = pdb.global_symbols() {
+        let mut iter = global_symbols.iter();
+        while let Ok(Some(symbol)) = iter.next() {
+            let Ok(symbol_data) = symbol.parse() else {
+                continue;
+            };
+            match symbol_data {
+                pdb::SymbolData::Public(public) => {
+                    let name = public.name.to_string().to_string();
+                    let Some(addr) =
+                        section_offset_to_va(public.offset, address_map.as_ref(), image_base)
+                    else {
+                        continue;
+                    };
+                    if public.function && !info.function_signatures.contains_key(&addr) {
+                        info.function_signatures.insert(
+                            addr,
+                            FunctionSignature {
+                                name,
+                                return_type: TypeRef::Primitive(PrimitiveType::Void),
+                                parameters: Vec::new(),
+                                calling_convention: String::new(),
+                                is_variadic: false,
+                                source: crate::types::SignatureSource::DebugInfo,
+                            },
+                        );
+                    }
+                }
+                pdb::SymbolData::Data(data) => {
+                    let name = data.name.to_string().to_string();
+                    let Some(addr) =
+                        section_offset_to_va(data.offset, address_map.as_ref(), image_base)
+                    else {
+                        continue;
+                    };
+                    if name.is_empty() {
+                        continue;
+                    }
+                    let type_ref = resolver.resolve(&type_finder, data.type_index, arch);
+                    // Module streams carry the same symbol with equal detail —
+                    // keep whichever was seen first.
+                    info.global_variables.entry(addr).or_insert(VariableInfo {
+                        name,
+                        type_ref,
+                        location: VariableLocation::Address(addr),
+                    });
+                }
+                pdb::SymbolData::ThreadStorage(tls) => {
+                    let name = tls.name.to_string().to_string();
+                    let Some(addr) =
+                        section_offset_to_va(tls.offset, address_map.as_ref(), image_base)
+                    else {
+                        continue;
+                    };
+                    if name.is_empty() {
+                        continue;
+                    }
+                    let type_ref = resolver.resolve(&type_finder, tls.type_index, arch);
+                    info.global_variables.entry(addr).or_insert(VariableInfo {
+                        name,
+                        type_ref,
+                        location: VariableLocation::Address(addr),
+                    });
+                }
+                // S_CONSTANT records carry a value but no address, so they
+                // cannot live in the address-keyed globals map.
+                _ => {}
+            }
+        }
+    }
+
     Ok(info)
+}
+
+/// Collect one module's C13 line table into `source_lines`: each row maps an
+/// instruction address to `file:line[:column]`. `budget` caps total rows
+/// across all modules (line data is untrusted input).
+fn collect_module_lines(
+    program: &pdb::LineProgram<'_>,
+    string_table: Option<&pdb::StringTable<'_>>,
+    address_map: Option<&pdb::AddressMap<'_>>,
+    image_base: u64,
+    info: &mut DebugInfo,
+    budget: &mut usize,
+) {
+    let mut lines = program.lines();
+    while let Ok(Some(line)) = lines.next() {
+        if *budget == 0 {
+            return;
+        }
+        *budget -= 1;
+
+        let Some(addr) = section_offset_to_va(line.offset, address_map, image_base) else {
+            continue;
+        };
+        let file = program
+            .get_file_info(line.file_index)
+            .ok()
+            .and_then(|fi| string_table?.get(fi.name).ok())
+            .map(|raw| raw.to_string().to_string())
+            .unwrap_or_default();
+        // Column 0 means "not recorded" in practice
+        let column = line.column_start.filter(|&c| c != 0);
+
+        info.source_lines.insert(
+            addr,
+            SourceLineInfo {
+                file,
+                line: line.line_start,
+                column,
+            },
+        );
+    }
 }
 
 /// Map a PDB section-relative symbol offset to a virtual address in the same
