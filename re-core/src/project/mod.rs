@@ -129,6 +129,9 @@ pub struct Project {
     /// Struct-pointer inference evidence, reviewable in the UI. Statuses
     /// survive re-analysis (merged by function + base register) and saves.
     pub struct_candidates: Vec<StructCandidate>,
+    /// Global-variable addresses synthesized from [`Self::struct_overlays`],
+    /// tracked so a removed overlay can retract exactly what it added.
+    overlay_derived_globals: Vec<u64>,
 }
 
 /// Tracks which functions a cached decompilation depends on so a single edit
@@ -299,6 +302,7 @@ impl Project {
             struct_overlays: Vec::new(),
             debug_profiles: Vec::new(),
             struct_candidates: Vec::new(),
+            overlay_derived_globals: Vec::new(),
         }
     }
 
@@ -557,6 +561,84 @@ impl Project {
         }
     }
 
+    /// Add a struct overlay and make it visible to analysis.
+    pub fn add_struct_overlay(&mut self, overlay: StructOverlay) {
+        self.struct_overlays.push(overlay);
+        self.sync_overlay_globals();
+    }
+
+    /// Remove the overlay at `index` (no-op when out of range) and refresh the
+    /// derived globals.
+    pub fn remove_struct_overlay(&mut self, index: usize) {
+        if index < self.struct_overlays.len() {
+            self.struct_overlays.remove(index);
+            self.sync_overlay_globals();
+        }
+    }
+
+    /// Project each struct overlay into a typed, named global variable and a
+    /// type annotation, so an overlay actually reaches the decompiler: a bare
+    /// constant at the overlay address renders as its label instead of a raw
+    /// number, carrying the overlay's type.
+    ///
+    /// Overlays only ever *add* globals — an address already carrying a global
+    /// from debug info keeps it, since debug info is the stronger source.
+    /// Stale entries from removed overlays are dropped by tracking which
+    /// addresses this projection owns.
+    ///
+    /// Invalidates cached pseudocode, since existing output may render the
+    /// affected addresses as bare constants.
+    pub fn sync_overlay_globals(&mut self) {
+        self.derive_overlay_globals();
+        self.decompilation_cache.clear();
+        self.cache_deps = CacheDependencyGraph::default();
+    }
+
+    /// The projection itself, without cache invalidation — used on load, where
+    /// the restored cache was already produced with these overlays applied.
+    fn derive_overlay_globals(&mut self) {
+        use crate::types::{TypeAnnotation, TypeRef, VariableInfo, VariableLocation};
+
+        // Drop globals/annotations previously derived from overlays.
+        let owned: Vec<u64> = self.overlay_derived_globals.drain(..).collect();
+        for addr in owned {
+            self.types.global_variables.remove(&addr);
+            self.types.annotations.remove(&addr);
+        }
+
+        for overlay in &self.struct_overlays {
+            if self.types.global_variables.contains_key(&overlay.address) {
+                continue; // a stronger source already named this address
+            }
+            let base = TypeRef::Named(overlay.type_name.clone());
+            let type_ref = if overlay.count > 1 {
+                TypeRef::Array {
+                    element: Box::new(base),
+                    count: overlay.count,
+                }
+            } else {
+                base
+            };
+            self.types.global_variables.insert(
+                overlay.address,
+                VariableInfo {
+                    name: overlay.label.clone(),
+                    type_ref: type_ref.clone(),
+                    location: VariableLocation::Address(overlay.address),
+                },
+            );
+            self.types.annotations.insert(
+                overlay.address,
+                TypeAnnotation {
+                    address: overlay.address,
+                    type_ref,
+                    name: overlay.label.clone(),
+                },
+            );
+            self.overlay_derived_globals.push(overlay.address);
+        }
+    }
+
     /// Build the command that accepts a struct-inference candidate, capturing
     /// everything undo needs (whether the type is newly materialized, and the
     /// old parameter type when the base register maps to a signature
@@ -784,8 +866,13 @@ impl Project {
                 db.save_function_signature(addr, sig)?;
             }
 
-            // Persist global variables
+            // Persist global variables. Entries derived from struct overlays
+            // are skipped — they are re-derived on load, so persisting them
+            // would strand copies when the overlay is later removed.
             for (&addr, var) in &self.types.global_variables {
+                if self.overlay_derived_globals.contains(&addr) {
+                    continue;
+                }
                 db.save_global_variable(addr, var)?;
             }
 
@@ -941,6 +1028,9 @@ impl Project {
 
         // Restore struct-inference candidates
         project.struct_candidates = db.load_struct_candidates()?;
+
+        // Re-derive overlay globals (they are deliberately not persisted).
+        project.derive_overlay_globals();
 
         // Restore class metadata.
         project.types.classes = db.load_classes()?;
@@ -1539,6 +1629,67 @@ mod tests {
 
         p.undo();
         assert_eq!(p.struct_candidates[0].status, EvidenceStatus::Proposed);
+    }
+
+    #[test]
+    fn struct_overlays_become_typed_globals() {
+        use crate::types::{TypeRef, VariableLocation};
+        let mut p = test_project();
+        p.add_struct_overlay(StructOverlay {
+            address: 0x404000,
+            type_name: "POINT".into(),
+            count: 1,
+            label: "g_origin".into(),
+        });
+        let g = &p.types.global_variables[&0x404000];
+        assert_eq!(g.name, "g_origin");
+        assert_eq!(g.type_ref, TypeRef::Named("POINT".into()));
+        assert!(matches!(g.location, VariableLocation::Address(0x404000)));
+        assert_eq!(p.types.annotations[&0x404000].name, "g_origin");
+
+        // An array overlay carries its count into the type.
+        p.add_struct_overlay(StructOverlay {
+            address: 0x405000,
+            type_name: "POINT".into(),
+            count: 4,
+            label: "g_quad".into(),
+        });
+        assert_eq!(
+            p.types.global_variables[&0x405000].type_ref,
+            TypeRef::Array {
+                element: Box::new(TypeRef::Named("POINT".into())),
+                count: 4,
+            }
+        );
+
+        // Removing an overlay retracts exactly its derived global.
+        p.remove_struct_overlay(0);
+        assert!(!p.types.global_variables.contains_key(&0x404000));
+        assert!(p.types.global_variables.contains_key(&0x405000));
+    }
+
+    #[test]
+    fn overlay_globals_never_displace_debug_info_globals() {
+        use crate::types::{PrimitiveType, TypeRef, VariableInfo, VariableLocation};
+        let mut p = test_project();
+        p.types.global_variables.insert(
+            0x404000,
+            VariableInfo {
+                name: "real_name".into(),
+                type_ref: TypeRef::Primitive(PrimitiveType::I32),
+                location: VariableLocation::Address(0x404000),
+            },
+        );
+        p.add_struct_overlay(StructOverlay {
+            address: 0x404000,
+            type_name: "POINT".into(),
+            count: 1,
+            label: "g_origin".into(),
+        });
+        // The stronger source wins and is not retracted by overlay removal.
+        assert_eq!(p.types.global_variables[&0x404000].name, "real_name");
+        p.remove_struct_overlay(0);
+        assert_eq!(p.types.global_variables[&0x404000].name, "real_name");
     }
 
     #[test]

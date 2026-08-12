@@ -138,9 +138,8 @@ impl SleuthreApp {
         // Apply deferred actions
         if let Some(idx) = delete_idx
             && let Some(ref mut project) = self.project
-            && idx < project.struct_overlays.len()
         {
-            project.struct_overlays.remove(idx);
+            project.remove_struct_overlay(idx);
         }
 
         if let Some(addr) = navigate_to {
@@ -206,7 +205,7 @@ impl SleuthreApp {
                                 label,
                             };
                             if let Some(ref mut project) = self.project {
-                                project.struct_overlays.push(overlay);
+                                project.add_struct_overlay(overlay);
                             }
                         }
                         self.overlay_add_active = false;
