@@ -1,7 +1,9 @@
 use crate::debuginfo::DebugInfo;
 use crate::debuginfo::source_map::parse_source_lines;
 use crate::debuginfo::type_mapper::{TypeContext, attr_to_unit_offset, die_name_string};
-use crate::types::{FunctionSignature, PrimitiveType, TypeRef, VariableInfo, VariableLocation};
+use crate::types::{
+    FunctionParameter, FunctionSignature, PrimitiveType, TypeRef, VariableInfo, VariableLocation,
+};
 use gimli::{Dwarf, EndianSlice, RunTimeEndian};
 use object::{Object, ObjectSection};
 
@@ -209,48 +211,88 @@ fn parse_subprogram<'a>(
         .map(map_dwarf_calling_convention)
         .unwrap_or_default();
 
-    // Parse parameters and local variables from children
-    let mut parameters = Vec::new();
-    let mut locals = Vec::new();
-    let mut is_variadic = false;
-
+    // Parse parameters and local variables from children, descending into
+    // nested lexical blocks (block-scoped locals would otherwise be lost).
+    let mut scope = CollectedScope::default();
     if let Ok(mut tree) = unit.entries_tree(Some(die.offset()))
         && let Ok(root) = tree.root()
     {
-        let mut children = root.children();
-        while let Ok(Some(child)) = children.next() {
-            let child_entry = child.entry();
-            match child_entry.tag() {
-                gimli::DW_TAG_formal_parameter => {
-                    let param = type_ctx.resolve_parameter(dwarf, unit, child_entry);
-                    parameters.push(param);
-                }
-                gimli::DW_TAG_unspecified_parameters => {
-                    is_variadic = true;
-                }
-                gimli::DW_TAG_variable => {
-                    if let Some(var) = parse_variable(dwarf, unit, child_entry, type_ctx) {
-                        locals.push(var);
-                    }
-                }
-                _ => {}
-            }
-        }
+        collect_scope(dwarf, unit, root, type_ctx, &mut scope, 0);
     }
 
     let sig = FunctionSignature {
         name,
         return_type,
-        parameters,
+        parameters: scope.parameters,
         calling_convention,
-        is_variadic,
+        is_variadic: scope.is_variadic,
         source: crate::types::SignatureSource::DebugInfo,
     };
 
     info.function_signatures.insert(addr, sig);
 
-    if !locals.is_empty() {
-        info.local_variables.insert(addr, locals);
+    if !scope.locals.is_empty() {
+        info.local_variables.insert(addr, scope.locals);
+    }
+}
+
+/// Parameters and locals collected from a subprogram subtree.
+#[derive(Default)]
+struct CollectedScope {
+    parameters: Vec<FunctionParameter>,
+    locals: Vec<VariableInfo>,
+    is_variadic: bool,
+}
+
+/// Deepest lexical-block nesting we follow inside a subprogram; beyond this
+/// the tree is treated as hostile (recursion depth is bounded by it).
+const MAX_LEXICAL_BLOCK_DEPTH: u32 = 32;
+
+/// Upper bound on variables collected for one function, so a crafted DIE tree
+/// cannot balloon memory.
+const MAX_LOCALS_PER_FUNCTION: usize = 10_000;
+
+fn collect_scope<'a>(
+    dwarf: &'a Dwarf<SliceReader<'a>>,
+    unit: &gimli::Unit<SliceReader<'a>>,
+    node: gimli::EntriesTreeNode<'_, '_, SliceReader<'a>>,
+    type_ctx: &mut TypeContext<SliceReader<'a>>,
+    out: &mut CollectedScope,
+    depth: u32,
+) {
+    let mut children = node.children();
+    while let Ok(Some(child)) = children.next() {
+        let tag = child.entry().tag();
+        match tag {
+            gimli::DW_TAG_formal_parameter => {
+                if depth == 0 {
+                    let param = type_ctx.resolve_parameter(dwarf, unit, child.entry());
+                    out.parameters.push(param);
+                } else if out.locals.len() < MAX_LOCALS_PER_FUNCTION
+                    && let Some(var) = parse_variable(dwarf, unit, child.entry(), type_ctx)
+                {
+                    // A parameter re-homed into a nested scope (e.g. by an
+                    // inlined instance) is surfaced as a local.
+                    out.locals.push(var);
+                }
+            }
+            gimli::DW_TAG_unspecified_parameters => {
+                if depth == 0 {
+                    out.is_variadic = true;
+                }
+            }
+            gimli::DW_TAG_variable => {
+                if out.locals.len() < MAX_LOCALS_PER_FUNCTION
+                    && let Some(var) = parse_variable(dwarf, unit, child.entry(), type_ctx)
+                {
+                    out.locals.push(var);
+                }
+            }
+            gimli::DW_TAG_lexical_block if depth < MAX_LEXICAL_BLOCK_DEPTH => {
+                collect_scope(dwarf, unit, child, type_ctx, out, depth + 1);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -275,7 +317,9 @@ fn parse_variable<'a>(
         TypeRef::Primitive(PrimitiveType::Void)
     };
 
-    let location = parse_location(dwarf, unit, die);
+    // A variable whose location is absent or undecodable is skipped rather
+    // than fabricated at stack offset 0 (indistinguishable from a real local).
+    let location = parse_location(dwarf, unit, die, type_ctx.arch)?;
 
     Some(VariableInfo {
         name,
@@ -284,64 +328,138 @@ fn parse_variable<'a>(
     })
 }
 
+/// Map a DWARF register number to a display name for the architecture.
+fn dwarf_register_name(arch: crate::arch::Architecture, reg: u8) -> String {
+    use crate::arch::Architecture;
+    match arch {
+        Architecture::X86_64 => match reg {
+            0 => "rax".to_string(),
+            1 => "rdx".to_string(),
+            2 => "rcx".to_string(),
+            3 => "rbx".to_string(),
+            4 => "rsi".to_string(),
+            5 => "rdi".to_string(),
+            6 => "rbp".to_string(),
+            7 => "rsp".to_string(),
+            8..=15 => format!("r{}", reg),
+            _ => format!("reg{}", reg),
+        },
+        Architecture::X86 => match reg {
+            0 => "eax".to_string(),
+            1 => "ecx".to_string(),
+            2 => "edx".to_string(),
+            3 => "ebx".to_string(),
+            4 => "esp".to_string(),
+            5 => "ebp".to_string(),
+            6 => "esi".to_string(),
+            7 => "edi".to_string(),
+            _ => format!("reg{}", reg),
+        },
+        Architecture::Arm64 => match reg {
+            0..=28 => format!("x{}", reg),
+            29 => "fp".to_string(),
+            30 => "lr".to_string(),
+            31 => "sp".to_string(),
+            _ => format!("reg{}", reg),
+        },
+        Architecture::Arm => match reg {
+            0..=10 => format!("r{}", reg),
+            11 => "fp".to_string(),
+            12 => "ip".to_string(),
+            13 => "sp".to_string(),
+            14 => "lr".to_string(),
+            15 => "pc".to_string(),
+            _ => format!("reg{}", reg),
+        },
+        _ => format!("reg{}", reg),
+    }
+}
+
+/// Whether a DWARF register number is the frame or stack pointer for the
+/// architecture — `DW_OP_breg` off these registers is a stack slot.
+fn is_frame_or_stack_register(arch: crate::arch::Architecture, reg: u8) -> bool {
+    use crate::arch::Architecture;
+    matches!(
+        (arch, reg),
+        (Architecture::X86_64, 6 | 7)
+            | (Architecture::X86, 4 | 5)
+            | (Architecture::Arm64, 29 | 31)
+            | (Architecture::Arm, 11 | 13)
+            | (Architecture::Mips | Architecture::Mips64, 29 | 30)
+            | (Architecture::RiscV32 | Architecture::RiscV64, 2 | 8)
+    )
+}
+
 fn parse_location<'a>(
     dwarf: &'a Dwarf<SliceReader<'a>>,
     unit: &gimli::Unit<SliceReader<'a>>,
     die: &gimli::DebuggingInformationEntry<SliceReader<'a>>,
-) -> VariableLocation {
-    if let Some(attr) = die.attr_value(gimli::DW_AT_location) {
-        match attr {
-            gimli::AttributeValue::Exprloc(expr) => {
-                let bytes = expr.0.slice();
-                if !bytes.is_empty() {
-                    match bytes[0] {
-                        0x91 => {
-                            // DW_OP_fbreg — SLEB128 offset from frame base
-                            if let Some(offset) = read_sleb128(&bytes[1..]) {
-                                return VariableLocation::Stack(offset);
-                            }
-                        }
-                        0x03 => {
-                            // DW_OP_addr
-                            if bytes.len() >= 9 {
-                                let addr = u64::from_le_bytes([
-                                    bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
-                                    bytes[7], bytes[8],
-                                ]);
-                                return VariableLocation::Address(addr);
-                            } else if bytes.len() >= 5 {
-                                let addr =
-                                    u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]])
-                                        as u64;
-                                return VariableLocation::Address(addr);
-                            }
-                        }
-                        0xa1 => {
-                            // DW_OP_addrx — ULEB128 index into .debug_addr
-                            if let Some(index) = read_uleb128(&bytes[1..])
-                                && let Ok(addr) =
-                                    dwarf.address(unit, gimli::DebugAddrIndex(index as usize))
-                            {
-                                return VariableLocation::Address(addr);
-                            }
-                        }
-                        op if (0x50..=0x6f).contains(&op) => {
-                            // DW_OP_reg0..DW_OP_reg31
-                            let reg_num = op - 0x50;
-                            return VariableLocation::Register(format!("reg{}", reg_num));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            gimli::AttributeValue::Addr(addr) => {
-                return VariableLocation::Address(addr);
-            }
-            _ => {}
+    arch: crate::arch::Architecture,
+) -> Option<VariableLocation> {
+    match die.attr_value(gimli::DW_AT_location)? {
+        gimli::AttributeValue::Exprloc(expr) => {
+            decode_location_expr(dwarf, unit, expr.0.slice(), arch)
         }
+        gimli::AttributeValue::Addr(addr) => Some(VariableLocation::Address(addr)),
+        // Location lists (variables that move between locations) and any
+        // other form are not modelled — skip the variable.
+        _ => None,
     }
+}
 
-    VariableLocation::Stack(0)
+/// Decode the leading operation of a DWARF location expression. Unknown or
+/// truncated expressions yield `None` so the caller drops the variable.
+fn decode_location_expr<'a>(
+    dwarf: &'a Dwarf<SliceReader<'a>>,
+    unit: &gimli::Unit<SliceReader<'a>>,
+    bytes: &[u8],
+    arch: crate::arch::Architecture,
+) -> Option<VariableLocation> {
+    let (&op, rest) = bytes.split_first()?;
+    match op {
+        // DW_OP_fbreg — SLEB128 offset from frame base
+        0x91 => read_sleb128(rest).map(VariableLocation::Stack),
+        // DW_OP_addr
+        0x03 => {
+            if rest.len() >= 8 {
+                let addr = u64::from_le_bytes([
+                    rest[0], rest[1], rest[2], rest[3], rest[4], rest[5], rest[6], rest[7],
+                ]);
+                Some(VariableLocation::Address(addr))
+            } else if rest.len() >= 4 {
+                let addr = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as u64;
+                Some(VariableLocation::Address(addr))
+            } else {
+                None
+            }
+        }
+        // DW_OP_addrx — ULEB128 index into .debug_addr
+        0xa1 => {
+            let index = read_uleb128(rest)?;
+            dwarf
+                .address(unit, gimli::DebugAddrIndex(index as usize))
+                .ok()
+                .map(VariableLocation::Address)
+        }
+        // DW_OP_reg0..DW_OP_reg31
+        0x50..=0x6f => {
+            let reg = op - 0x50;
+            Some(VariableLocation::Register(dwarf_register_name(arch, reg)))
+        }
+        // DW_OP_breg0..DW_OP_breg31 — base register + SLEB128 offset. Off the
+        // frame/stack pointer this is a stack slot; off any other register the
+        // variable lives relative to that register.
+        0x70..=0x8f => {
+            let reg = op - 0x70;
+            let offset = read_sleb128(rest)?;
+            if is_frame_or_stack_register(arch, reg) {
+                Some(VariableLocation::Stack(offset))
+            } else {
+                Some(VariableLocation::Register(dwarf_register_name(arch, reg)))
+            }
+        }
+        _ => None,
+    }
 }
 
 fn read_uleb128(bytes: &[u8]) -> Option<u64> {
@@ -417,6 +535,26 @@ mod tests {
         assert_eq!(read_uleb128(&[]), None);
         // Over-long hostile encoding must not panic
         assert_eq!(read_uleb128(&[0xff; 16]), None);
+    }
+
+    #[test]
+    fn register_naming_and_frame_detection() {
+        use crate::arch::Architecture;
+        assert_eq!(dwarf_register_name(Architecture::X86_64, 6), "rbp");
+        assert_eq!(dwarf_register_name(Architecture::X86_64, 7), "rsp");
+        assert_eq!(dwarf_register_name(Architecture::X86_64, 12), "r12");
+        assert_eq!(dwarf_register_name(Architecture::X86, 5), "ebp");
+        assert_eq!(dwarf_register_name(Architecture::Arm64, 29), "fp");
+        assert_eq!(dwarf_register_name(Architecture::Arm64, 3), "x3");
+        assert_eq!(dwarf_register_name(Architecture::Mips, 29), "reg29");
+
+        assert!(is_frame_or_stack_register(Architecture::X86_64, 6));
+        assert!(is_frame_or_stack_register(Architecture::X86_64, 7));
+        assert!(!is_frame_or_stack_register(Architecture::X86_64, 0));
+        assert!(is_frame_or_stack_register(Architecture::X86, 5));
+        assert!(is_frame_or_stack_register(Architecture::Arm64, 31));
+        assert!(is_frame_or_stack_register(Architecture::RiscV64, 2));
+        assert!(!is_frame_or_stack_register(Architecture::Arm, 0));
     }
 
     #[test]
