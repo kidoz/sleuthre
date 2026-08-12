@@ -1,0 +1,11 @@
+// Decompiled with Sleuthre
+
+#include <stdbool.h>
+#include <stdint.h>
+
+int64_t field_access(int64_t dst) {
+    uint32_t result_1;
+
+    result_1 = dst->field_8;
+    return result_1 + dst->field_10;
+}

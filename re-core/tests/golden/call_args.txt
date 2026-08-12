@@ -1,0 +1,9 @@
+// Decompiled with Sleuthre
+
+#include <stdbool.h>
+#include <stdint.h>
+
+void call_args(void) {
+    helper(1, 2);
+    return;
+}

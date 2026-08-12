@@ -1,0 +1,11 @@
+// Decompiled with Sleuthre
+
+#include <stdbool.h>
+#include <stdint.h>
+
+int64_t branch_select(int64_t dst) {
+    if (dst <= 5) {
+        return 1;
+    }
+    return 2;
+}

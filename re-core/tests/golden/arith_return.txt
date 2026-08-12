@@ -1,0 +1,11 @@
+// Decompiled with Sleuthre
+
+#include <stdbool.h>
+#include <stdint.h>
+
+int64_t arith_return(int64_t dst, int64_t src) {
+    int64_t result_1;
+
+    result_1 = dst;
+    return dst + src;
+}

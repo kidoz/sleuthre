@@ -1,0 +1,17 @@
+// Decompiled with Sleuthre
+
+#include <stdbool.h>
+#include <stdint.h>
+
+void loop_sum(int64_t dst) {
+    int64_t result;
+    int64_t result_1;
+    int64_t result_2;
+
+    result_1 = 0;
+    do {
+        result_2 = result + dst;
+        dst = dst - 1;
+    } while (dst != 0);
+    return;
+}
