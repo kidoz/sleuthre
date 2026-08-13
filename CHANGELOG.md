@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-13
+
 ### Added
 
 - **Struct/field inference evidence (roadmap 0.7).** Struct-pointer inference now records the concrete evidence behind every inferred field — each access site's address, direction (read/write), and width — instead of a single prose finding. A new **Inference Evidence** panel lists candidates with their fields, access sites, and confidence, and an analyst can accept (materializing a struct type whose `field_<offset>` names match the pseudocode, and retyping the matching ABI parameter to point at it), reject, or reset each one. Accept/reject go through the undo command stack, so they are undoable, cache-invalidating, and replicated over collaboration; review decisions survive re-analysis and are persisted with the project. The decompiler's "inferred signature" badge and the disassembly/pseudocode context menus link into the panel
