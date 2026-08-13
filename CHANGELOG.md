@@ -13,6 +13,7 @@
 
 ### Changed
 
+- Dependencies upgraded: `egui`/`eframe` 0.34 → 0.36 (panels now `show` instead of `show_inside`, tooltip and screen-rect APIs migrated), `egui_dock` 0.19 → 0.21, `gimli` 0.33 → 0.34, `object` 0.39 → 0.40, plus lockfile-wide semver-compatible updates
 - Stack variables are named from their location instead of a discovery counter (`var_18`, `arg_0`, `var_s10`), so names are stable across re-analysis and unrelated edits no longer renumber every later variable; frame slots are classified by base register and offset, so saved frame-pointer/return-address slots and sp-relative locals stop being reported as arguments
 - Parameter ordering and return-register detection follow the function's detected calling convention through the shared ABI model rather than a duplicated x86-64/ARM64 table: Win64 binaries order `rcx, rdx, r8, r9` instead of the SysV sequence, and ARM32/RISC-V get argument ordering they previously lacked
 - Struct overlays applied to an address now project into a typed, named global, so an overlay actually reaches the decompiler instead of being persisted and ignored; removing the overlay retracts exactly what it added, and a global from debug info is never displaced
