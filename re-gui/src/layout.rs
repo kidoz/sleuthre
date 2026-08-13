@@ -14,6 +14,10 @@ struct SleuthreTabViewer<'a> {
 impl TabViewer for SleuthreTabViewer<'_> {
     type Tab = Tab;
 
+    fn id(&mut self, tab: &mut Self::Tab) -> egui::Id {
+        egui::Id::new(*tab)
+    }
+
     fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
         tab.to_string().into()
     }
@@ -263,8 +267,7 @@ impl SleuthreApp {
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::LEFT_TOP, [0.0, 0.0])
             .show(ctx, |ui| {
-                #[allow(deprecated)]
-                let screen = ui.ctx().screen_rect();
+                let screen = ui.ctx().content_rect();
                 ui.allocate_exact_size(screen.size(), egui::Sense::hover());
                 ui.painter().rect_filled(
                     screen,
@@ -297,7 +300,7 @@ impl SleuthreApp {
     fn show_status_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::bottom("status_bar")
             .exact_size(20.0)
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.style_mut().spacing.item_spacing.x = 12.0;
 
@@ -387,7 +390,7 @@ impl SleuthreApp {
 
     fn show_top_panel(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        egui::Panel::top("top_panel").show_inside(ui, |ui| {
+        egui::Panel::top("top_panel").show(ui, |ui| {
             self.show_menu_bar(ui, &ctx);
             ui.separator();
             ui.horizontal(|ui| {
@@ -1253,8 +1256,13 @@ impl SleuthreApp {
                             if hover_addr < end { Some(f) } else { None }
                         });
 
-                    #[allow(deprecated)]
-                    egui::show_tooltip(ui.ctx(), ui.layer_id(), ui.id(), |ui| {
+                    egui::Tooltip::always_open(
+                        ui.ctx().clone(),
+                        ui.layer_id(),
+                        ui.id(),
+                        egui::PopupAnchor::Pointer,
+                    )
+                    .show(|ui| {
                         ui.label(format!("Address: {:08X}", hover_addr));
                         if let Some(seg) = segment_info {
                             ui.label(format!(
@@ -1323,7 +1331,7 @@ impl SleuthreApp {
         egui::Panel::bottom("bottom_panel")
             .resizable(true)
             .default_size(self.output_panel_height)
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
                         ui.label("Output");
@@ -1616,7 +1624,7 @@ impl SleuthreApp {
         egui::Panel::left("left_panel")
             .resizable(true)
             .default_size(320.0)
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 ui.heading("Functions");
 
                 // Filter row

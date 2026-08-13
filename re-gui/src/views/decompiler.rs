@@ -98,7 +98,7 @@ impl SleuthreApp {
             let hover_addr = response.hover_pos().and_then(|pos| {
                 let relative_pos = pos - response.rect.min;
                 let cursor = galley.cursor_from_pos(relative_pos);
-                let char_idx = cursor.index;
+                let char_idx = cursor.index.0;
                 // Any Function/Global annotation at this char index is a candidate
                 // target for run-to-cursor.
                 self.decompiled_code.annotations.iter().find_map(|ann| {
@@ -119,7 +119,7 @@ impl SleuthreApp {
             {
                 let relative_pos = pos - response.rect.min;
                 let cursor = galley.cursor_from_pos(relative_pos);
-                let char_idx = cursor.index;
+                let char_idx = cursor.index.0;
 
                 // Find annotation at this index
                 for ann in &self.decompiled_code.annotations {

@@ -26,7 +26,7 @@ flate2 = "1.0"
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 # The `write` feature lets tests synthesize DWARF sections in memory instead of
 # checking binary fixtures into the repository.
-gimli = { version = "0.33", features = ["read", "write"] }
+gimli = { workspace = true, features = ["read", "write"] }
 
 [[bench]]
 name = "analysis"
