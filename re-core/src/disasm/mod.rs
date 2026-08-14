@@ -31,6 +31,16 @@ pub struct Instruction {
     pub groups: Vec<String>,
 }
 
+/// A borrowed view of one decoded instruction, valid only for the duration of
+/// the [`Disassembler::decode_one`] callback that produced it.
+#[derive(Debug, Clone, Copy)]
+pub struct InstructionRef<'a> {
+    pub address: u64,
+    pub bytes: &'a [u8],
+    pub mnemonic: &'a str,
+    pub op_str: &'a str,
+}
+
 pub struct Disassembler {
     cs: Capstone,
     /// A second handle with Capstone's detail mode off. Decoding fills the
@@ -150,6 +160,38 @@ impl Disassembler {
                 "Failed to disassemble instruction".to_string(),
             ))
         }
+    }
+
+    /// Decode one instruction and hand a borrowed view of it to `f`.
+    ///
+    /// Nothing is allocated for the instruction, unlike
+    /// [`Self::disassemble_one_fast`], which copies the bytes and both text
+    /// fields onto the heap. The walking passes decode millions of
+    /// instructions and only need to classify each one, so they use this.
+    pub fn decode_one<T>(
+        &self,
+        memory: &MemoryMap,
+        address: u64,
+        f: impl FnOnce(InstructionRef<'_>) -> T,
+    ) -> Result<T> {
+        let data = memory
+            .get_data(address, 15)
+            .ok_or_else(|| Error::Analysis(format!("Failed to read memory at 0x{:x}", address)))?;
+
+        let insns = self
+            .cs_no_detail
+            .disasm_count(data, address, 1)
+            .map_err(|e: capstone::Error| Error::Analysis(e.to_string()))?;
+
+        let insn = insns
+            .first()
+            .ok_or_else(|| Error::Analysis("Failed to disassemble instruction".to_string()))?;
+        Ok(f(InstructionRef {
+            address: insn.address(),
+            bytes: insn.bytes(),
+            mnemonic: insn.mnemonic().unwrap_or(""),
+            op_str: insn.op_str().unwrap_or(""),
+        }))
     }
 
     /// Like [`Self::disassemble_one`] but skips Capstone's detail pass. The

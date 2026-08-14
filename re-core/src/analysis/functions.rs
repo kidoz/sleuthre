@@ -345,17 +345,14 @@ impl FunctionManager {
             let max_instructions = 10_000;
 
             while instructions_seen < max_instructions {
-                let insn = match disasm.disassemble_one_fast(memory, addr) {
-                    Ok(i) => i,
-                    Err(_) => break,
+                let Ok(step) = disasm.decode_one(memory, addr, classify) else {
+                    break;
                 };
                 instructions_seen += 1;
 
-                let mnemonic = crate::disasm::lower_text(&insn.mnemonic);
-
                 // Check for call instructions — their targets are new functions
-                if is_call_mnemonic(&mnemonic)
-                    && let Some(target) = parse_target(&insn.op_str)
+                if step.is_call
+                    && let Some(target) = step.target
                     && memory.contains_address(target)
                     && !self.functions.contains_key(&target)
                 {
@@ -370,39 +367,39 @@ impl FunctionManager {
                 }
 
                 // Follow unconditional jumps within function
-                if (mnemonic == "jmp" || mnemonic == "b")
-                    && let Some(target) = parse_target(&insn.op_str)
+                if step.is_unconditional_jump
+                    && let Some(target) = step.target
                     && !visited.contains(&target)
                     && memory.contains_address(target)
                 {
                     addr = target;
                     continue;
                 }
-                if mnemonic == "jmp" || mnemonic == "b" {
+                if step.is_unconditional_jump {
                     break;
                 }
 
                 // Conditional branches: follow both paths
-                if is_conditional_branch(&mnemonic)
-                    && let Some(target) = parse_target(&insn.op_str)
+                if step.is_conditional_branch
+                    && let Some(target) = step.target
                     && memory.contains_address(target)
                     && !visited.contains(&target)
                 {
-                    let next = insn.address + insn.bytes.len() as u64;
+                    let next = step.next_address();
                     self.scan_for_calls(memory, disasm, target, &mut queue, &mut visited);
                     addr = next;
                     continue;
                 }
 
-                if mnemonic == "ret" || mnemonic == "retn" || mnemonic == "bx" {
+                if step.is_return {
                     break;
                 }
 
-                if is_padding(&insn.mnemonic, &insn.bytes) {
+                if step.is_padding {
                     break;
                 }
 
-                addr = insn.address + insn.bytes.len() as u64;
+                addr = step.next_address();
             }
         }
 
@@ -424,15 +421,13 @@ impl FunctionManager {
         let mut addr = start;
         let mut count = 0u32;
         while count < 1000 {
-            let insn = match disasm.disassemble_one_fast(memory, addr) {
-                Ok(i) => i,
-                Err(_) => break,
+            let Ok(step) = disasm.decode_one(memory, addr, classify) else {
+                break;
             };
             count += 1;
-            let mnemonic = crate::disasm::lower_text(&insn.mnemonic);
 
-            if is_call_mnemonic(&mnemonic)
-                && let Some(target) = parse_target(&insn.op_str)
+            if step.is_call
+                && let Some(target) = step.target
                 && memory.contains_address(target)
                 && !self.functions.contains_key(&target)
             {
@@ -446,13 +441,13 @@ impl FunctionManager {
                 queue.push_back(target);
             }
 
-            if mnemonic == "ret" || mnemonic == "retn" || mnemonic == "jmp" || mnemonic == "bx" {
+            if step.is_return || step.is_jmp {
                 break;
             }
-            if is_padding(&insn.mnemonic, &insn.bytes) {
+            if step.is_padding {
                 break;
             }
-            addr = insn.address + insn.bytes.len() as u64;
+            addr = step.next_address();
         }
     }
 }
@@ -604,6 +599,46 @@ fn reg_is_written(mn: &str, ops: &str, reg: &str) -> bool {
         // `xor ecx, ecx` / `sub ecx, ecx` zero the register.
         "xor" | "sub" => ops.split(',').map(str::trim).all(|o| o == reg),
         _ => false,
+    }
+}
+
+/// The facts the descent walkers need about one instruction. Classification
+/// happens while the borrowed decode is still in scope, so the walk never
+/// allocates a per-instruction `Instruction`.
+#[derive(Debug, Clone, Copy)]
+struct Step {
+    address: u64,
+    length: u64,
+    target: Option<u64>,
+    is_call: bool,
+    /// `jmp` alone — the spelling the call scanner stops at.
+    is_jmp: bool,
+    /// `jmp`, or ARM's `b`.
+    is_unconditional_jump: bool,
+    is_conditional_branch: bool,
+    is_return: bool,
+    is_padding: bool,
+}
+
+impl Step {
+    fn next_address(&self) -> u64 {
+        self.address + self.length
+    }
+}
+
+fn classify(insn: crate::disasm::InstructionRef<'_>) -> Step {
+    let mnemonic = crate::disasm::lower_text(insn.mnemonic);
+    let is_jmp = mnemonic == "jmp";
+    Step {
+        address: insn.address,
+        length: insn.bytes.len() as u64,
+        target: parse_target(insn.op_str),
+        is_call: is_call_mnemonic(&mnemonic),
+        is_jmp,
+        is_unconditional_jump: is_jmp || mnemonic == "b",
+        is_conditional_branch: is_conditional_branch(&mnemonic),
+        is_return: mnemonic == "ret" || mnemonic == "retn" || mnemonic == "bx",
+        is_padding: is_padding(insn.mnemonic, insn.bytes),
     }
 }
 
