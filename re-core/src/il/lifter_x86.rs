@@ -290,7 +290,7 @@ fn parse_address_expr(func: &mut LlilFunction, expr: &str) -> ExprId {
 
 /// Determine memory access size from prefix (qword=8, dword=4, word=2, byte=1).
 fn mem_size_prefix(op: &str) -> u8 {
-    let lower = op.to_lowercase();
+    let lower = crate::disasm::lower_text(op);
     if lower.starts_with("qword") {
         8
     } else if lower.starts_with("dword") {
