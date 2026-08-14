@@ -57,7 +57,7 @@ impl FunctionIl {
             .unwrap_or(0x400)
             .clamp(1, 0x4000);
         let insns = disasm
-            .disassemble_range(memory, func.start_address, size)
+            .disassemble_range_fast(memory, func.start_address, size)
             .ok()?;
         if insns.is_empty() {
             return None;

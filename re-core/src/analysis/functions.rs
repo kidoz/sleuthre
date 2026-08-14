@@ -345,13 +345,13 @@ impl FunctionManager {
             let max_instructions = 10_000;
 
             while instructions_seen < max_instructions {
-                let insn = match disasm.disassemble_one(memory, addr) {
+                let insn = match disasm.disassemble_one_fast(memory, addr) {
                     Ok(i) => i,
                     Err(_) => break,
                 };
                 instructions_seen += 1;
 
-                let mnemonic = insn.mnemonic.to_lowercase();
+                let mnemonic = crate::disasm::lower_text(&insn.mnemonic);
 
                 // Check for call instructions — their targets are new functions
                 if is_call_mnemonic(&mnemonic)
@@ -424,12 +424,12 @@ impl FunctionManager {
         let mut addr = start;
         let mut count = 0u32;
         while count < 1000 {
-            let insn = match disasm.disassemble_one(memory, addr) {
+            let insn = match disasm.disassemble_one_fast(memory, addr) {
                 Ok(i) => i,
                 Err(_) => break,
             };
             count += 1;
-            let mnemonic = insn.mnemonic.to_lowercase();
+            let mnemonic = crate::disasm::lower_text(&insn.mnemonic);
 
             if is_call_mnemonic(&mnemonic)
                 && let Some(target) = parse_target(&insn.op_str)
@@ -498,7 +498,7 @@ fn detect_calling_convention(
     };
 
     // Disassemble the first ~20 instructions of the function to analyze prologue
-    let Ok(insns) = disasm.disassemble_range(memory, addr, 100) else {
+    let Ok(insns) = disasm.disassemble_range_fast(memory, addr, 100) else {
         return (default_cc, 0);
     };
 
@@ -641,7 +641,7 @@ fn is_conditional_branch(mnemonic: &str) -> bool {
 }
 
 fn is_padding(mnemonic: &str, bytes: &[u8]) -> bool {
-    let mn = mnemonic.to_lowercase();
+    let mn = crate::disasm::lower_text(mnemonic);
     // x86 NOP
     if mn == "nop" {
         return true;

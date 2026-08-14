@@ -309,7 +309,7 @@ pub fn infer_struct_candidates(
         let end_addr = func.end_address.unwrap_or(func.start_address + 0x100);
         let size = (end_addr.saturating_sub(func.start_address)) as usize;
 
-        let Ok(insns) = disasm.disassemble_range(memory, func.start_address, size.min(0x1000))
+        let Ok(insns) = disasm.disassemble_range_fast(memory, func.start_address, size.min(0x1000))
         else {
             continue;
         };

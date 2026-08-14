@@ -90,14 +90,14 @@ pub fn lift_function(name: &str, entry: u64, instructions: &[Instruction]) -> Ll
 
 /// Lift a single native instruction into one or more LLIL statements.
 fn lift_instruction(func: &mut LlilFunction, insn: &Instruction) -> Vec<LlilStmt> {
-    let mn = insn.mnemonic.to_lowercase();
+    let mn = crate::disasm::lower_text(&insn.mnemonic);
     let ops: Vec<&str> = if insn.op_str.is_empty() {
         vec![]
     } else {
         insn.op_str.split(',').map(|s| s.trim()).collect()
     };
 
-    match mn.as_str() {
+    match mn.as_ref() {
         "nop" | "endbr64" | "endbr32" => vec![LlilStmt::Nop],
 
         // --- Data movement ---

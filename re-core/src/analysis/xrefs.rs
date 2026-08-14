@@ -85,12 +85,12 @@ impl XrefManager {
 
             let mut addr = start_addr;
             while addr < end_boundary {
-                let insn = match disasm.disassemble_one(memory, addr) {
+                let insn = match disasm.disassemble_one_fast(memory, addr) {
                     Ok(i) => i,
                     Err(_) => break,
                 };
 
-                let mnemonic = insn.mnemonic.to_lowercase();
+                let mnemonic = crate::disasm::lower_text(&insn.mnemonic);
 
                 // Code xrefs: call/jump targets
                 if mnemonic == "call" || mnemonic.starts_with('j') {
@@ -173,7 +173,7 @@ impl XrefManager {
                 if let Some(target) = parse_hex_from_bracket(inner)
                     && memory.contains_address(target)
                 {
-                    let mn = mnemonic.to_lowercase();
+                    let mn = crate::disasm::lower_text(mnemonic);
                     let xref_type = if is_write_mnemonic(&mn) {
                         XrefType::DataWrite
                     } else {
@@ -215,7 +215,7 @@ impl XrefManager {
                 .unwrap_or(start_addr + 0x10000);
             let mut addr = start_addr;
             while addr < end_boundary {
-                let insn = match disasm.disassemble_one(memory, addr) {
+                let insn = match disasm.disassemble_one_fast(memory, addr) {
                     Ok(i) => i,
                     Err(_) => break,
                 };
