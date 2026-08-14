@@ -76,120 +76,56 @@ impl XrefManager {
             strings.iter().map(|s| s.address).collect();
 
         let func_starts: Vec<u64> = functions.functions.keys().copied().collect();
+        let ranges: Vec<(u64, u64)> = func_starts
+            .iter()
+            .enumerate()
+            .map(|(idx, &start_addr)| {
+                let end_boundary = func_starts
+                    .get(idx + 1)
+                    .copied()
+                    .unwrap_or(start_addr + 0x10000);
+                (start_addr, end_boundary)
+            })
+            .collect();
 
-        for (idx, &start_addr) in func_starts.iter().enumerate() {
-            let end_boundary = func_starts
-                .get(idx + 1)
-                .copied()
-                .unwrap_or(start_addr + 0x10000);
-
-            let mut addr = start_addr;
-            while addr < end_boundary {
-                let insn = match disasm.disassemble_one_fast(memory, addr) {
-                    Ok(i) => i,
-                    Err(_) => break,
-                };
-
-                let mnemonic = crate::disasm::lower_text(&insn.mnemonic);
-
-                // Code xrefs: call/jump targets
-                if mnemonic == "call" || mnemonic.starts_with('j') {
-                    if let Some(target_addr) = parse_address(&insn.op_str) {
-                        let xref_type = if mnemonic == "call" {
-                            XrefType::Call
-                        } else {
-                            XrefType::Jump
+        // Each function's range is walked independently, so the scan is split
+        // across threads (each with its own `Disassembler`, since Capstone is
+        // `!Send`). Replaying the per-chunk results in range order reproduces
+        // the sequential insertion order exactly.
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(ranges.len())
+            .max(1);
+        let chunk_len = ranges.len().div_ceil(workers).max(1);
+        let arch = disasm.arch;
+        let string_addrs = &string_addrs;
+        let per_chunk: Vec<Vec<Xref>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = ranges
+                .chunks(chunk_len)
+                .map(|chunk| {
+                    scope.spawn(move || {
+                        let mut out = Vec::new();
+                        let Ok(d) = Disassembler::new(arch) else {
+                            return out;
                         };
-                        self.add_xref(Xref {
-                            from_address: insn.address,
-                            to_address: target_addr,
-                            xref_type,
-                        });
-                    } else if insn.op_str.contains('[')
-                        && let Some(target_addr) = parse_hex_from_bracket(&insn.op_str)
-                        && memory.contains_address(target_addr)
-                    {
-                        let xref_type = if mnemonic == "call" {
-                            XrefType::Call
-                        } else {
-                            XrefType::Jump
-                        };
-                        self.add_xref(Xref {
-                            from_address: insn.address,
-                            to_address: target_addr,
-                            xref_type,
-                        });
-                    }
-                }
+                        for &(start, end) in chunk {
+                            collect_range_xrefs(memory, &d, start, end, string_addrs, &mut out);
+                        }
+                        out
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_default())
+                .collect()
+        });
 
-                // Data xrefs
-                self.extract_data_xrefs(&insn.mnemonic, &insn.op_str, insn.address, memory);
-
-                // String xrefs (only when string addresses are provided)
-                if !string_addrs.is_empty() {
-                    if (mnemonic == "lea" || mnemonic == "adr" || mnemonic == "adrp")
-                        && let Some(target) = self.extract_effective_address(&insn, addr)
-                        && string_addrs.contains(&target)
-                    {
-                        self.add_xref(Xref {
-                            from_address: insn.address,
-                            to_address: target,
-                            xref_type: XrefType::StringRef,
-                        });
-                    }
-                    if (mnemonic == "mov" || mnemonic == "movabs")
-                        && let Some(target) = parse_address_from_operands(&insn.op_str)
-                        && string_addrs.contains(&target)
-                    {
-                        self.add_xref(Xref {
-                            from_address: insn.address,
-                            to_address: target,
-                            xref_type: XrefType::StringRef,
-                        });
-                    }
-                }
-
-                // Do not stop at a `ret`: multi-exit functions have code
-                // (and xrefs) after their first return; the walk is already
-                // bounded by `end_boundary`.
-                addr += insn.bytes.len() as u64;
-            }
+        for xref in per_chunk.into_iter().flatten() {
+            self.add_xref(xref);
         }
         Ok(())
-    }
-
-    fn extract_data_xrefs(
-        &mut self,
-        mnemonic: &str,
-        op_str: &str,
-        from_addr: u64,
-        memory: &MemoryMap,
-    ) {
-        // Look for [0xHEX] patterns in operand string
-        let mut remaining = op_str;
-        while let Some(bracket_start) = remaining.find('[') {
-            if let Some(bracket_end) = remaining[bracket_start..].find(']') {
-                let inner = &remaining[bracket_start + 1..bracket_start + bracket_end];
-                if let Some(target) = parse_hex_from_bracket(inner)
-                    && memory.contains_address(target)
-                {
-                    let mn = crate::disasm::lower_text(mnemonic);
-                    let xref_type = if is_write_mnemonic(&mn) {
-                        XrefType::DataWrite
-                    } else {
-                        XrefType::DataRead
-                    };
-                    self.add_xref(Xref {
-                        from_address: from_addr,
-                        to_address: target,
-                        xref_type,
-                    });
-                }
-                remaining = &remaining[bracket_start + bracket_end + 1..];
-            } else {
-                break;
-            }
-        }
     }
 
     /// Scan for string references in disassembled code.
@@ -224,7 +160,7 @@ impl XrefManager {
                 // Check for LEA instructions (RIP-relative string loading)
                 // Pattern: lea reg, [rip + 0x????] where the effective address is a string
                 if (mn == "lea" || mn == "adr" || mn == "adrp")
-                    && let Some(target) = self.extract_effective_address(&insn, addr)
+                    && let Some(target) = effective_address(&insn, addr)
                     && string_addrs.contains(&target)
                 {
                     self.add_xref(Xref {
@@ -255,36 +191,149 @@ impl XrefManager {
         }
         Ok(())
     }
+}
 
-    fn extract_effective_address(
-        &self,
-        insn: &crate::disasm::Instruction,
-        insn_addr: u64,
-    ) -> Option<u64> {
-        // Parse [rip + 0xNNNN] or [pc, #NNNN] patterns
-        let op = &insn.op_str;
-        if let Some(bracket_start) = op.find('[')
-            && let Some(bracket_end) = op[bracket_start..].find(']')
-        {
-            let inner = &op[bracket_start + 1..bracket_start + bracket_end];
-            // RIP-relative: [rip + 0xNNNN]
-            if inner.contains("rip") {
-                if let Some(plus_pos) = inner.find('+') {
-                    let offset_str = inner[plus_pos + 1..].trim().trim_start_matches("0x");
-                    if let Ok(offset) = u64::from_str_radix(offset_str, 16) {
-                        // RIP-relative uses next instruction address as base
-                        return Some(insn_addr + insn.bytes.len() as u64 + offset);
-                    }
+/// Parse `[rip + 0xNNNN]` / `[pc, #NNNN]` operands into the address they
+/// resolve to, relative to the following instruction.
+fn effective_address(insn: &crate::disasm::Instruction, insn_addr: u64) -> Option<u64> {
+    let op = &insn.op_str;
+    if let Some(bracket_start) = op.find('[')
+        && let Some(bracket_end) = op[bracket_start..].find(']')
+    {
+        let inner = &op[bracket_start + 1..bracket_start + bracket_end];
+        // RIP-relative: [rip + 0xNNNN]
+        if inner.contains("rip") {
+            if let Some(plus_pos) = inner.find('+') {
+                let offset_str = inner[plus_pos + 1..].trim().trim_start_matches("0x");
+                if let Ok(offset) = u64::from_str_radix(offset_str, 16) {
+                    // RIP-relative uses next instruction address as base
+                    return Some(insn_addr + insn.bytes.len() as u64 + offset);
                 }
-                if let Some(minus_pos) = inner.find('-') {
-                    let offset_str = inner[minus_pos + 1..].trim().trim_start_matches("0x");
-                    if let Ok(offset) = u64::from_str_radix(offset_str, 16) {
-                        return Some(insn_addr + insn.bytes.len() as u64 - offset);
-                    }
+            }
+            if let Some(minus_pos) = inner.find('-') {
+                let offset_str = inner[minus_pos + 1..].trim().trim_start_matches("0x");
+                if let Ok(offset) = u64::from_str_radix(offset_str, 16) {
+                    return Some(insn_addr + insn.bytes.len() as u64 - offset);
                 }
             }
         }
-        None
+    }
+    None
+}
+
+/// Append the data xrefs implied by one instruction's operands.
+fn collect_data_xrefs(
+    mnemonic: &str,
+    op_str: &str,
+    from_addr: u64,
+    memory: &MemoryMap,
+    out: &mut Vec<Xref>,
+) {
+    // Look for [0xHEX] patterns in operand string
+    let mut remaining = op_str;
+    while let Some(bracket_start) = remaining.find('[') {
+        if let Some(bracket_end) = remaining[bracket_start..].find(']') {
+            let inner = &remaining[bracket_start + 1..bracket_start + bracket_end];
+            if let Some(target) = parse_hex_from_bracket(inner)
+                && memory.contains_address(target)
+            {
+                let mn = crate::disasm::lower_text(mnemonic);
+                let xref_type = if is_write_mnemonic(&mn) {
+                    XrefType::DataWrite
+                } else {
+                    XrefType::DataRead
+                };
+                out.push(Xref {
+                    from_address: from_addr,
+                    to_address: target,
+                    xref_type,
+                });
+            }
+            remaining = &remaining[bracket_start + bracket_end + 1..];
+        } else {
+            break;
+        }
+    }
+}
+
+/// Walk `[start, end)` and append every xref found, in instruction order.
+fn collect_range_xrefs(
+    memory: &MemoryMap,
+    disasm: &Disassembler,
+    start: u64,
+    end: u64,
+    string_addrs: &std::collections::HashSet<u64>,
+    out: &mut Vec<Xref>,
+) {
+    let mut addr = start;
+    while addr < end {
+        let insn = match disasm.disassemble_one_fast(memory, addr) {
+            Ok(i) => i,
+            Err(_) => break,
+        };
+
+        let mnemonic = crate::disasm::lower_text(&insn.mnemonic);
+
+        // Code xrefs: call/jump targets
+        if mnemonic == "call" || mnemonic.starts_with('j') {
+            if let Some(target_addr) = parse_address(&insn.op_str) {
+                let xref_type = if mnemonic == "call" {
+                    XrefType::Call
+                } else {
+                    XrefType::Jump
+                };
+                out.push(Xref {
+                    from_address: insn.address,
+                    to_address: target_addr,
+                    xref_type,
+                });
+            } else if insn.op_str.contains('[')
+                && let Some(target_addr) = parse_hex_from_bracket(&insn.op_str)
+                && memory.contains_address(target_addr)
+            {
+                let xref_type = if mnemonic == "call" {
+                    XrefType::Call
+                } else {
+                    XrefType::Jump
+                };
+                out.push(Xref {
+                    from_address: insn.address,
+                    to_address: target_addr,
+                    xref_type,
+                });
+            }
+        }
+
+        // Data xrefs
+        collect_data_xrefs(&insn.mnemonic, &insn.op_str, insn.address, memory, out);
+
+        // String xrefs (only when string addresses are provided)
+        if !string_addrs.is_empty() {
+            if (mnemonic == "lea" || mnemonic == "adr" || mnemonic == "adrp")
+                && let Some(target) = effective_address(&insn, addr)
+                && string_addrs.contains(&target)
+            {
+                out.push(Xref {
+                    from_address: insn.address,
+                    to_address: target,
+                    xref_type: XrefType::StringRef,
+                });
+            }
+            if (mnemonic == "mov" || mnemonic == "movabs")
+                && let Some(target) = parse_address_from_operands(&insn.op_str)
+                && string_addrs.contains(&target)
+            {
+                out.push(Xref {
+                    from_address: insn.address,
+                    to_address: target,
+                    xref_type: XrefType::StringRef,
+                });
+            }
+        }
+
+        // Do not stop at a `ret`: multi-exit functions have code (and xrefs)
+        // after their first return; the walk is already bounded by `end`.
+        addr += insn.bytes.len() as u64;
     }
 }
 
@@ -422,7 +471,6 @@ mod tests {
 
     #[test]
     fn extract_effective_address_rip_relative() {
-        let mgr = XrefManager::new();
         // Simulate a LEA instruction: lea rdi, [rip + 0x2000]
         // instruction at 0x1000, 7 bytes long
         let insn = crate::disasm::Instruction {
@@ -432,14 +480,13 @@ mod tests {
             op_str: "rdi, [rip + 0x2000]".to_string(),
             groups: vec![],
         };
-        let result = mgr.extract_effective_address(&insn, 0x1000);
+        let result = effective_address(&insn, 0x1000);
         // Expected: 0x1000 + 7 + 0x2000 = 0x3007
         assert_eq!(result, Some(0x3007));
     }
 
     #[test]
     fn extract_effective_address_rip_minus() {
-        let mgr = XrefManager::new();
         let insn = crate::disasm::Instruction {
             address: 0x5000,
             bytes: vec![0x48, 0x8d, 0x3d, 0x00, 0x10, 0x00, 0x00], // 7 bytes
@@ -447,14 +494,13 @@ mod tests {
             op_str: "rdi, [rip - 0x1000]".to_string(),
             groups: vec![],
         };
-        let result = mgr.extract_effective_address(&insn, 0x5000);
+        let result = effective_address(&insn, 0x5000);
         // Expected: 0x5000 + 7 - 0x1000 = 0x4007
         assert_eq!(result, Some(0x4007));
     }
 
     #[test]
     fn extract_effective_address_no_rip() {
-        let mgr = XrefManager::new();
         let insn = crate::disasm::Instruction {
             address: 0x1000,
             bytes: vec![0x48, 0x8d, 0x04, 0x25, 0x00, 0x20, 0x00, 0x00],
@@ -462,7 +508,7 @@ mod tests {
             op_str: "rax, [rbx + 0x10]".to_string(),
             groups: vec![],
         };
-        let result = mgr.extract_effective_address(&insn, 0x1000);
+        let result = effective_address(&insn, 0x1000);
         assert_eq!(result, None);
     }
 }
