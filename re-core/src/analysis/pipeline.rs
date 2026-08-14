@@ -418,19 +418,59 @@ fn analyze_loaded_with_bytes(
         // Each function's IL is summarized into call-flow facts and then
         // dropped: retaining every function's MLIL at once costs gigabytes on a
         // large binary, and inference only ever reads the facts.
+        //
+        // Functions are independent, so the lift is split across threads. Each
+        // worker builds its own `Disassembler` (Capstone is `!Send`) and takes a
+        // contiguous chunk; concatenating the chunk results in order reproduces
+        // the sequential fact order exactly.
         let mut call_flow_facts = Vec::new();
-        if let Some(ref d) = disasm {
-            for func in project.functions.functions.values() {
-                check_cancelled(cancellation)?;
-                if let Some(il) =
-                    FunctionIl::build(&project.memory_map, d, loaded.arch, loaded.format, func)
-                {
-                    crate::analysis::type_propagation::extract_call_flow_facts(
-                        &il,
-                        &mut call_flow_facts,
-                    );
-                }
-            }
+        if disasm.is_some() {
+            let funcs: Vec<&crate::analysis::functions::Function> =
+                project.functions.functions.values().collect();
+            let workers = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .min(funcs.len())
+                .max(1);
+            let chunk_len = funcs.len().div_ceil(workers).max(1);
+            let memory = &project.memory_map;
+            let (arch, format) = (loaded.arch, loaded.format);
+            let per_chunk: Vec<Vec<crate::analysis::type_propagation::CallFlowFact>> =
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = funcs
+                        .chunks(chunk_len)
+                        .map(|chunk| {
+                            scope.spawn(move || {
+                                let mut out = Vec::new();
+                                let Ok(d) = Disassembler::new(arch) else {
+                                    return out;
+                                };
+                                for func in chunk {
+                                    if cancellation.is_some_and(AnalysisCancellation::is_cancelled)
+                                    {
+                                        break;
+                                    }
+                                    if let Some(il) =
+                                        FunctionIl::build(memory, &d, arch, format, func)
+                                    {
+                                        crate::analysis::type_propagation::extract_call_flow_facts(
+                                            &il, &mut out,
+                                        );
+                                    }
+                                }
+                                out
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().unwrap_or_default())
+                        .collect()
+                });
+            // A cancellation observed mid-lift leaves the facts partial; fail
+            // here rather than propagating types from an incomplete picture.
+            check_cancelled(cancellation)?;
+            call_flow_facts = per_chunk.into_iter().flatten().collect();
         }
         let propagator = TypePropagator::new(
             &project.functions,
