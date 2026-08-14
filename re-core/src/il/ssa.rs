@@ -166,12 +166,11 @@ impl DefUse {
     /// (the latest def strictly before it). Ignores branch merges — a
     /// single-path approximation; do not rely on it where control flow joins.
     pub fn reaching_def(&self, name: &str, before: Site) -> Option<Site> {
-        self.defs
-            .get(name)?
-            .iter()
-            .copied()
-            .filter(|d| d.order() < before.order())
-            .max_by_key(|d| d.order())
+        // `build` appends sites in program order, so the def list is sorted by
+        // `order()` and the reaching def is the last entry before `before`.
+        let defs = self.defs.get(name)?;
+        let idx = defs.partition_point(|d| d.order() < before.order());
+        idx.checked_sub(1).map(|i| defs[i])
     }
 }
 
