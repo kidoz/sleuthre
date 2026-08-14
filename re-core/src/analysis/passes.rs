@@ -217,6 +217,17 @@ impl AnalysisPass for ImportThunkNamePass {
             .map(|f| (f.start_address, f.end_address))
             .collect();
 
+        // Sort the xref origins once so each function inspects only the
+        // entries inside its own range instead of the whole map — the full
+        // scan per function is quadratic and dominates analysis on binaries
+        // with tens of thousands of functions.
+        let mut from_sorted: Vec<(u64, &Vec<crate::analysis::xrefs::Xref>)> = xrefs
+            .from_address_xrefs
+            .iter()
+            .map(|(&from, refs)| (from, refs))
+            .collect();
+        from_sorted.sort_unstable_by_key(|&(from, _)| from);
+
         for (start, end) in bounds {
             // Count this function's outbound code references to imports vs. to
             // anything else. A function that calls/jumps exactly one import and
@@ -225,10 +236,9 @@ impl AnalysisPass for ImportThunkNamePass {
             let mut import_hit: Option<&str> = None;
             let mut import_count = 0usize;
             let mut other_calls = 0usize;
-            for (from, refs) in &xrefs.from_address_xrefs {
-                if *from < start || *from >= stop {
-                    continue;
-                }
+            let lo = from_sorted.partition_point(|&(from, _)| from < start);
+            let hi = from_sorted.partition_point(|&(from, _)| from < stop);
+            for &(_, refs) in &from_sorted[lo..hi] {
                 for x in refs {
                     if !matches!(
                         x.xref_type,
