@@ -414,14 +414,21 @@ fn analyze_loaded_with_bytes(
         // Lift each function to IL (with call ABI effects + def-use) so the
         // propagator can run backward inference across calls. Cancellation-aware;
         // functions whose arch ABI is unmodelled or that fail to lift are skipped.
-        let mut il_map = std::collections::BTreeMap::new();
+        //
+        // Each function's IL is summarized into call-flow facts and then
+        // dropped: retaining every function's MLIL at once costs gigabytes on a
+        // large binary, and inference only ever reads the facts.
+        let mut call_flow_facts = Vec::new();
         if let Some(ref d) = disasm {
             for func in project.functions.functions.values() {
                 check_cancelled(cancellation)?;
                 if let Some(il) =
                     FunctionIl::build(&project.memory_map, d, loaded.arch, loaded.format, func)
                 {
-                    il_map.insert(func.start_address, il);
+                    crate::analysis::type_propagation::extract_call_flow_facts(
+                        &il,
+                        &mut call_flow_facts,
+                    );
                 }
             }
         }
@@ -431,7 +438,7 @@ fn analyze_loaded_with_bytes(
             &project.type_libs,
             &project.imports,
         )
-        .with_il(&il_map);
+        .with_call_flow_facts(call_flow_facts);
         let type_info = propagator.propagate(&debug_info, &project.types);
         for (&addr, info) in &type_info {
             if let Some(ref sig) = info.signature {

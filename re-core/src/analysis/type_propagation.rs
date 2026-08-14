@@ -72,15 +72,77 @@ impl FunctionIl {
     }
 }
 
+/// One argument-passing link recovered from a function's IL: at a call to
+/// `callee`, argument slot `slot` held the return value of a call to
+/// `producer`.
+///
+/// This is the whole of what backward inference reads from the IL, and it does
+/// not depend on which signatures are known yet — so it is extracted once and
+/// the (large) IL dropped, instead of re-walking every function's IL on each
+/// inference round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallFlowFact {
+    pub callee: u64,
+    pub slot: usize,
+    pub producer: u64,
+}
+
+/// Recover every [`CallFlowFact`] in one function's IL, appending to `out`.
+pub fn extract_call_flow_facts(il: &FunctionIl, out: &mut Vec<CallFlowFact>) {
+    let ret_reg = il.abi.ret_reg;
+    let arg_regs = il.abi.arg_regs;
+    for (inst_index, inst) in il.mlil.instructions.iter().enumerate() {
+        for (stmt_index, stmt) in inst.stmts.iter().enumerate() {
+            let Some(callee) = call_target(stmt) else {
+                continue;
+            };
+            let call_site = Site {
+                inst_index,
+                stmt_index,
+                address: inst.address,
+            };
+            for (slot, &arg_reg) in arg_regs.iter().enumerate() {
+                // The value in arg_reg at this call came from a copy of the
+                // return register, which was defined by an earlier call.
+                let Some(def_site) = il.defuse.reaching_def(arg_reg, call_site) else {
+                    continue;
+                };
+                if !is_copy_from(stmt_at(il, def_site), arg_reg, ret_reg) {
+                    continue;
+                }
+                let Some(prod_site) = il.defuse.reaching_def(ret_reg, def_site) else {
+                    continue;
+                };
+                // `reaching_def` is a single-path approximation; only trust the
+                // producer→consumer link when no control-flow transfer sits
+                // between them, avoiding a branch-induced mis-link.
+                if control_flow_between(il, prod_site, call_site) {
+                    continue;
+                }
+                if let Some(producer) = call_defining(stmt_at(il, prod_site), ret_reg) {
+                    out.push(CallFlowFact {
+                        callee,
+                        slot,
+                        producer,
+                    });
+                }
+            }
+        }
+    }
+}
+
 /// Propagates type information across function call sites.
 pub struct TypePropagator<'a> {
     functions: &'a FunctionManager,
     xrefs: &'a XrefManager,
     type_libs: &'a TypeLibraryManager,
     imports: &'a [Import],
-    /// Per-function IL keyed by start address, when available. Backward
-    /// (IL-based) inference uses it; seed/forward passes work without it.
+    /// Per-function IL keyed by start address, when available. Only retained so
+    /// [`Self::function_il`] can hand it back; inference reads `facts`.
     il: Option<&'a BTreeMap<u64, FunctionIl>>,
+    /// Argument-passing links driving backward inference. Empty means the
+    /// seed/forward passes run alone.
+    facts: Vec<CallFlowFact>,
 }
 
 impl<'a> TypePropagator<'a> {
@@ -96,13 +158,29 @@ impl<'a> TypePropagator<'a> {
             type_libs,
             imports,
             il: None,
+            facts: Vec::new(),
         }
     }
 
     /// Attach per-function IL (built via [`FunctionIl::build`]) so the
     /// propagator can follow values across calls during backward inference.
+    ///
+    /// Callers analysing a whole binary should prefer [`Self::with_call_flow_facts`],
+    /// which lets each function's IL be dropped as soon as it is summarized.
     pub fn with_il(mut self, il: &'a BTreeMap<u64, FunctionIl>) -> Self {
+        let mut facts = Vec::new();
+        for f in il.values() {
+            extract_call_flow_facts(f, &mut facts);
+        }
         self.il = Some(il);
+        self.facts = facts;
+        self
+    }
+
+    /// Attach pre-extracted [`CallFlowFact`]s, so backward inference runs
+    /// without the IL they came from being kept alive.
+    pub fn with_call_flow_facts(mut self, facts: Vec<CallFlowFact>) -> Self {
+        self.facts = facts;
         self
     }
 
@@ -269,59 +347,21 @@ impl<'a> TypePropagator<'a> {
         &self,
         result: &BTreeMap<u64, FunctionTypeInfo>,
     ) -> BTreeMap<u64, TypeRef> {
-        let Some(il_map) = self.il else {
-            return BTreeMap::new();
-        };
         let mut candidates: BTreeMap<u64, Vec<TypeRef>> = BTreeMap::new();
 
-        for il in il_map.values() {
-            let ret_reg = il.abi.ret_reg;
-            let arg_regs = il.abi.arg_regs;
-            for (inst_index, inst) in il.mlil.instructions.iter().enumerate() {
-                for (stmt_index, stmt) in inst.stmts.iter().enumerate() {
-                    // A call to a function H that already has a signature.
-                    let Some(h_addr) = call_target(stmt) else {
-                        continue;
-                    };
-                    let Some(h_sig) = result.get(&h_addr).and_then(|i| i.signature.as_ref()) else {
-                        continue;
-                    };
-                    let call_site = Site {
-                        inst_index,
-                        stmt_index,
-                        address: inst.address,
-                    };
-                    for (k, param) in h_sig.parameters.iter().enumerate() {
-                        let Some(&arg_reg) = arg_regs.get(k) else {
-                            break; // beyond register-passed arguments
-                        };
-                        // The value in arg_reg at this call came from a copy of
-                        // the return register, which was defined by a call to G.
-                        let Some(def_site) = il.defuse.reaching_def(arg_reg, call_site) else {
-                            continue;
-                        };
-                        if !is_copy_from(stmt_at(il, def_site), arg_reg, ret_reg) {
-                            continue;
-                        }
-                        let Some(call_g_site) = il.defuse.reaching_def(ret_reg, def_site) else {
-                            continue;
-                        };
-                        // `reaching_def` is a single-path approximation; only
-                        // trust the producer→consumer link when no control-flow
-                        // transfer sits between them (so the value provably flows
-                        // straight through), avoiding a branch-induced mis-link.
-                        if control_flow_between(il, call_g_site, call_site) {
-                            continue;
-                        }
-                        if let Some(g_addr) = call_defining(stmt_at(il, call_g_site), ret_reg) {
-                            candidates
-                                .entry(g_addr)
-                                .or_default()
-                                .push(param.type_ref.clone());
-                        }
-                    }
-                }
-            }
+        for fact in &self.facts {
+            // The consuming call must already be typed, and the slot must be
+            // one of its declared (register-passed) parameters.
+            let Some(h_sig) = result.get(&fact.callee).and_then(|i| i.signature.as_ref()) else {
+                continue;
+            };
+            let Some(param) = h_sig.parameters.get(fact.slot) else {
+                continue;
+            };
+            candidates
+                .entry(fact.producer)
+                .or_default()
+                .push(param.type_ref.clone());
         }
 
         // Commit only callees that are untyped and whose evidence is unanimous.
@@ -354,52 +394,22 @@ impl<'a> TypePropagator<'a> {
         &self,
         result: &BTreeMap<u64, FunctionTypeInfo>,
     ) -> BTreeMap<u64, Vec<TypeRef>> {
-        let Some(il_map) = self.il else {
-            return BTreeMap::new();
-        };
         // (callee addr, arg slot) -> candidate types.
         let mut candidates: BTreeMap<(u64, usize), Vec<TypeRef>> = BTreeMap::new();
 
-        for il in il_map.values() {
-            let ret_reg = il.abi.ret_reg;
-            let arg_regs = il.abi.arg_regs;
-            for (inst_index, inst) in il.mlil.instructions.iter().enumerate() {
-                for (stmt_index, stmt) in inst.stmts.iter().enumerate() {
-                    let Some(g_addr) = call_target(stmt) else {
-                        continue;
-                    };
-                    let call_site = Site {
-                        inst_index,
-                        stmt_index,
-                        address: inst.address,
-                    };
-                    for (k, &arg_reg) in arg_regs.iter().enumerate() {
-                        let Some(def_site) = il.defuse.reaching_def(arg_reg, call_site) else {
-                            continue;
-                        };
-                        if !is_copy_from(stmt_at(il, def_site), arg_reg, ret_reg) {
-                            continue;
-                        }
-                        let Some(prod_site) = il.defuse.reaching_def(ret_reg, def_site) else {
-                            continue;
-                        };
-                        // Same straight-line requirement as return inference: no
-                        // control-flow transfer between producer and consumer.
-                        if control_flow_between(il, prod_site, call_site) {
-                            continue;
-                        }
-                        if let Some(h_addr) = call_defining(stmt_at(il, prod_site), ret_reg)
-                            && let Some(h_sig) =
-                                result.get(&h_addr).and_then(|i| i.signature.as_ref())
-                        {
-                            candidates
-                                .entry((g_addr, k))
-                                .or_default()
-                                .push(h_sig.return_type.clone());
-                        }
-                    }
-                }
-            }
+        for fact in &self.facts {
+            // The value flowing into the slot is typed only once the function
+            // that produced it has a signature.
+            let Some(h_sig) = result
+                .get(&fact.producer)
+                .and_then(|i| i.signature.as_ref())
+            else {
+                continue;
+            };
+            candidates
+                .entry((fact.callee, fact.slot))
+                .or_default()
+                .push(h_sig.return_type.clone());
         }
 
         // Unify each slot, then keep the contiguous prefix arg0, arg1, … .
@@ -438,16 +448,17 @@ impl<'a> TypePropagator<'a> {
 
     /// Find the function that contains a given address.
     fn find_containing_function(&self, addr: u64) -> Option<u64> {
-        // Binary search for the function whose range includes addr
-        for (&start, func) in self.functions.functions.iter().rev() {
-            if addr >= start {
-                if let Some(end) = func.end_address {
-                    if addr < end {
-                        return Some(start);
-                    }
-                } else {
-                    return Some(start);
-                }
+        // Walk candidates from the greatest start address downwards. Seeking
+        // with `range(..=addr)` skips the functions that start after `addr`
+        // outright — the same candidates in the same order, without the full
+        // reverse scan this performs once per call xref.
+        for (&start, func) in self.functions.functions.range(..=addr).rev() {
+            match func.end_address {
+                Some(end) if addr < end => return Some(start),
+                // A function that ends before `addr` does not rule out an
+                // enclosing one that starts earlier, so keep walking back.
+                Some(_) => {}
+                None => return Some(start),
             }
         }
         None
@@ -463,7 +474,17 @@ fn control_flow_between(il: &FunctionIl, a: Site, b: Site) -> bool {
     let a = (a.inst_index, a.stmt_index);
     let b = (b.inst_index, b.stmt_index);
     let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-    for (ii, inst) in il.mlil.instructions.iter().enumerate() {
+    // Only instructions in `lo.0..=hi.0` can hold a statement between the two
+    // sites; skipping the rest keeps this linear in the gap, not in the
+    // function, which matters when it runs once per inference candidate.
+    let span = il
+        .mlil
+        .instructions
+        .iter()
+        .enumerate()
+        .skip(lo.0)
+        .take(hi.0.saturating_sub(lo.0) + 1);
+    for (ii, inst) in span {
         for (si, stmt) in inst.stmts.iter().enumerate() {
             let here = (ii, si);
             if here > lo
