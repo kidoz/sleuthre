@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-08-14
+
+### Fixed
+
+- Analysis of a large binary was quadratic in function count: the import-thunk naming pass rescanned the entire cross-reference map once per function. Xref origins are now indexed once and each function's range located by binary search — on a stripped 8 MB x86-64 PE with 10,639 functions that stage drops from 6.3s to 0.4s
+- Type propagation retained every function's lifted IL for the whole inference run and re-walked all of it on each of up to eight rounds. Each function's IL is now summarized into compact call-flow facts (the only thing backward inference reads) and dropped immediately, cutting peak memory on the same binary from 2.5 GB to 176 MB and the stage from 2.6s to 0.3s
+- `DefUse::reaching_def` scanned every definition of a register to find the latest one before a site, though the definition list is already in program order; it binary-searches instead
+- `control_flow_between` scanned a whole function's IL per inference candidate rather than only the statements between the two sites, and the propagator's `find_containing_function` walked every function on every call xref instead of seeking with a range query
+
+### Changed
+
+- Loading a binary is roughly 7x faster end to end and uses 14x less memory (10.2s / 2.5 GB → 1.5s / 176 MB on the 8 MB PE above), with `analyze`, `functions`, `strings`, `imports`, `exports`, `info`, `plugins`, and decompiler output byte-identical to 0.7.0
+- Function IL lifting and the cross-reference scan run across worker threads, each with its own Capstone handle since Capstone is `!Send`; per-chunk results are merged in range order, so the output and its ordering stay deterministic
+- Analysis passes that never read instruction groups decode with Capstone's detail mode off, and the recursive-descent walkers classify instructions from a borrowed decode instead of allocating an owned `Instruction` per instruction
+- Instruction text is lowercased without allocating when it is already lowercase, which it always is coming from Capstone
+
 ## [0.7.0] - 2026-08-13
 
 ### Added
