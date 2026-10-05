@@ -385,6 +385,15 @@ impl FunctionManager {
     }
 
     /// Recursive descent: discover functions by following call targets from known functions
+    /// Walk every known function's code paths, adding direct call targets as
+    /// new functions.
+    ///
+    /// The walk follows both directions of conditional branches and forward
+    /// unconditional jumps. Instruction addresses are tracked per function so
+    /// a backward jump closes the loop instead of re-walking it — without that
+    /// set, one jump loop consumes the whole per-function budget and hides the
+    /// calls in every later block. When an exception-table end is known the
+    /// walk stops there rather than running into the next function.
     pub fn discover_functions_recursive(
         &mut self,
         memory: &MemoryMap,
@@ -397,116 +406,87 @@ impl FunctionManager {
             if !visited.insert(func_addr) {
                 continue;
             }
+            let func_end = self.functions.get(&func_addr).and_then(|f| f.end_address);
 
-            let mut addr = func_addr;
+            // Safety bound for functions without a known extent; a walked-set
+            // keeps real traversal proportional to the function's size.
+            let max_instructions = 50_000;
             let mut instructions_seen = 0u32;
-            let max_instructions = 10_000;
+            let mut walked: HashSet<u64> = HashSet::new();
+            let mut block_queue: Vec<u64> = vec![func_addr];
 
-            while instructions_seen < max_instructions {
-                let Ok(step) = disasm.decode_one(memory, addr, classify) else {
-                    break;
-                };
-                instructions_seen += 1;
+            // With a known end the range itself bounds the walk; a single
+            // in-function `nop` (compilers emit them for alignment) must not
+            // stop it. Without an end, a *run* of padding is the only signal
+            // that the walk has left the function.
+            let mut padding_run = 0u32;
 
-                // Check for call instructions — their targets are new functions
-                if step.is_call
-                    && let Some(target) = step.target
-                    && memory.contains_address(target)
-                    && !self.functions.contains_key(&target)
-                {
-                    self.add_function(Function {
-                        name: format!("sub_{:x}", target),
-                        start_address: target,
-                        end_address: None,
-                        calling_convention: CallingConvention::default(),
-                        stack_frame_size: 0,
-                    });
-                    queue.push_back(target);
+            'blocks: while let Some(block) = block_queue.pop() {
+                let mut addr = block;
+                while instructions_seen < max_instructions {
+                    if func_end.is_some_and(|end| addr >= end) || !walked.insert(addr) {
+                        break;
+                    }
+                    let Ok(step) = disasm.decode_one(memory, addr, classify) else {
+                        break;
+                    };
+                    instructions_seen += 1;
+
+                    // Call targets are new functions.
+                    if step.is_call
+                        && let Some(target) = step.target
+                        && memory.contains_address(target)
+                        && !self.functions.contains_key(&target)
+                    {
+                        self.add_function(Function {
+                            name: format!("sub_{:x}", target),
+                            start_address: target,
+                            end_address: None,
+                            calling_convention: CallingConvention::default(),
+                            stack_frame_size: 0,
+                        });
+                        queue.push_back(target);
+                    }
+
+                    if step.is_return {
+                        break;
+                    }
+                    if step.is_padding {
+                        padding_run += 1;
+                        if func_end.is_none() && padding_run >= 2 {
+                            break;
+                        }
+                    } else {
+                        padding_run = 0;
+                    }
+
+                    if step.is_unconditional_jump {
+                        match step.target.filter(|t| memory.contains_address(*t)) {
+                            Some(target) => {
+                                addr = target;
+                                continue;
+                            }
+                            None => break,
+                        }
+                    }
+
+                    if step.is_conditional_branch {
+                        if let Some(target) = step.target.filter(|t| memory.contains_address(*t)) {
+                            block_queue.push(target);
+                        }
+                        addr = step.next_address();
+                        continue;
+                    }
+
+                    addr = step.next_address();
                 }
-
-                // Follow unconditional jumps within function
-                if step.is_unconditional_jump
-                    && let Some(target) = step.target
-                    && !visited.contains(&target)
-                    && memory.contains_address(target)
-                {
-                    addr = target;
-                    continue;
+                if instructions_seen >= max_instructions {
+                    break 'blocks;
                 }
-                if step.is_unconditional_jump {
-                    break;
-                }
-
-                // Conditional branches: follow both paths
-                if step.is_conditional_branch
-                    && let Some(target) = step.target
-                    && memory.contains_address(target)
-                    && !visited.contains(&target)
-                {
-                    let next = step.next_address();
-                    self.scan_for_calls(memory, disasm, target, &mut queue, &mut visited);
-                    addr = next;
-                    continue;
-                }
-
-                if step.is_return {
-                    break;
-                }
-
-                if step.is_padding {
-                    break;
-                }
-
-                addr = step.next_address();
             }
         }
 
         Ok(())
-    }
-
-    /// Scan a code path for call instructions without treating the path itself as a function
-    fn scan_for_calls(
-        &mut self,
-        memory: &MemoryMap,
-        disasm: &Disassembler,
-        start: u64,
-        queue: &mut VecDeque<u64>,
-        visited: &mut HashSet<u64>,
-    ) {
-        if !visited.insert(start) {
-            return;
-        }
-        let mut addr = start;
-        let mut count = 0u32;
-        while count < 1000 {
-            let Ok(step) = disasm.decode_one(memory, addr, classify) else {
-                break;
-            };
-            count += 1;
-
-            if step.is_call
-                && let Some(target) = step.target
-                && memory.contains_address(target)
-                && !self.functions.contains_key(&target)
-            {
-                self.add_function(Function {
-                    name: format!("sub_{:x}", target),
-                    start_address: target,
-                    end_address: None,
-                    calling_convention: CallingConvention::default(),
-                    stack_frame_size: 0,
-                });
-                queue.push_back(target);
-            }
-
-            if step.is_return || step.is_jmp {
-                break;
-            }
-            if step.is_padding {
-                break;
-            }
-            addr = step.next_address();
-        }
     }
 }
 
@@ -669,8 +649,6 @@ struct Step {
     length: u64,
     target: Option<u64>,
     is_call: bool,
-    /// `jmp` alone — the spelling the call scanner stops at.
-    is_jmp: bool,
     /// `jmp`, or ARM's `b`.
     is_unconditional_jump: bool,
     is_conditional_branch: bool,
@@ -692,7 +670,6 @@ fn classify(insn: crate::disasm::InstructionRef<'_>) -> Step {
         length: insn.bytes.len() as u64,
         target: parse_target(insn.op_str),
         is_call: is_call_mnemonic(&mnemonic),
-        is_jmp,
         is_unconditional_jump: is_jmp || mnemonic == "b",
         is_conditional_branch: is_conditional_branch(&mnemonic),
         is_return: mnemonic == "ret" || mnemonic == "retn" || mnemonic == "bx",
@@ -970,5 +947,170 @@ mod tests {
         assert_eq!(stats.removed, 0);
         assert!(mgr.functions.contains_key(&0x1040));
         assert!(mgr.functions.contains_key(&0x1200));
+    }
+
+    /// Descent must reach calls in branch-target blocks even when the linear
+    /// fallthrough hits a self-loop first, and even when the target block is
+    /// longer than the old 1000-instruction path cap.
+    #[test]
+    fn descent_finds_calls_past_self_loop_and_long_block() {
+        // Fill with `inc eax` (FF C0), not nops: nops would be padding.
+        let mut code = vec![0u8; 0x2002];
+        for chunk in code.as_chunks_mut::<2>().0 {
+            chunk.copy_from_slice(&[0xFF, 0xC0]);
+        }
+        let mut put = |addr: u64, bytes: &[u8]| {
+            let off = (addr - 0x1000) as usize;
+            code[off..off + bytes.len()].copy_from_slice(bytes);
+        };
+        // 0x1000: test eax, eax; je 0x2000; 0x1008: jmp 0x1008 (self-loop).
+        put(0x1000, &[0x85, 0xC0]);
+        put(0x1002, &[0x0F, 0x84, 0xF8, 0x0F, 0x00, 0x00]);
+        put(0x1008, &[0xEB, 0xFE]);
+        // 0x2800 (after 0x1000 filler bytes = 2048 instructions): call 0x3000; ret.
+        put(0x2800, &[0xE8, 0xFB, 0x07, 0x00, 0x00]);
+        put(0x2805, &[0xC3]);
+        put(0x3000, &[0xC3]);
+
+        use crate::memory::MemorySegment;
+        let mut map = MemoryMap::default();
+        map.add_segment(MemorySegment {
+            name: ".text".to_string(),
+            start: 0x1000,
+            size: code.len() as u64,
+            data: code,
+            permissions: Permissions::READ | Permissions::EXECUTE,
+        })
+        .unwrap();
+
+        let mut mgr = FunctionManager::default();
+        mgr.add_function(Function {
+            name: "sub_1000".to_string(),
+            start_address: 0x1000,
+            end_address: None,
+            calling_convention: CallingConvention::default(),
+            stack_frame_size: 0,
+        });
+
+        let disasm = Disassembler::new(Architecture::X86_64).unwrap();
+        mgr.discover_functions_recursive(&map, &disasm).unwrap();
+
+        assert!(
+            mgr.functions.contains_key(&0x3000),
+            "call past the self-loop and long block must be discovered"
+        );
+    }
+
+    /// A single in-function `nop` (compilers emit them for alignment) must not
+    /// stop the walk; a run of padding still ends a function without known end.
+    #[test]
+    fn descent_walks_through_single_nop_but_stops_at_padding_run() {
+        use crate::memory::MemorySegment;
+
+        let mut code = vec![0u8; 0x1400];
+        // 0x1000: call 0x2000; 0x1005: nop; 0x1006: call 0x2100;
+        // 0x100B: nop; 0x100C: nop (a run); 0x100D: call 0x2200 (decoy); ret.
+        code[0x00..0x05].copy_from_slice(&[0xE8, 0xFB, 0x0F, 0x00, 0x00]);
+        code[0x05] = 0x90;
+        code[0x06..0x0B].copy_from_slice(&[0xE8, 0xF5, 0x10, 0x00, 0x00]);
+        code[0x0B] = 0x90;
+        code[0x0C] = 0x90;
+        code[0x0D..0x12].copy_from_slice(&[0xE8, 0xEE, 0x11, 0x00, 0x00]);
+        code[0x12] = 0xC3;
+        // Callee stubs.
+        code[0x1000] = 0xC3; // 0x2000
+        code[0x1100] = 0xC3; // 0x2100
+        code[0x1200] = 0xC3; // 0x2200
+
+        let mut map = MemoryMap::default();
+        map.add_segment(MemorySegment {
+            name: ".text".to_string(),
+            start: 0x1000,
+            size: code.len() as u64,
+            data: code,
+            permissions: Permissions::READ | Permissions::EXECUTE,
+        })
+        .unwrap();
+
+        let mut mgr = FunctionManager::default();
+        mgr.add_function(Function {
+            name: "sub_1000".to_string(),
+            start_address: 0x1000,
+            end_address: None,
+            calling_convention: CallingConvention::default(),
+            stack_frame_size: 0,
+        });
+
+        let disasm = Disassembler::new(Architecture::X86_64).unwrap();
+        mgr.discover_functions_recursive(&map, &disasm).unwrap();
+
+        assert!(
+            mgr.functions.contains_key(&0x2000),
+            "call before the nop must be discovered"
+        );
+        assert!(
+            mgr.functions.contains_key(&0x2100),
+            "the walk must continue through a single nop"
+        );
+        assert!(
+            !mgr.functions.contains_key(&0x2200),
+            "a padding run must stop a function without a known end"
+        );
+    }
+
+    /// A known function end bounds the walk: bytes past it are not code.
+    #[test]
+    fn descent_stops_at_known_function_end() {
+        use crate::memory::MemorySegment;
+
+        // 0x1000..0x1010: filler `inc eax` (the function). At 0x1010, just past
+        // the end, a `call 0x1200` sits in what is really the next function.
+        let mut code = vec![0u8; 0x300];
+        for chunk in code.as_chunks_mut::<2>().0 {
+            chunk.copy_from_slice(&[0xFF, 0xC0]);
+        }
+        code[0x10..0x15].copy_from_slice(&[0xE8, 0xEB, 0x01, 0x00, 0x00]);
+        code[0x15] = 0xC3;
+        code[0x200] = 0xC3;
+
+        let mut map = MemoryMap::default();
+        map.add_segment(MemorySegment {
+            name: ".text".to_string(),
+            start: 0x1000,
+            size: code.len() as u64,
+            data: code,
+            permissions: Permissions::READ | Permissions::EXECUTE,
+        })
+        .unwrap();
+
+        let make_mgr = |end: Option<u64>| {
+            let mut mgr = FunctionManager::default();
+            mgr.add_function(Function {
+                name: "sub_1000".to_string(),
+                start_address: 0x1000,
+                end_address: end,
+                calling_convention: CallingConvention::default(),
+                stack_frame_size: 0,
+            });
+            mgr
+        };
+
+        let disasm = Disassembler::new(Architecture::X86_64).unwrap();
+
+        let mut bounded = make_mgr(Some(0x1010));
+        bounded.discover_functions_recursive(&map, &disasm).unwrap();
+        assert!(
+            !bounded.functions.contains_key(&0x1200),
+            "walk must stop at the known function end"
+        );
+
+        let mut unbounded = make_mgr(None);
+        unbounded
+            .discover_functions_recursive(&map, &disasm)
+            .unwrap();
+        assert!(
+            unbounded.functions.contains_key(&0x1200),
+            "without an end the walk falls through, as before"
+        );
     }
 }
