@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### Added
+
+- Exact function ranges recovered from PE x64 `.pdata` exception tables, so functions are bounded precisely even without prologue patterns
+- Jump-table dispatches recover `Switch` case targets instead of dropping computed jumps
+
+### Changed
+
+- RIP-relative memory operands resolve to their absolute targets, producing data and call xrefs and folded operands in the x86 lifter instead of opaque `rip`-relative expressions
+- String scan skips executable segments by default, keeping code bytes out of the strings view
+- Signature matching: generic prologue shapes dropped from the built-in signature databases, and prologue patterns only match at decoded instruction starts
+- Dependencies refreshed to their latest compatible versions; benchmarks moved to criterion 0.8
+
+### Fixed
+
+- Recursive descent no longer stalls or stops early on nop padding, so all direct call targets are discovered
+- Segment bases no longer leak into struct-pointer folding and parameter detection
+
 ## [0.7.1] - 2026-08-14
 
 ### Fixed
