@@ -600,7 +600,7 @@ impl Project {
         use crate::types::{TypeAnnotation, TypeRef, VariableInfo, VariableLocation};
 
         // Drop globals/annotations previously derived from overlays.
-        let owned: Vec<u64> = self.overlay_derived_globals.drain(..).collect();
+        let owned = std::mem::take(&mut self.overlay_derived_globals);
         for addr in owned {
             self.types.global_variables.remove(&addr);
             self.types.annotations.remove(&addr);
