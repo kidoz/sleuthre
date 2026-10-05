@@ -38,3 +38,7 @@ release:
 # Run cargo-deny license/advisory checks
 deny:
     cargo deny check
+
+# Compile benchmarks without running them
+bench:
+    cargo build -p re-core --benches
