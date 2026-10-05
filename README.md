@@ -29,13 +29,13 @@ An open-source reverse engineering desktop application built in Rust.
 ### Collaboration & automation
 - **Live broadcast collab** — TCP listener publishes every `UndoCommand` as line-delimited JSON; viewers can also send events back (bidirectional). Tools menu exposes start/stop.
 - **Git-friendly project format** — `Project::export_jsonl` emits deterministic JSON-Lines for renames/comments/bookmarks/tags/overlays/types; `merge_jsonl_3way` performs a semantic 3-way merge with conflict markers for async PR-based RE.
-- **MCP server** — first-party Model Context Protocol implementation with 27 typed tools (disasm, decomp, MLIL/SSA dumps, IL rewrite, recompile-diff, JSONL merge, signature scans, …) and 7 resources for AI agent integration. No other RE tool ships this natively.
+- **MCP server** — first-party Model Context Protocol implementation with 25 typed tools (disasm, decomp, MLIL/SSA dumps, IL rewrite, recompile-diff, JSONL merge, signature scans, …) and 7 resources for AI agent integration. No other RE tool ships this natively.
 - **Plugins** — Rhai scripts hot-reloaded from `~/.sleuthre/plugins/`; async worker thread runs scripts without blocking the UI; FLIRT PAT importer for community signature corpora.
 - **GDB Remote Serial Protocol debugger** — connects to gdbserver / QEMU-gdbstub / LLDB platform via `GdbRemoteDebugger`; attach / step / continue / read registers + memory.
 - **AI approval queue** — review and approve AI-suggested renames and comments before they apply.
 
 ### Project persistence
-- SQLite-backed (`*.sleuthre`) with full round-trip for functions, comments, xrefs, strings, types, classes, struct overlays, bookmarks, tags, and decompilation cache.
+- SQLite-backed (`*.slre`) with full round-trip for functions, comments, xrefs, strings, types, classes, struct overlays, bookmarks, tags, and decompilation cache.
 
 ## Architecture
 
