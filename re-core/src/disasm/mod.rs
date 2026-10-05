@@ -194,6 +194,20 @@ impl Disassembler {
         }))
     }
 
+    /// Length in bytes of the instruction at the start of `data`, or `None`
+    /// when it does not decode.
+    ///
+    /// Unlike [`Self::decode_one`] this reads no memory and needs no readable
+    /// 15-byte window, so linear sweeps that already own the segment bytes do
+    /// not fall back to byte stepping near the end of a segment.
+    pub fn decode_length(&self, data: &[u8]) -> Option<usize> {
+        if data.is_empty() {
+            return None;
+        }
+        let insns = self.cs_no_detail.disasm_count(data, 0, 1).ok()?;
+        insns.first().map(|insn| insn.bytes().len())
+    }
+
     /// Like [`Self::disassemble_one`] but skips Capstone's detail pass. The
     /// returned instruction has an empty `groups`; use the detailed variant
     /// when that field is read.

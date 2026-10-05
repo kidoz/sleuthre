@@ -160,11 +160,17 @@ impl FunctionManager {
         stats
     }
 
-    /// Prologue-based function discovery with multi-architecture support
+    /// Prologue-based function discovery with multi-architecture support.
+    ///
+    /// Executable segments are swept with a linear disassembly pass and
+    /// prologues are only tested at decoded instruction starts. Matching raw
+    /// bytes at every offset invents functions inside real ones — a three-byte
+    /// `48 83 EC` occurs constantly mid-instruction — so the walk must stay on
+    /// instruction boundaries.
     pub fn discover_functions(
         &mut self,
         memory: &MemoryMap,
-        _disasm: &Disassembler,
+        disasm: &Disassembler,
         entry_point: u64,
         arch: Architecture,
     ) -> Result<()> {
@@ -190,14 +196,14 @@ impl FunctionManager {
             let mut offset = 0;
             while offset < data.len() {
                 let addr = segment.start + offset as u64;
-                let remaining = &data[offset..];
 
-                if self.check_prologue(remaining, addr, arch) {
-                    offset += 1;
-                    continue;
-                }
+                self.check_prologue(&data[offset..], addr, arch);
 
-                offset += 1;
+                // Advance one instruction so prologues are only matched at
+                // instruction starts; fall back to one byte on undecodable
+                // data (embedded tables) to try to resynchronize.
+                let advance = disasm.decode_length(&data[offset..]).unwrap_or(1);
+                offset += advance;
             }
         }
         Ok(())
@@ -851,6 +857,36 @@ mod tests {
             detected_cc(&[0xC3], Architecture::X86),
             CallingConvention::Cdecl
         );
+    }
+
+    /// Prologue bytes embedded mid-instruction must not create a function.
+    #[test]
+    fn prologue_scan_only_matches_instruction_starts() {
+        use crate::memory::MemorySegment;
+        // 0x1000: mov eax, 0xEC8348 — contains `48 83 EC` starting at 0x1001,
+        // mid-instruction. 0x1005 is the only real prologue.
+        let code = [0xB8, 0x48, 0x83, 0xEC, 0x00, 0x55, 0x48, 0x89, 0xE5, 0xC3];
+        let mut map = MemoryMap::default();
+        map.add_segment(MemorySegment {
+            name: ".text".to_string(),
+            start: 0x1000,
+            size: code.len() as u64,
+            data: code.to_vec(),
+            permissions: Permissions::READ | Permissions::EXECUTE,
+        })
+        .unwrap();
+
+        let mut mgr = FunctionManager::default();
+        let disasm = Disassembler::new(Architecture::X86_64).unwrap();
+        mgr.discover_functions(&map, &disasm, 0x1005, Architecture::X86_64)
+            .unwrap();
+
+        assert!(mgr.functions.contains_key(&0x1005));
+        assert!(
+            !mgr.functions.contains_key(&0x1001),
+            "mid-instruction prologue bytes must not start a function"
+        );
+        assert_eq!(mgr.functions.len(), 1);
     }
 
     fn runtime_function(start: u64, end: u64) -> RuntimeFunction {
