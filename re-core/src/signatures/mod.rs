@@ -261,15 +261,15 @@ impl SignatureDatabase {
         matches
     }
 
-    /// Create a built-in database with common function prologues.
+    /// Create the built-in x86-64 signature database.
+    ///
+    /// Only patterns that *identify* a specific routine belong here. Generic
+    /// instruction shapes — `sub rsp, N` alone, or `push rbp; mov rbp, rsp` —
+    /// match thousands of unrelated functions and are deliberately absent:
+    /// [`Self::scan_and_apply`] turns every match into a rename, so shape
+    /// patterns collapse most of a binary's functions onto one name.
     pub fn builtin_x86_64() -> Self {
         let mut db = Self::new();
-
-        // Standard function prologues
-        db.add_pattern("push_rbp_prologue", "55 48 89 E5", "common");
-        db.add_pattern("push_rbp_mov_rsp", "55 48 89 E5 48 83 EC", "common");
-        db.add_pattern("sub_rsp_prologue", "48 83 EC", "common");
-        db.add_pattern("push_rbx_prologue", "53 48 83 EC", "common");
 
         // libc functions
         db.add_pattern("strlen", "48 89 F8 80 38 00 74 ?? 48 FF C0", "libc");
@@ -346,22 +346,16 @@ impl SignatureDatabase {
         db.add_pattern("aes_key_schedule", "66 0F 38 DB ?? 66 0F EF", "crypto");
         db.add_pattern("sha256_round", "0F 38 CC ?? 0F 38 CD", "crypto");
 
-        // Intel CET (Control-flow Enforcement Technology)
-        db.add_pattern("endbr64_prologue", "F3 0F 1E FA 55 48 89 E5", "common");
-
-        // x86-32 prologues (for 32-bit code in 64-bit analysis)
-        db.add_pattern("push_ebp_prologue", "55 89 E5", "common_x86");
-        db.add_pattern("push_ebp_sub_esp", "55 89 E5 83 EC", "common_x86");
-
         db
     }
 
-    /// Create a built-in database with common ARM64 patterns.
+    /// Create the built-in ARM64 signature database.
+    ///
+    /// As with [`Self::builtin_x86_64`], only identifying patterns belong
+    /// here — the `stp x29, x30, [sp, #-N]!` frame setup every non-leaf
+    /// function uses is not a signature.
     pub fn builtin_arm64() -> Self {
-        let mut db = Self::new();
-        db.add_pattern("stp_prologue", "FD 7B ?? A9", "common");
-        db.add_pattern("paciasp_prologue", "3F 23 03 D5 FD 7B ?? A9", "common");
-        db
+        Self::new()
     }
 }
 
@@ -475,23 +469,21 @@ mod tests {
     }
 
     #[test]
-    fn builtin_x86_64_has_at_least_30_signatures() {
+    fn builtin_x86_64_has_identifying_signatures() {
         let db = SignatureDatabase::builtin_x86_64();
         assert!(
-            db.signatures.len() >= 30,
-            "Expected at least 30 signatures, got {}",
+            db.signatures.len() >= 20,
+            "Expected at least 20 signatures, got {}",
             db.signatures.len()
         );
     }
 
+    /// Generic prologue shapes are not signatures — matching one would rename
+    /// every function that uses the shape. The ARM64 set has no identifying
+    /// patterns yet, so it is deliberately empty.
     #[test]
-    fn builtin_arm64_has_signatures() {
-        let db = SignatureDatabase::builtin_arm64();
-        assert!(
-            db.signatures.len() >= 2,
-            "Expected at least 2 ARM64 signatures, got {}",
-            db.signatures.len()
-        );
+    fn builtin_arm64_has_no_shape_patterns() {
+        assert!(SignatureDatabase::builtin_arm64().signatures.is_empty());
     }
 
     #[test]
@@ -500,12 +492,33 @@ mod tests {
         let libraries: std::collections::HashSet<&str> =
             db.signatures.iter().map(|s| s.library.as_str()).collect();
         // Should have signatures across multiple categories
-        assert!(libraries.contains("common"), "Missing 'common' library");
         assert!(libraries.contains("libc"), "Missing 'libc' library");
         assert!(libraries.contains("security"), "Missing 'security' library");
         assert!(libraries.contains("plt"), "Missing 'plt' library");
         assert!(libraries.contains("compiler"), "Missing 'compiler' library");
         assert!(libraries.contains("crypto"), "Missing 'crypto' library");
+    }
+
+    /// A generic prologue must not be part of the built-in database:
+    /// `scan_and_apply` renames on match, so a shape pattern collapses
+    /// unrelated functions onto one name.
+    #[test]
+    fn builtin_x86_64_has_no_prologue_shape_patterns() {
+        let db = SignatureDatabase::builtin_x86_64();
+        for name in [
+            "sub_rsp_prologue",
+            "push_rbx_prologue",
+            "push_rbp_prologue",
+            "push_rbp_mov_rsp",
+            "endbr64_prologue",
+            "push_ebp_prologue",
+            "push_ebp_sub_esp",
+        ] {
+            assert!(
+                db.signatures.iter().all(|s| s.name != name),
+                "'{name}' is a shape pattern and must not rename functions"
+            );
+        }
     }
 
     #[test]
