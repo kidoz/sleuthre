@@ -711,7 +711,11 @@ fn prune_unreachable_statements(stmts: &mut Vec<HlilStmt>) {
 
         let terminates = matches!(
             stmt,
-            HlilStmt::Return(_) | HlilStmt::Goto(_) | HlilStmt::Break | HlilStmt::Continue
+            HlilStmt::Return(_)
+                | HlilStmt::Goto(_)
+                | HlilStmt::IndirectGoto(_)
+                | HlilStmt::Break
+                | HlilStmt::Continue
         );
         result.push(stmt);
         if terminates {
@@ -1059,6 +1063,7 @@ fn lift_stack_refs_in_stmt(
             }
         }
         HlilStmt::Expr(e) => lift_stack_refs_in_expr(e, stack_map),
+        HlilStmt::IndirectGoto(target) => lift_stack_refs_in_expr(target, stack_map),
         HlilStmt::Return(opt) => {
             if let Some(e) = opt {
                 lift_stack_refs_in_expr(e, stack_map);
@@ -1189,6 +1194,7 @@ fn resolve_symbols_in_stmt(stmt: &mut HlilStmt, symbols: &HashMap<u64, String>) 
             resolve_symbols_in_expr(value, symbols);
         }
         HlilStmt::Expr(e) => resolve_symbols_in_expr(e, symbols),
+        HlilStmt::IndirectGoto(target) => resolve_symbols_in_expr(target, symbols),
         HlilStmt::Return(opt) => {
             if let Some(e) = opt {
                 resolve_symbols_in_expr(e, symbols);
@@ -1298,6 +1304,7 @@ fn resolve_globals_in_stmt(stmt: &mut HlilStmt, types: &TypeManager) {
             resolve_globals_in_expr(src, types);
         }
         HlilStmt::Expr(e) => resolve_globals_in_expr(e, types),
+        HlilStmt::IndirectGoto(target) => resolve_globals_in_expr(target, types),
         HlilStmt::Return(opt) => {
             if let Some(e) = opt {
                 resolve_globals_in_expr(e, types);
@@ -1559,6 +1566,7 @@ fn infer_types_in_stmt(
             infer_types_in_expr(value, inferred_types, types);
         }
         HlilStmt::Expr(e) => infer_types_in_expr(e, inferred_types, types),
+        HlilStmt::IndirectGoto(target) => infer_types_in_expr(target, inferred_types, types),
         HlilStmt::Return(opt) => {
             if let Some(e) = opt {
                 infer_types_in_expr(e, inferred_types, types);
@@ -1702,6 +1710,7 @@ fn collect_ssa_vars_stmts(stmts: &[HlilStmt], found: &mut HashSet<String>) {
                 collect_ssa_vars_expr(value, found);
             }
             HlilStmt::Expr(e) => collect_ssa_vars_expr(e, found),
+            HlilStmt::IndirectGoto(target) => collect_ssa_vars_expr(target, found),
             HlilStmt::Return(opt) => {
                 if let Some(e) = opt {
                     collect_ssa_vars_expr(e, found);
@@ -1797,6 +1806,24 @@ pub fn structure_function(
     memory: &crate::memory::MemoryMap,
     arch: crate::arch::Architecture,
 ) -> Vec<HlilStmt> {
+    structure_function_ex(func, memory, arch).stmts
+}
+
+/// Result of structuring one function.
+pub struct StructuredFunction {
+    pub stmts: Vec<HlilStmt>,
+    /// The function contains a computed jump whose targets could not be
+    /// recovered. Its following blocks may be entered only through that
+    /// transfer, so passes that delete "unreachable" statements must not run.
+    pub has_unresolved_indirect_jump: bool,
+}
+
+/// Structure a function, recovering jump-table dispatches first.
+pub fn structure_function_ex(
+    func: &MlilFunction,
+    memory: &crate::memory::MemoryMap,
+    arch: crate::arch::Architecture,
+) -> StructuredFunction {
     let mut jump_targets = HashSet::new();
     for inst in &func.instructions {
         for stmt in &inst.stmts {
@@ -1816,23 +1843,53 @@ pub fn structure_function(
         }
     }
 
+    // Recover jump tables before walking: the case blocks are entered only
+    // through the dispatch, so their addresses must join `jump_targets` or the
+    // walk emits no label for them and they read as unreachable.
+    let mut dispatches: HashMap<u64, RecoveredDispatch> = HashMap::new();
+    let mut has_unresolved_indirect_jump = false;
+    for (idx, inst) in func.instructions.iter().enumerate() {
+        let [MlilStmt::Jump { target }] = inst.stmts.as_slice() else {
+            continue;
+        };
+        if matches!(target, MlilExpr::Const(_)) {
+            continue;
+        }
+        let resolved = resolve_expr_backwards(&func.instructions[..idx], target, 8);
+        let recovered = match_dispatch(&resolved).and_then(|table| {
+            let targets = read_table_targets(&table, memory, arch);
+            (!targets.is_empty()).then_some(RecoveredDispatch {
+                index: table.index,
+                targets,
+            })
+        });
+        match recovered {
+            Some(dispatch) => {
+                jump_targets.extend(dispatch.targets.iter().copied());
+                dispatches.insert(inst.address, dispatch);
+            }
+            None => has_unresolved_indirect_jump = true,
+        }
+    }
+
     let mut stmts = structure_range(
         &func.instructions,
         &ControlFlowContext::default(),
         &jump_targets,
-        memory,
-        arch,
+        &dispatches,
     );
     remove_unused_labels(&mut stmts);
-    stmts
+    StructuredFunction {
+        stmts,
+        has_unresolved_indirect_jump,
+    }
 }
 
 fn structure_range(
     insts: &[crate::il::mlil::MlilInst],
     ctx: &ControlFlowContext,
     jump_targets: &HashSet<u64>,
-    memory: &crate::memory::MemoryMap,
-    arch: crate::arch::Architecture,
+    dispatches: &HashMap<u64, RecoveredDispatch>,
 ) -> Vec<HlilStmt> {
     let mut stmts = Vec::new();
     let mut i = 0;
@@ -1843,6 +1900,24 @@ fn structure_range(
         // Emit label if this address is a jump target
         if jump_targets.contains(&inst.address) {
             stmts.push(HlilStmt::Label(inst.address));
+        }
+
+        // A recovered jump table becomes a switch whose arms jump to the case
+        // blocks; the blocks themselves are emitted where the walk reaches
+        // them, labeled because their addresses are jump targets.
+        if let Some(dispatch) = dispatches.get(&inst.address) {
+            stmts.push(HlilStmt::Switch {
+                cond: hlil::mlil_to_hlil_expr(&dispatch.index),
+                cases: dispatch
+                    .targets
+                    .iter()
+                    .enumerate()
+                    .map(|(n, &target)| (n as u64, vec![HlilStmt::Goto(target)]))
+                    .collect(),
+                default: vec![],
+            });
+            i += 1;
+            continue;
         }
 
         // Check for do-while loop: look ahead for a BranchIf that targets the current
@@ -1866,8 +1941,7 @@ fn structure_range(
                 &insts[i..back_branch.branch_idx],
                 &loop_ctx,
                 jump_targets,
-                memory,
-                arch,
+                dispatches,
             );
             let cond = hlil::mlil_to_hlil_expr(&back_branch.cond);
             stmts.push(HlilStmt::DoWhile { body, cond });
@@ -1891,13 +1965,8 @@ fn structure_range(
                 loop_exit: Some(*exit_addr),
             };
 
-            let body = structure_range(
-                &insts[i + 1..eidx - 1],
-                &loop_ctx,
-                jump_targets,
-                memory,
-                arch,
-            );
+            let body =
+                structure_range(&insts[i + 1..eidx - 1], &loop_ctx, jump_targets, dispatches);
             stmts.push(HlilStmt::While { cond, body });
             i = eidx;
             continue;
@@ -1908,10 +1977,9 @@ fn structure_range(
             && let Some((then_end, else_end)) = find_if_else_bounds(insts, i, &branch_stmt)
         {
             let cond = hlil::mlil_to_hlil_expr(&branch_stmt.0);
-            let then_body =
-                structure_range(&insts[i + 1..then_end], ctx, jump_targets, memory, arch);
+            let then_body = structure_range(&insts[i + 1..then_end], ctx, jump_targets, dispatches);
             let else_body = if else_end > then_end {
-                structure_range(&insts[then_end..else_end], ctx, jump_targets, memory, arch)
+                structure_range(&insts[then_end..else_end], ctx, jump_targets, dispatches)
             } else {
                 vec![]
             };
@@ -1926,7 +1994,7 @@ fn structure_range(
         }
 
         // Default: lower each statement individually
-        stmts.extend(lower_mlil_stmts(&inst.stmts, ctx, memory, arch));
+        stmts.extend(lower_mlil_stmts(&inst.stmts, ctx));
         i += 1;
     }
 
@@ -2021,89 +2089,217 @@ fn find_jump_target(stmts: &[MlilStmt]) -> Option<u64> {
     None
 }
 
-fn recover_switch(
-    target: &MlilExpr,
-    memory: &crate::memory::MemoryMap,
-    arch: crate::arch::Architecture,
-) -> Option<HlilStmt> {
-    // Pattern: Jump(Load(base + index * scale))
-    if let MlilExpr::Load { addr, size } = target
-        && let MlilExpr::BinOp {
+/// A jump-table dispatch recovered from a computed jump.
+#[derive(Debug, Clone)]
+struct RecoveredDispatch {
+    /// The switch selector expression.
+    index: MlilExpr,
+    /// One target address per table entry, in table order.
+    targets: Vec<u64>,
+}
+
+/// A recognized table reference: `[base + index * scale]`, optionally with
+/// entries that are offsets relative to `addend` rather than absolute
+/// addresses.
+#[derive(Debug)]
+struct DispatchTable {
+    index: MlilExpr,
+    base: u64,
+    entry_size: u8,
+    /// Entries are sign-extended offsets added to this base (`target =
+    /// base + entry`). `None` means entries are absolute addresses.
+    addend: Option<u64>,
+}
+
+/// Peel a `Cast { signed, bits, Load { .. } }` chain down to the load,
+/// reporting the cast width. The cast signals a *relative* table: a 4-byte
+/// entry sign-extended to the pointer width is an offset, not a pointer.
+fn peel_load_cast(expr: &MlilExpr) -> Option<(&MlilExpr, u8, Option<u8>)> {
+    match expr {
+        MlilExpr::Load { addr, size } => Some((addr, *size, None)),
+        MlilExpr::Cast {
+            signed: true,
+            bits,
+            operand,
+        } => match &**operand {
+            MlilExpr::Load { addr, size } => Some((addr, *size, Some(*bits))),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Match a computed jump target against the jump-table shapes compilers emit.
+///
+/// Absolute tables: `jmp [base + index*scale]` — the entries are pointers.
+/// Relative tables (MSVC `/Gy`, PIC-style): the entry is loaded and added to
+/// the table base (`movsxd rax, [base + index*4]; add rax, base; jmp rax`),
+/// which after value propagation is `Add(Cast(Load(..)), base)`.
+fn match_dispatch(expr: &MlilExpr) -> Option<DispatchTable> {
+    // A constant added to the loaded entry marks the relative form.
+    let (inner, addend) = match expr {
+        MlilExpr::BinOp {
             op: crate::il::llil::BinOp::Add,
             left,
             right,
-        } = &**addr
-    {
-        let (base, offset) = if let MlilExpr::Const(c) = &**left {
-            (*c, &**right)
-        } else if let MlilExpr::Const(c) = &**right {
-            (*c, &**left)
-        } else {
-            return None;
-        };
+        } => {
+            if let MlilExpr::Const(c) = &**right {
+                (&**left, Some(*c))
+            } else if let MlilExpr::Const(c) = &**left {
+                (&**right, Some(*c))
+            } else {
+                (expr, None)
+            }
+        }
+        other => (other, None),
+    };
 
-        // Offset might be index * scale or just index (if scale is 1)
-        let (index_expr, scale) = if let MlilExpr::BinOp {
+    let (addr, entry_size, sign_bits) = peel_load_cast(inner)?;
+
+    let MlilExpr::BinOp {
+        op: crate::il::llil::BinOp::Add,
+        left,
+        right,
+    } = addr
+    else {
+        return None;
+    };
+    let (base, offset) = match (&**left, &**right) {
+        (MlilExpr::Const(b), off) => (*b, off),
+        (off, MlilExpr::Const(b)) => (*b, off),
+        _ => return None,
+    };
+
+    let (index, scale) = match offset {
+        MlilExpr::BinOp {
             op: crate::il::llil::BinOp::Mul,
             left,
             right,
-        } = offset
-        {
-            if let MlilExpr::Const(s) = &**left {
-                (&**right, *s)
-            } else if let MlilExpr::Const(s) = &**right {
-                (&**left, *s)
-            } else {
-                (offset, 1)
-            }
-        } else {
-            (offset, 1)
-        };
+        } => match (&**left, &**right) {
+            (MlilExpr::Const(s), i) => (i.clone(), *s),
+            (i, MlilExpr::Const(s)) => (i.clone(), *s),
+            _ => (offset.clone(), 1),
+        },
+        other => (other.clone(), 1),
+    };
 
-        // Validate scale matches pointer size
-        if scale != *size as u64 {
-            return None;
-        }
-
-        // Heuristic: Read pointers from base until invalid
-        let mut cases = Vec::new();
-        let mut cursor = base;
-        let mut idx = 0;
-        let endian = arch.default_endianness();
-
-        // Limit to reasonable number of cases
-        while cases.len() < 256 {
-            let ptr = if *size == 8 {
-                match memory.read_u64(cursor, endian) {
-                    Some(p) => p,
-                    None => break,
-                }
-            } else {
-                match memory.read_u32(cursor, endian) {
-                    Some(p) => p as u64,
-                    None => break,
-                }
-            };
-
-            // Validate pointer points to executable code or is 0 (if sparse)
-            if ptr == 0 {
-                break;
-            }
-
-            cases.push((idx, vec![HlilStmt::Goto(ptr)]));
-            cursor += *size as u64;
-            idx += 1;
-        }
-
-        if !cases.is_empty() {
-            return Some(HlilStmt::Switch {
-                cond: hlil::mlil_to_hlil_expr(index_expr),
-                cases,
-                default: vec![], // Unknown default from just the jump
-            });
-        }
+    if scale != entry_size as u64 {
+        return None;
     }
-    None
+
+    // Offsets must be sign-extended to reach a base below them; without the
+    // signed cast an added constant is just ordinary pointer arithmetic.
+    let addend = match (addend, sign_bits) {
+        (Some(a), Some(_)) => Some(a),
+        (None, None) => None,
+        _ => return None,
+    };
+
+    Some(DispatchTable {
+        index,
+        base,
+        entry_size,
+        addend,
+    })
+}
+
+/// Read a table's case targets until an entry is absent, zero, or does not
+/// lead to executable memory.
+fn read_table_targets(
+    table: &DispatchTable,
+    memory: &crate::memory::MemoryMap,
+    arch: crate::arch::Architecture,
+) -> Vec<u64> {
+    let endian = arch.default_endianness();
+    let mut targets = Vec::new();
+    let mut cursor = table.base;
+    while targets.len() < 256 {
+        let entry = match table.entry_size {
+            8 => memory.read_u64(cursor, endian),
+            4 => memory.read_u32(cursor, endian).map(u64::from),
+            _ => None,
+        };
+        let Some(entry) = entry else { break };
+        if entry == 0 {
+            break;
+        }
+        let target = match table.addend {
+            Some(base) => base.wrapping_add(sign_extend(entry, table.entry_size)),
+            None => entry,
+        };
+        if !memory.is_executable(target) {
+            break;
+        }
+        targets.push(target);
+        cursor += table.entry_size as u64;
+    }
+    targets
+}
+
+/// Sign-extend the low `size` bytes of `value`.
+fn sign_extend(value: u64, size: u8) -> u64 {
+    match size {
+        1 => value as u8 as i8 as i64 as u64,
+        2 => value as u16 as i16 as i64 as u64,
+        4 => value as u32 as i32 as i64 as u64,
+        _ => value,
+    }
+}
+
+/// Resolve `expr` through the nearest preceding assignment of each variable
+/// so a dispatch target built up over several instructions can be matched
+/// (and its index expression printed instead of a throwaway temporary).
+///
+/// Bounded in depth and cycle-safe; anything unresolved stays a `Var`.
+fn resolve_expr_backwards(
+    preceding: &[crate::il::mlil::MlilInst],
+    expr: &MlilExpr,
+    depth: u32,
+) -> MlilExpr {
+    if depth == 0 {
+        return expr.clone();
+    }
+    match expr {
+        MlilExpr::Var(v) => {
+            for (idx, inst) in preceding.iter().enumerate().rev() {
+                for stmt in inst.stmts.iter().rev() {
+                    if let MlilStmt::Assign { dest, src } = stmt
+                        && dest.name == v.name
+                    {
+                        // Resolve against the instructions *before* this
+                        // definition: the slice strictly shrinks, so a
+                        // self-referential assignment (`rax = rax + rdx`)
+                        // cannot resolve to itself and cannot loop.
+                        return resolve_expr_backwards(&preceding[..idx], src, depth - 1);
+                    }
+                }
+            }
+            expr.clone()
+        }
+        MlilExpr::Cast {
+            signed,
+            bits,
+            operand,
+        } => MlilExpr::Cast {
+            signed: *signed,
+            bits: *bits,
+            operand: Box::new(resolve_expr_backwards(preceding, operand, depth - 1)),
+        },
+        MlilExpr::Load { addr, size } => MlilExpr::Load {
+            addr: Box::new(resolve_expr_backwards(preceding, addr, depth - 1)),
+            size: *size,
+        },
+        MlilExpr::BinOp { op, left, right } => MlilExpr::BinOp {
+            op: *op,
+            left: Box::new(resolve_expr_backwards(preceding, left, depth - 1)),
+            right: Box::new(resolve_expr_backwards(preceding, right, depth - 1)),
+        },
+        MlilExpr::UnaryOp { op, operand } => MlilExpr::UnaryOp {
+            op: *op,
+            operand: Box::new(resolve_expr_backwards(preceding, operand, depth - 1)),
+        },
+        _ => expr.clone(),
+    }
 }
 
 fn get_expr_type(
@@ -2448,12 +2644,7 @@ struct ControlFlowContext {
 }
 
 /// Lower MLIL statements into HLIL statements.
-fn lower_mlil_stmts(
-    stmts: &[MlilStmt],
-    ctx: &ControlFlowContext,
-    memory: &crate::memory::MemoryMap,
-    arch: crate::arch::Architecture,
-) -> Vec<HlilStmt> {
+fn lower_mlil_stmts(stmts: &[MlilStmt], ctx: &ControlFlowContext) -> Vec<HlilStmt> {
     let mut result = Vec::new();
     for stmt in stmts {
         match stmt {
@@ -2500,12 +2691,13 @@ fn lower_mlil_stmts(
                     } else {
                         result.push(HlilStmt::Goto(*addr));
                     }
-                } else if let Some(switch_stmt) = recover_switch(target, memory, arch) {
-                    result.push(switch_stmt);
                 } else {
-                    // Indirect jump (computed goto)
-                    // Fallback to evaluating the target
-                    result.push(HlilStmt::Expr(hlil::mlil_to_hlil_expr(target)));
+                    // Computed jump whose table could not be recovered. It
+                    // must still be rendered as a transfer: dropping it makes
+                    // every following block look unreachable.
+                    result.push(HlilStmt::IndirectGoto(Box::new(hlil::mlil_to_hlil_expr(
+                        target,
+                    ))));
                 }
             }
             MlilStmt::BranchIf { cond, target } => {
@@ -2565,7 +2757,9 @@ pub fn decompile(
         .unwrap_or_default();
     let (mut info, stack_map) =
         analyze_function_signature(&mlil, instructions, arch, symbols, type_info, types, cc);
-    let mut hlil_stmts = structure_function(&mlil, memory, arch);
+    let structured = structure_function_ex(&mlil, memory, arch);
+    let has_unresolved_indirect_jump = structured.has_unresolved_indirect_jump;
+    let mut hlil_stmts = structured.stmts;
     detect_for_loops(&mut hlil_stmts);
     fold_return_values(&mut hlil_stmts);
 
@@ -2608,8 +2802,16 @@ pub fn decompile(
     // Collapse gotos that jump to the immediately-following label (the
     // dominant goto-soup source: `if (c) {..} else { goto L } L: ..`), then
     // drop unreachable statements and unused labels.
+    //
+    // The unreachable-prune assumes every entry into a post-terminator run has
+    // a label. That holds for the structuring's own gotos, but not when a
+    // computed jump could not be recovered: its targets are unknown, so runs
+    // that look dead may be live case blocks. Skipping the prune keeps such
+    // functions whole (goto-soup, but complete) instead of erasing them.
     eliminate_redundant_gotos(&mut hlil_stmts);
-    prune_unreachable_statements(&mut hlil_stmts);
+    if !has_unresolved_indirect_jump {
+        prune_unreachable_statements(&mut hlil_stmts);
+    }
     remove_unused_labels(&mut hlil_stmts);
 
     // 4. Collect remaining SSA variables and declare them
@@ -3004,6 +3206,9 @@ fn fold_field_accesses_stmt(
         }
         HlilStmt::Expr(e) => {
             fold_field_accesses_expr(e, type_info, inferred_types, types, struct_ptrs)
+        }
+        HlilStmt::IndirectGoto(target) => {
+            fold_field_accesses_expr(target, type_info, inferred_types, types, struct_ptrs)
         }
         HlilStmt::Return(opt) => {
             if let Some(e) = opt {
@@ -5086,6 +5291,206 @@ mod tests {
             matches!(&expr, HlilExpr::FieldAccess { field_name, is_ptr: false, .. } if field_name == "y"),
             "expected .y field access, got {:?}",
             expr
+        );
+    }
+
+    fn svar(name: &str) -> SsaVar {
+        SsaVar {
+            name: name.to_string(),
+            version: 1,
+        }
+    }
+
+    /// Executable text plus a read-only table at 0x2000 holding the signed
+    /// 32-bit offsets of three case bodies relative to the table base.
+    fn dispatch_memory() -> crate::memory::MemoryMap {
+        use crate::memory::{MemorySegment, Permissions};
+        let mut map = crate::memory::MemoryMap::default();
+        map.add_segment(MemorySegment {
+            name: ".text".to_string(),
+            start: 0x1000,
+            size: 0x1000,
+            data: vec![0x90; 0x1000],
+            permissions: Permissions::READ | Permissions::EXECUTE,
+        })
+        .unwrap();
+        let mut table = Vec::new();
+        for target in [0x1020u64, 0x1030, 0x1040] {
+            table.extend_from_slice(&((target as i64 - 0x2000) as i32).to_le_bytes());
+        }
+        table.extend_from_slice(&0i32.to_le_bytes());
+        map.add_segment(MemorySegment {
+            name: ".rdata".to_string(),
+            start: 0x2000,
+            size: table.len() as u64,
+            data: table,
+            permissions: Permissions::READ,
+        })
+        .unwrap();
+        map
+    }
+
+    /// MSVC-style relative dispatch: `movsxd rax, [rdx + rax*4]; add rax, rdx;
+    /// jmp rax`. The case bodies must become labeled blocks (so nothing prunes
+    /// them) and the dispatch must become a switch.
+    #[test]
+    fn structures_relative_jump_table_as_switch() {
+        let load = MlilExpr::Cast {
+            signed: true,
+            bits: 32,
+            operand: Box::new(MlilExpr::Load {
+                addr: Box::new(MlilExpr::BinOp {
+                    op: BinOp::Add,
+                    left: Box::new(MlilExpr::Var(svar("rdx"))),
+                    right: Box::new(MlilExpr::BinOp {
+                        op: BinOp::Mul,
+                        left: Box::new(MlilExpr::Var(svar("rax"))),
+                        right: Box::new(MlilExpr::Const(4)),
+                    }),
+                }),
+                size: 4,
+            }),
+        };
+        let func = make_mlil_func(vec![
+            MlilInst {
+                address: 0x1000,
+                stmts: vec![MlilStmt::Assign {
+                    dest: svar("rdx"),
+                    src: MlilExpr::Const(0x2000),
+                }],
+            },
+            MlilInst {
+                address: 0x1007,
+                stmts: vec![MlilStmt::Assign {
+                    dest: svar("rax"),
+                    src: load,
+                }],
+            },
+            MlilInst {
+                address: 0x100b,
+                stmts: vec![MlilStmt::Assign {
+                    dest: svar("rax"),
+                    src: MlilExpr::BinOp {
+                        op: BinOp::Add,
+                        left: Box::new(MlilExpr::Var(svar("rax"))),
+                        right: Box::new(MlilExpr::Var(svar("rdx"))),
+                    },
+                }],
+            },
+            MlilInst {
+                address: 0x100e,
+                stmts: vec![MlilStmt::Jump {
+                    target: MlilExpr::Var(svar("rax")),
+                }],
+            },
+            MlilInst {
+                address: 0x1020,
+                stmts: vec![MlilStmt::Return],
+            },
+            MlilInst {
+                address: 0x1030,
+                stmts: vec![MlilStmt::Return],
+            },
+            MlilInst {
+                address: 0x1040,
+                stmts: vec![MlilStmt::Return],
+            },
+        ]);
+
+        let out =
+            structure_function_ex(&func, &dispatch_memory(), crate::arch::Architecture::X86_64);
+
+        assert!(
+            !out.has_unresolved_indirect_jump,
+            "relative table must be recovered"
+        );
+        let targets: Vec<u64> = out
+            .stmts
+            .iter()
+            .find_map(|s| match s {
+                HlilStmt::Switch { cases, .. } => Some(
+                    cases
+                        .iter()
+                        .map(|(_, body)| match &body[0] {
+                            HlilStmt::Goto(t) => *t,
+                            other => panic!("expected goto arm, got {other:?}"),
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .expect("dispatch must structure as a switch");
+        assert_eq!(targets, vec![0x1020, 0x1030, 0x1040]);
+        for target in [0x1020u64, 0x1030, 0x1040] {
+            assert!(
+                out.stmts
+                    .iter()
+                    .any(|s| matches!(s, HlilStmt::Label(a) if *a == target)),
+                "case block at {target:x} must keep its label"
+            );
+        }
+    }
+
+    /// A computed jump that cannot be resolved must still render as a
+    /// transfer, and the function must be marked so the unreachable-prune is
+    /// skipped for it.
+    #[test]
+    fn unresolved_indirect_jump_is_rendered_and_flagged() {
+        let func = make_mlil_func(vec![
+            MlilInst {
+                address: 0x1000,
+                stmts: vec![MlilStmt::Jump {
+                    target: MlilExpr::Var(svar("rax")),
+                }],
+            },
+            MlilInst {
+                address: 0x1010,
+                stmts: vec![MlilStmt::Return],
+            },
+        ]);
+
+        let out = structure_function_ex(
+            &func,
+            &crate::memory::MemoryMap::default(),
+            crate::arch::Architecture::X86_64,
+        );
+
+        assert!(out.has_unresolved_indirect_jump);
+        assert!(
+            out.stmts
+                .iter()
+                .any(|s| matches!(s, HlilStmt::IndirectGoto(_))),
+            "the transfer must not be dropped: {:?}",
+            out.stmts
+        );
+    }
+
+    /// Regression: an unresolved computed jump used to make everything after
+    /// the next `return` look unreachable, and the prune deleted it.
+    #[test]
+    fn decompile_keeps_code_after_unresolved_indirect_jump() {
+        let insns = vec![
+            make_insn(0x1000, "jmp", "rax"),
+            make_insn(0x1002, "ret", ""),
+            // Dead-looking tail that must survive: `mov eax, 0x2a; ret`.
+            make_insn(0x1003, "mov", "eax, 0x2a"),
+            make_insn(0x1008, "ret", ""),
+        ];
+        let code = decompile(
+            "computed",
+            &insns,
+            crate::arch::Architecture::X86_64,
+            &HashMap::new(),
+            None,
+            &TypeManager::default(),
+            &crate::memory::MemoryMap::default(),
+            &HashMap::new(),
+        );
+
+        assert!(
+            code.text.contains("0x2a"),
+            "code after the computed jump was pruned away: {}",
+            code.text
         );
     }
 }

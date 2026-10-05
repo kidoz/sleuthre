@@ -98,6 +98,11 @@ pub enum HlilStmt {
     Continue,
     Label(u64),
     Goto(u64),
+    /// Jump through a computed address (`jmp rax`, `jmp [table + i*8]`). The
+    /// target is not statically known, but the transfer must still be rendered:
+    /// dropping it makes every following block look unreachable and they get
+    /// pruned away.
+    IndirectGoto(Box<HlilExpr>),
     Block(Vec<HlilStmt>),
     Comment(String),
 }
@@ -730,6 +735,11 @@ fn write_stmt(w: &mut SourceWriter, stmt: &HlilStmt) {
         }
         HlilStmt::Goto(addr) => {
             w.write(&format!("goto label_{:x};\n", addr));
+        }
+        HlilStmt::IndirectGoto(target) => {
+            w.write("goto *(");
+            write_expr(w, target);
+            w.write(");\n");
         }
         HlilStmt::Block(stmts) => {
             for s in stmts {
