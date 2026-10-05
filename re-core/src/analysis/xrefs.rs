@@ -160,7 +160,8 @@ impl XrefManager {
                 // Check for LEA instructions (RIP-relative string loading)
                 // Pattern: lea reg, [rip + 0x????] where the effective address is a string
                 if (mn == "lea" || mn == "adr" || mn == "adrp")
-                    && let Some(target) = effective_address(&insn, addr)
+                    && let Some(target) =
+                        memory_operand_address(&insn.op_str, insn.address, insn.bytes.len())
                     && string_addrs.contains(&target)
                 {
                     self.add_xref(Xref {
@@ -193,32 +194,60 @@ impl XrefManager {
     }
 }
 
-/// Parse `[rip + 0xNNNN]` / `[pc, #NNNN]` operands into the address they
-/// resolve to, relative to the following instruction.
-fn effective_address(insn: &crate::disasm::Instruction, insn_addr: u64) -> Option<u64> {
-    let op = &insn.op_str;
-    if let Some(bracket_start) = op.find('[')
-        && let Some(bracket_end) = op[bracket_start..].find(']')
-    {
-        let inner = &op[bracket_start + 1..bracket_start + bracket_end];
-        // RIP-relative: [rip + 0xNNNN]
-        if inner.contains("rip") {
-            if let Some(plus_pos) = inner.find('+') {
-                let offset_str = inner[plus_pos + 1..].trim().trim_start_matches("0x");
-                if let Ok(offset) = u64::from_str_radix(offset_str, 16) {
-                    // RIP-relative uses next instruction address as base
-                    return Some(insn_addr + insn.bytes.len() as u64 + offset);
-                }
-            }
-            if let Some(minus_pos) = inner.find('-') {
-                let offset_str = inner[minus_pos + 1..].trim().trim_start_matches("0x");
-                if let Ok(offset) = u64::from_str_radix(offset_str, 16) {
-                    return Some(insn_addr + insn.bytes.len() as u64 - offset);
-                }
-            }
-        }
+/// The absolute address a statically-known memory operand refers to.
+///
+/// * `[0x1234]` — absolute displacement.
+/// * `[rip + 0x10]` / `[rip - 0x10]` — relative to the next instruction.
+///
+/// Indexed (`[rip + rax*4]`), register-based (`[rbp - 8]`) and segment-relative
+/// (`gs:[0x30]`, `fs:[...]`) references depend on runtime values and have no
+/// static target. Resolving RIP-relative operands matters on x86-64, where
+/// globals and import slots are almost always addressed this way.
+fn memory_operand_address(op_str: &str, insn_addr: u64, insn_len: usize) -> Option<u64> {
+    let bracket_start = op_str.find('[')?;
+    let bracket_end = bracket_start + op_str[bracket_start..].find(']')?;
+    let inner = op_str[bracket_start + 1..bracket_end].trim();
+    let lower = crate::disasm::lower_text(inner);
+
+    let prefix = crate::disasm::lower_text(&op_str[..bracket_start]);
+    let prefix = prefix.trim_end();
+    if prefix.ends_with("gs:") || prefix.ends_with("fs:") {
+        return None;
     }
-    None
+
+    if lower.contains("rip") {
+        let next_ip = insn_addr.wrapping_add(insn_len as u64);
+        let rest = lower.replacen("rip", "", 1);
+        let rest = rest.trim();
+        if rest.is_empty() {
+            return Some(next_ip);
+        }
+        let sign = match rest.as_bytes()[0] {
+            b'+' => 1i64,
+            b'-' => -1i64,
+            _ => return None,
+        };
+        let value = parse_hex_value(rest[1..].trim())?;
+        return Some(if sign > 0 {
+            next_ip.wrapping_add(value)
+        } else {
+            next_ip.wrapping_sub(value)
+        });
+    }
+
+    parse_hex_value(&lower)
+}
+
+/// Parse a capstone-printed displacement ("0x1234" or decimal digits).
+fn parse_hex_value(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if let Some(hex) = s.strip_prefix("0x") {
+        u64::from_str_radix(hex, 16).ok()
+    } else if s.chars().all(|c| c.is_ascii_hexdigit()) && !s.is_empty() {
+        u64::from_str_radix(s, 16).ok()
+    } else {
+        None
+    }
 }
 
 /// Append the data xrefs implied by one instruction's operands.
@@ -226,34 +255,34 @@ fn collect_data_xrefs(
     mnemonic: &str,
     op_str: &str,
     from_addr: u64,
+    insn_len: usize,
     memory: &MemoryMap,
     out: &mut Vec<Xref>,
 ) {
-    // Look for [0xHEX] patterns in operand string
-    let mut remaining = op_str;
-    while let Some(bracket_start) = remaining.find('[') {
-        if let Some(bracket_end) = remaining[bracket_start..].find(']') {
-            let inner = &remaining[bracket_start + 1..bracket_start + bracket_end];
-            if let Some(target) = parse_hex_from_bracket(inner)
-                && memory.contains_address(target)
-            {
-                let mn = crate::disasm::lower_text(mnemonic);
-                let xref_type = if is_write_mnemonic(&mn) {
-                    XrefType::DataWrite
-                } else {
-                    XrefType::DataRead
-                };
-                out.push(Xref {
-                    from_address: from_addr,
-                    to_address: target,
-                    xref_type,
-                });
-            }
-            remaining = &remaining[bracket_start + bracket_end + 1..];
-        } else {
-            break;
-        }
+    let Some(target) = memory_operand_address(op_str, from_addr, insn_len) else {
+        return;
+    };
+    if !memory.contains_address(target) {
+        return;
     }
+    let mn = crate::disasm::lower_text(mnemonic);
+    // Intel syntax puts the destination first: `mov [mem], rax` writes the
+    // address, `mov rax, [mem]` only reads it. Testing the mnemonic alone
+    // would label every load a write.
+    let dest_is_memory = op_str
+        .split(',')
+        .next()
+        .is_some_and(|first| first.contains('['));
+    let xref_type = if dest_is_memory && is_write_mnemonic(&mn) {
+        XrefType::DataWrite
+    } else {
+        XrefType::DataRead
+    };
+    out.push(Xref {
+        from_address: from_addr,
+        to_address: target,
+        xref_type,
+    });
 }
 
 /// Walk `[start, end)` and append every xref found, in instruction order.
@@ -287,8 +316,8 @@ fn collect_range_xrefs(
                     to_address: target_addr,
                     xref_type,
                 });
-            } else if insn.op_str.contains('[')
-                && let Some(target_addr) = parse_hex_from_bracket(&insn.op_str)
+            } else if let Some(target_addr) =
+                memory_operand_address(&insn.op_str, insn.address, insn.bytes.len())
                 && memory.contains_address(target_addr)
             {
                 let xref_type = if mnemonic == "call" {
@@ -305,12 +334,20 @@ fn collect_range_xrefs(
         }
 
         // Data xrefs
-        collect_data_xrefs(&insn.mnemonic, &insn.op_str, insn.address, memory, out);
+        collect_data_xrefs(
+            &insn.mnemonic,
+            &insn.op_str,
+            insn.address,
+            insn.bytes.len(),
+            memory,
+            out,
+        );
 
         // String xrefs (only when string addresses are provided)
         if !string_addrs.is_empty() {
             if (mnemonic == "lea" || mnemonic == "adr" || mnemonic == "adrp")
-                && let Some(target) = effective_address(&insn, addr)
+                && let Some(target) =
+                    memory_operand_address(&insn.op_str, insn.address, insn.bytes.len())
                 && string_addrs.contains(&target)
             {
                 out.push(Xref {
@@ -337,13 +374,15 @@ fn collect_range_xrefs(
     }
 }
 
+/// Mnemonics that write their (memory) destination operand. `push`/`pop` are
+/// deliberately absent: `push [mem]` reads the address, and treating it as a
+/// write would mislabel the reference.
 fn is_write_mnemonic(mnemonic: &str) -> bool {
     matches!(
         mnemonic,
         "mov"
             | "movs"
             | "stos"
-            | "push"
             | "xchg"
             | "add"
             | "sub"
@@ -363,24 +402,6 @@ fn parse_address(op_str: &str) -> Option<u64> {
         .trim_start_matches("0x")
         .trim_start_matches("loc_");
     u64::from_str_radix(cleaned, 16).ok()
-}
-
-fn parse_hex_from_bracket(inner: &str) -> Option<u64> {
-    // Try to find a standalone hex value like "0x401000" or just "401000"
-    // within bracket contents like "rip + 0x401000" or plain "0x401000"
-    for token in inner.split(|c: char| c == '+' || c == '-' || c == '*' || c.is_whitespace()) {
-        let trimmed = token.trim().trim_start_matches("0x");
-        if trimmed.is_empty() {
-            continue;
-        }
-        // Must look like a large hex address (at least 5 hex digits to avoid register offsets)
-        if trimmed.len() >= 5
-            && let Ok(val) = u64::from_str_radix(trimmed, 16)
-        {
-            return Some(val);
-        }
-    }
-    None
 }
 
 fn parse_address_from_operands(op_str: &str) -> Option<u64> {
@@ -410,17 +431,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_hex_from_bracket_works() {
-        assert_eq!(parse_hex_from_bracket("0x401000"), Some(0x401000));
-        assert_eq!(parse_hex_from_bracket("rip + 0x401000"), Some(0x401000));
-        assert_eq!(parse_hex_from_bracket("rax"), None); // too short
-        assert_eq!(parse_hex_from_bracket("0x10"), None); // too short
-    }
-
-    #[test]
     fn write_mnemonic_detection() {
         assert!(is_write_mnemonic("mov"));
-        assert!(is_write_mnemonic("push"));
+        assert!(!is_write_mnemonic("push"), "push reads its memory source");
         assert!(!is_write_mnemonic("cmp"));
         assert!(!is_write_mnemonic("test"));
     }
@@ -470,45 +483,127 @@ mod tests {
     }
 
     #[test]
-    fn extract_effective_address_rip_relative() {
-        // Simulate a LEA instruction: lea rdi, [rip + 0x2000]
-        // instruction at 0x1000, 7 bytes long
-        let insn = crate::disasm::Instruction {
-            address: 0x1000,
-            bytes: vec![0x48, 0x8d, 0x3d, 0x00, 0x20, 0x00, 0x00], // 7 bytes
-            mnemonic: "lea".to_string(),
-            op_str: "rdi, [rip + 0x2000]".to_string(),
-            groups: vec![],
-        };
-        let result = effective_address(&insn, 0x1000);
-        // Expected: 0x1000 + 7 + 0x2000 = 0x3007
-        assert_eq!(result, Some(0x3007));
+    fn memory_operand_address_rip_relative() {
+        // lea rdi, [rip + 0x2000] at 0x1000, 7 bytes: 0x1000 + 7 + 0x2000.
+        assert_eq!(
+            memory_operand_address("rdi, [rip + 0x2000]", 0x1000, 7),
+            Some(0x3007)
+        );
+        // mov rax, qword ptr [rip - 0x1000] at 0x5000, 7 bytes.
+        assert_eq!(
+            memory_operand_address("rax, qword ptr [rip - 0x1000]", 0x5000, 7),
+            Some(0x4007)
+        );
     }
 
     #[test]
-    fn extract_effective_address_rip_minus() {
-        let insn = crate::disasm::Instruction {
-            address: 0x5000,
-            bytes: vec![0x48, 0x8d, 0x3d, 0x00, 0x10, 0x00, 0x00], // 7 bytes
-            mnemonic: "lea".to_string(),
-            op_str: "rdi, [rip - 0x1000]".to_string(),
-            groups: vec![],
-        };
-        let result = effective_address(&insn, 0x5000);
-        // Expected: 0x5000 + 7 - 0x1000 = 0x4007
-        assert_eq!(result, Some(0x4007));
+    fn memory_operand_address_rejects_runtime_bases() {
+        // Register-relative, indexed and segment-relative references have no
+        // static target.
+        assert_eq!(memory_operand_address("rax, [rbx + 0x10]", 0x1000, 4), None);
+        assert_eq!(
+            memory_operand_address("rcx, [rip + rax*4]", 0x1000, 7),
+            None
+        );
+        assert_eq!(
+            memory_operand_address("rax, qword ptr gs:[0x30]", 0x1000, 9),
+            None
+        );
+        assert_eq!(
+            memory_operand_address("rax, qword ptr [rbp - 8]", 0x1000, 4),
+            None
+        );
     }
 
     #[test]
-    fn extract_effective_address_no_rip() {
-        let insn = crate::disasm::Instruction {
-            address: 0x1000,
-            bytes: vec![0x48, 0x8d, 0x04, 0x25, 0x00, 0x20, 0x00, 0x00],
-            mnemonic: "lea".to_string(),
-            op_str: "rax, [rbx + 0x10]".to_string(),
-            groups: vec![],
-        };
-        let result = effective_address(&insn, 0x1000);
-        assert_eq!(result, None);
+    fn memory_operand_address_absolute_displacement() {
+        // mov rax, qword ptr [0x1234] — no base register.
+        assert_eq!(
+            memory_operand_address("rax, qword ptr [0x1234]", 0x1000, 8),
+            Some(0x1234)
+        );
+    }
+
+    #[test]
+    fn data_xref_direction_follows_operand_position() {
+        use crate::memory::{MemorySegment, Permissions};
+        let mut text = vec![0x90u8; 32];
+        // mov [rip + 0xff9], rax at 0x1000 (writes 0x2000)
+        text[..7].copy_from_slice(&[0x48, 0x89, 0x05, 0xF9, 0x0F, 0x00, 0x00]);
+        // mov rax, [rip + 0xff2] at 0x1007 (reads 0x2000)
+        text[7..14].copy_from_slice(&[0x48, 0x8B, 0x05, 0xF2, 0x0F, 0x00, 0x00]);
+
+        let mut map = MemoryMap::default();
+        map.add_segment(MemorySegment {
+            name: ".text".to_string(),
+            start: 0x1000,
+            size: text.len() as u64,
+            data: text,
+            permissions: Permissions::READ | Permissions::EXECUTE,
+        })
+        .unwrap();
+        map.add_segment(MemorySegment {
+            name: ".data".to_string(),
+            start: 0x2000,
+            size: 8,
+            data: vec![0; 8],
+            permissions: Permissions::READ | Permissions::WRITE,
+        })
+        .unwrap();
+
+        let disasm = crate::disasm::Disassembler::new(crate::arch::Architecture::X86_64).unwrap();
+        let mut out = Vec::new();
+        collect_range_xrefs(&map, &disasm, 0x1000, 0x100e, &Default::default(), &mut out);
+
+        assert!(out.iter().any(|x| x.from_address == 0x1000
+            && x.to_address == 0x2000
+            && x.xref_type == XrefType::DataWrite));
+        assert!(out.iter().any(|x| x.from_address == 0x1007
+            && x.to_address == 0x2000
+            && x.xref_type == XrefType::DataRead));
+    }
+
+    #[test]
+    fn call_through_rip_relative_iat_slot_produces_call_xref() {
+        use crate::memory::MemorySegment;
+        let mut map = MemoryMap::default();
+        // Instruction at 0x1000 (6 bytes): call qword ptr [rip + 0xffa] →
+        // slot at 0x2000, which is mapped in a data segment. The code segment
+        // is padded past capstone's 15-byte read window.
+        let mut text = vec![0x90u8; 16];
+        text[..6].copy_from_slice(&[0xFF, 0x15, 0xFA, 0x0F, 0x00, 0x00]);
+        map.add_segment(MemorySegment {
+            name: ".text".to_string(),
+            start: 0x1000,
+            size: text.len() as u64,
+            data: text,
+            permissions: crate::memory::Permissions::READ | crate::memory::Permissions::EXECUTE,
+        })
+        .unwrap();
+        map.add_segment(MemorySegment {
+            name: ".idata".to_string(),
+            start: 0x2000,
+            size: 8,
+            data: vec![0; 8],
+            permissions: crate::memory::Permissions::READ | crate::memory::Permissions::WRITE,
+        })
+        .unwrap();
+
+        let disasm = crate::disasm::Disassembler::new(crate::arch::Architecture::X86_64).unwrap();
+        let mut out = Vec::new();
+        collect_range_xrefs(&map, &disasm, 0x1000, 0x1006, &Default::default(), &mut out);
+
+        // The same instruction also reads the slot, so a Call and a DataRead
+        // xref are both expected.
+        let call = out
+            .iter()
+            .find(|x| x.xref_type == XrefType::Call)
+            .expect("call xref through the IAT slot");
+        assert_eq!(call.from_address, 0x1000);
+        assert_eq!(call.to_address, 0x2000);
+        assert!(
+            out.iter()
+                .any(|x| x.xref_type == XrefType::DataRead && x.to_address == 0x2000)
+        );
     }
 }
