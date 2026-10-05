@@ -1,4 +1,5 @@
 use crate::Result;
+use crate::analysis::exception_tables::{ExceptionTableStats, RuntimeFunction};
 use crate::arch::Architecture;
 use crate::disasm::Disassembler;
 use crate::loader::{BinaryFormat, Symbol, SymbolKind};
@@ -100,6 +101,63 @@ impl FunctionManager {
                 });
             }
         }
+    }
+
+    /// Apply authoritative function ranges from a PE exception table.
+    ///
+    /// Every entry contributes a known `[start, end)` range: existing records
+    /// at `start` gain an `end_address` (unless a symbol already supplied
+    /// one), missing records are created, and heuristic functions that start
+    /// strictly inside a real function are removed — those can only come from
+    /// byte-pattern scans matching mid-instruction.
+    pub fn apply_runtime_functions(&mut self, entries: &[RuntimeFunction]) -> ExceptionTableStats {
+        let mut stats = ExceptionTableStats {
+            entries: entries.len(),
+            ..Default::default()
+        };
+
+        for entry in entries {
+            match self.functions.get_mut(&entry.start) {
+                Some(func) => {
+                    if func.end_address.is_none() {
+                        func.end_address = Some(entry.end);
+                        stats.sized += 1;
+                    }
+                }
+                None => {
+                    self.add_function(Function {
+                        name: format!("sub_{:x}", entry.start),
+                        start_address: entry.start,
+                        end_address: Some(entry.end),
+                        calling_convention: CallingConvention::default(),
+                        stack_frame_size: 0,
+                    });
+                    stats.added += 1;
+                }
+            }
+        }
+
+        let mut ranges: Vec<(u64, u64)> = entries.iter().map(|e| (e.start, e.end)).collect();
+        ranges.sort_unstable();
+        let starts: Vec<u64> = ranges.iter().map(|r| r.0).collect();
+
+        let mut to_remove = Vec::new();
+        for &addr in self.functions.keys() {
+            let idx = starts.partition_point(|&s| s <= addr);
+            if idx == 0 {
+                continue;
+            }
+            let (start, end) = ranges[idx - 1];
+            if addr > start && addr < end {
+                to_remove.push(addr);
+            }
+        }
+        for addr in &to_remove {
+            self.functions.remove(addr);
+        }
+        stats.removed = to_remove.len();
+
+        stats
     }
 
     /// Prologue-based function discovery with multi-architecture support
@@ -816,5 +874,101 @@ mod tests {
             detected_cc(&[0xC3], Architecture::X86),
             CallingConvention::Cdecl
         );
+    }
+
+    fn runtime_function(start: u64, end: u64) -> RuntimeFunction {
+        RuntimeFunction {
+            start,
+            end,
+            unwind_info: 0,
+        }
+    }
+
+    #[test]
+    fn runtime_functions_add_missing_starts_and_size_existing() {
+        let mut mgr = FunctionManager::default();
+        mgr.add_function(Function {
+            name: "sub_1000".to_string(),
+            start_address: 0x1000,
+            end_address: None,
+            calling_convention: CallingConvention::default(),
+            stack_frame_size: 0,
+        });
+
+        let stats = mgr.apply_runtime_functions(&[
+            runtime_function(0x1000, 0x1040),
+            runtime_function(0x1100, 0x1110),
+        ]);
+
+        assert_eq!(stats.entries, 2);
+        assert_eq!(stats.added, 1);
+        assert_eq!(stats.sized, 1);
+        assert_eq!(stats.removed, 0);
+        assert_eq!(mgr.functions[&0x1000].end_address, Some(0x1040));
+        assert_eq!(mgr.functions[&0x1100].end_address, Some(0x1110));
+        assert_eq!(mgr.functions[&0x1100].name, "sub_1100");
+    }
+
+    #[test]
+    fn runtime_functions_keep_existing_end_from_symbols() {
+        let mut mgr = FunctionManager::default();
+        mgr.add_function(Function {
+            name: "from_pdb".to_string(),
+            start_address: 0x1000,
+            end_address: Some(0x1030),
+            calling_convention: CallingConvention::default(),
+            stack_frame_size: 0,
+        });
+        mgr.apply_runtime_functions(&[runtime_function(0x1000, 0x1040)]);
+        assert_eq!(mgr.functions[&0x1000].end_address, Some(0x1030));
+        assert_eq!(mgr.functions[&0x1000].name, "from_pdb");
+    }
+
+    #[test]
+    fn runtime_functions_drop_starts_inside_real_functions() {
+        let mut mgr = FunctionManager::default();
+        for (addr, name) in [
+            (0x1000, "sub_1000"),
+            (0x1001, "sub_1001"),
+            (0x1020, "sub_1020"),
+        ] {
+            mgr.add_function(Function {
+                name: name.to_string(),
+                start_address: addr,
+                end_address: None,
+                calling_convention: CallingConvention::default(),
+                stack_frame_size: 0,
+            });
+        }
+
+        let stats = mgr.apply_runtime_functions(&[runtime_function(0x1000, 0x1040)]);
+
+        assert_eq!(stats.removed, 2, "mid-instruction starts must be dropped");
+        assert!(mgr.functions.contains_key(&0x1000));
+        assert!(!mgr.functions.contains_key(&0x1001));
+        assert!(!mgr.functions.contains_key(&0x1020));
+    }
+
+    /// A function starting exactly at an entry boundary is real, and one in a
+    /// gap between entries is a leaf function the table does not describe —
+    /// both must survive pruning.
+    #[test]
+    fn runtime_functions_keep_boundary_and_gap_starts() {
+        let mut mgr = FunctionManager::default();
+        for addr in [0x1040u64, 0x1200] {
+            mgr.add_function(Function {
+                name: format!("sub_{addr:x}"),
+                start_address: addr,
+                end_address: None,
+                calling_convention: CallingConvention::default(),
+                stack_frame_size: 0,
+            });
+        }
+
+        let stats = mgr.apply_runtime_functions(&[runtime_function(0x1000, 0x1040)]);
+
+        assert_eq!(stats.removed, 0);
+        assert!(mgr.functions.contains_key(&0x1040));
+        assert!(mgr.functions.contains_key(&0x1200));
     }
 }

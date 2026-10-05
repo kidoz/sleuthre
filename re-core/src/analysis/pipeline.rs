@@ -271,6 +271,15 @@ fn analyze_loaded_with_bytes(
         project.functions.apply_symbols(&loaded.symbols);
     }
 
+    // --- PE exception table ---
+    // `.pdata` is authoritative for x86-64 function ranges: adopt its starts
+    // and ends and drop prologue-sweep false positives before descent runs.
+    let exception_stats = if config.discover_functions {
+        apply_exception_tables(&mut project)
+    } else {
+        crate::analysis::exception_tables::ExceptionTableStats::default()
+    };
+
     if config.recursive_descent {
         check_cancelled(cancellation)?;
         on_progress(AnalysisStage::RecursiveDescent);
@@ -580,6 +589,15 @@ fn analyze_loaded_with_bytes(
             debug_sig_count, debug_type_count
         ));
     }
+    if exception_stats.entries > 0 {
+        summary.push_str(&format!(
+            ", {} exception-table functions ({} added, {} sized, {} false positives dropped)",
+            exception_stats.entries,
+            exception_stats.added,
+            exception_stats.sized,
+            exception_stats.removed,
+        ));
+    }
 
     on_progress(AnalysisStage::Done);
 
@@ -590,6 +608,23 @@ fn analyze_loaded_with_bytes(
         entry_point: loaded.entry_point,
         summary,
     })
+}
+
+/// Adopt PE exception-table function ranges for x86-64 images.
+///
+/// No-op for other formats/architectures and for binaries without a `.pdata`
+/// section.
+fn apply_exception_tables(
+    project: &mut Project,
+) -> crate::analysis::exception_tables::ExceptionTableStats {
+    if project.binary_format != BinaryFormat::Pe || project.arch != Architecture::X86_64 {
+        return Default::default();
+    }
+    let entries = crate::analysis::exception_tables::parse_pe_x64_runtime_functions(
+        &project.memory_map,
+        project.image_base,
+    );
+    project.functions.apply_runtime_functions(&entries)
 }
 
 fn check_cancelled(cancellation: Option<&AnalysisCancellation>) -> Result<()> {
@@ -639,6 +674,7 @@ pub fn reanalyze_with_cancellation(
                     .functions
                     .discover_functions(&project.memory_map, ds, entry, project.arch);
         }
+        apply_exception_tables(project);
     }
 
     if config.recursive_descent {
