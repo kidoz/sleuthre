@@ -88,13 +88,68 @@ pub fn lift_function(name: &str, entry: u64, instructions: &[Instruction]) -> Ll
     func
 }
 
+/// Rewrite an operand whose memory reference is instruction-pointer- or
+/// segment-relative into plain arithmetic the lifter can fold:
+///
+/// * `[rip + 0x709728]` — substitute the absolute next-instruction address,
+///   which [`parse_address_expr`] then folds to a single constant. Left
+///   unrewritten it becomes a `pc + disp` expression that later reads as a
+///   struct field off the pseudo-register.
+/// * `gs:[0x30]` → `[gs_base + 0x30]` — dropping the segment prefix (a TEB
+///   read becomes a dereference of address `0x30`) is simply wrong.
+///
+/// `next_ip` is the address of the following instruction, the base RIP-relative
+/// addressing is defined against.
+fn rewrite_operand(op_str: &str, next_ip: u64) -> Option<String> {
+    let start = op_str.find('[')?;
+    let end = op_str[start..].find(']')? + start;
+
+    let mut before = op_str[..start].to_string();
+    let mut inner = op_str[start + 1..end].to_string();
+
+    let lower_before = crate::disasm::lower_text(&before);
+    let segment_base = if lower_before.trim_end().ends_with("gs:") {
+        before.truncate(before.len() - 3);
+        Some("gs_base")
+    } else if lower_before.trim_end().ends_with("fs:") {
+        before.truncate(before.len() - 3);
+        Some("fs_base")
+    } else {
+        None
+    };
+
+    let mut changed = false;
+    if inner
+        .split_whitespace()
+        .any(|t| t.eq_ignore_ascii_case("rip"))
+    {
+        let absolute = format!("0x{next_ip:x}");
+        inner = inner.replace("rip", &absolute).replace("RIP", &absolute);
+        changed = true;
+    }
+    if let Some(base) = segment_base {
+        inner = format!("{base} + {inner}");
+        changed = true;
+    }
+
+    changed.then(|| format!("{before}[{inner}]{}", &op_str[end + 1..]))
+}
+
 /// Lift a single native instruction into one or more LLIL statements.
 fn lift_instruction(func: &mut LlilFunction, insn: &Instruction) -> Vec<LlilStmt> {
     let mn = crate::disasm::lower_text(&insn.mnemonic);
-    let ops: Vec<&str> = if insn.op_str.is_empty() {
+    let rewritten;
+    let ops_src =
+        if let Some(r) = rewrite_operand(&insn.op_str, insn.address + insn.bytes.len() as u64) {
+            rewritten = r;
+            &rewritten
+        } else {
+            &insn.op_str
+        };
+    let ops: Vec<&str> = if ops_src.is_empty() {
         vec![]
     } else {
-        insn.op_str.split(',').map(|s| s.trim()).collect()
+        ops_src.split(',').map(|s| s.trim()).collect()
     };
 
     match mn.as_ref() {
@@ -157,7 +212,7 @@ fn lift_instruction(func: &mut LlilFunction, insn: &Instruction) -> Vec<LlilStmt
 
         // --- SIMD / Vector ---
         _ => {
-            if let Some(stmts) = lift_simd_instruction(func, &mn, &insn.op_str) {
+            if let Some(stmts) = lift_simd_instruction(func, &mn, ops_src) {
                 stmts
             } else {
                 vec![LlilStmt::Unimplemented {
@@ -253,11 +308,15 @@ fn extract_mem_operand(op: &str) -> Option<&str> {
 fn parse_address_expr(func: &mut LlilFunction, expr: &str) -> ExprId {
     let expr = expr.trim();
 
-    // Try splitting on " + " and " - " for compound expressions
-    // Handle subtraction: "rbp - 8"
+    // Try splitting on " + " and " - " for compound expressions.
+    // Constant sub-expressions fold, so a rewritten `[0x4011a8 + 0x709728]`
+    // becomes the single absolute address RIP-relative operands denote.
     if let Some(pos) = expr.rfind(" - ") {
         let left = parse_address_expr(func, &expr[..pos]);
         let right = parse_address_expr(func, &expr[pos + 3..]);
+        if let (Some(l), Some(r)) = (const_of(func, left), const_of(func, right)) {
+            return func.const_val(l.wrapping_sub(r));
+        }
         return func.binop(BinOp::Sub, left, right);
     }
 
@@ -265,6 +324,9 @@ fn parse_address_expr(func: &mut LlilFunction, expr: &str) -> ExprId {
     if let Some(pos) = expr.rfind(" + ") {
         let left = parse_address_expr(func, &expr[..pos]);
         let right = parse_address_expr(func, &expr[pos + 3..]);
+        if let (Some(l), Some(r)) = (const_of(func, left), const_of(func, right)) {
+            return func.const_val(l.wrapping_add(r));
+        }
         return func.binop(BinOp::Add, left, right);
     }
 
@@ -286,6 +348,14 @@ fn parse_address_expr(func: &mut LlilFunction, expr: &str) -> ExprId {
 
     // Register
     func.reg(expr)
+}
+
+/// The constant value of an expression, when it is one.
+fn const_of(func: &LlilFunction, id: ExprId) -> Option<u64> {
+    match func.exprs.get(id) {
+        Some(LlilExpr::Const(v)) => Some(*v),
+        _ => None,
+    }
 }
 
 /// Determine memory access size from prefix (qword=8, dword=4, word=2, byte=1).
@@ -1240,6 +1310,62 @@ mod tests {
             }
             other => panic!("Expected SetReg with Load, got {:?}", other),
         }
+    }
+
+    fn insn_with_len(addr: u64, len: usize, mn: &str, op: &str) -> Instruction {
+        Instruction {
+            address: addr,
+            bytes: vec![0; len],
+            mnemonic: mn.to_string(),
+            op_str: op.to_string(),
+            groups: vec![],
+        }
+    }
+
+    /// The effective address of a RIP-relative operand is `next_ip + disp`;
+    /// leaving it as `pc + disp` makes the decompiler read struct fields off
+    /// the instruction pointer.
+    #[test]
+    fn rip_relative_operand_folds_to_absolute_address() {
+        let insns = [insn_with_len(
+            0x4011a1,
+            7,
+            "mov",
+            "rdi, qword ptr [rip + 0x709728]",
+        )];
+        let func = lift_function("test", 0x4011a1, &insns);
+        let LlilStmt::SetReg { src, .. } = &func.instructions[0].stmts[0] else {
+            panic!("expected SetReg");
+        };
+        let LlilExpr::Load { addr, .. } = &func.exprs[*src] else {
+            panic!("expected Load");
+        };
+        assert_eq!(func.exprs[*addr], LlilExpr::Const(0x4011a8 + 0x709728));
+    }
+
+    /// A segment override is not decoration: `gs:[0x30]` is a TEB read, not a
+    /// dereference of address 0x30.
+    #[test]
+    fn segment_relative_operand_keeps_segment_base() {
+        let insns = [insn_with_len(
+            0x4011b4,
+            9,
+            "mov",
+            "rax, qword ptr gs:[0x30]",
+        )];
+        let func = lift_function("test", 0x4011b4, &insns);
+        let LlilStmt::SetReg { src, .. } = &func.instructions[0].stmts[0] else {
+            panic!("expected SetReg");
+        };
+        let LlilExpr::Load { addr, .. } = &func.exprs[*src] else {
+            panic!("expected Load");
+        };
+        let LlilExpr::BinOp { op, left, right } = &func.exprs[*addr] else {
+            panic!("expected BinOp, got {:?}", func.exprs[*addr]);
+        };
+        assert_eq!(*op, BinOp::Add);
+        assert_eq!(func.exprs[*left], LlilExpr::Reg("gs_base".to_string()));
+        assert_eq!(func.exprs[*right], LlilExpr::Const(0x30));
     }
 
     #[test]
