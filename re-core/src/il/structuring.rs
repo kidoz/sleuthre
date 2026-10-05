@@ -323,7 +323,9 @@ fn is_param_candidate_register(name: &str) -> bool {
     }
     !matches!(
         name,
-        // stack / frame / program-counter / link registers across arches
+        // stack / frame / program-counter / link registers across arches,
+        // plus the segment bases, which are always read before written but
+        // are never arguments.
         "rsp"
             | "esp"
             | "sp"
@@ -337,6 +339,8 @@ fn is_param_candidate_register(name: &str) -> bool {
             | "pc"
             | "lr"
             | "fp"
+            | "gs_base"
+            | "fs_base"
     )
 }
 
@@ -2855,6 +2859,10 @@ fn fold_field_accesses_inner(
 /// `*(var + const)` at two or more distinct offsets, or at a single offset
 /// large enough (>= 0x10) to be a struct field rather than a plain
 /// pointer-to-scalar deref.
+///
+/// Segment bases are excluded: `gs_base + 0x30` is a fixed TEB/PEB field
+/// address, and rendering it `gs_base->field_30` hides the segment access
+/// behind a struct that does not exist.
 fn collect_struct_pointer_bases(stmts: &[HlilStmt]) -> HashSet<String> {
     let mut offsets: HashMap<String, HashSet<u64>> = HashMap::new();
     for stmt in stmts {
@@ -2862,7 +2870,10 @@ fn collect_struct_pointer_bases(stmts: &[HlilStmt]) -> HashSet<String> {
     }
     offsets
         .into_iter()
-        .filter(|(_, offs)| offs.len() >= 2 || offs.iter().any(|&o| o >= 0x10))
+        .filter(|(name, offs)| {
+            !matches!(name.as_str(), "gs_base" | "fs_base")
+                && (offs.len() >= 2 || offs.iter().any(|&o| o >= 0x10))
+        })
         .map(|(name, _)| name)
         .collect()
 }
