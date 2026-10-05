@@ -1,0 +1,32 @@
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "CC0-1.0",
+    "Unlicense",
+    "BSL-1.0",
+    "MPL-2.0",
+    # Font licenses for the fonts bundled by epaint
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+]
+
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained; transitive dependency with no safe upgrade path" },
+    { id = "RUSTSEC-2026-0249", reason = "smartstring is unmaintained; pulled in via rhai, no safe upgrade path" },
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser 0.25.1 is unmaintained; via ab_glyph -> winit -> eframe, no safe upgrade path" },
+]
+
+[bans]
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

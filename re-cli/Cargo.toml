@@ -2,6 +2,7 @@
 name = "re-cli"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "Headless CLI tool for batch binary analysis"
 
 [dependencies]

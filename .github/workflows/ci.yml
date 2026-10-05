@@ -40,6 +40,13 @@ jobs:
         env:
           SLEUTHRE_REQUIRE_CC: '1'
 
+  deny:
+    name: Cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
   bench-build:
     # Build the criterion bench binaries on every PR so a regression in the
     # signatures or analysis hot paths fails fast — actually running the

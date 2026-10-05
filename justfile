@@ -34,3 +34,7 @@ run:
 # Build in release mode
 release:
     cargo build --release
+
+# Run cargo-deny license/advisory checks
+deny:
+    cargo deny check
