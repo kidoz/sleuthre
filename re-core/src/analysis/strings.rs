@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::memory::Permissions;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StringEncoding {
     Ascii,
@@ -19,6 +21,11 @@ pub struct DiscoveredString {
 pub struct StringsManager {
     pub strings: Vec<DiscoveredString>,
     pub min_length: usize,
+    /// Also scan executable segments. Off by default: arbitrary instruction
+    /// bytes decode as short ASCII runs (`AUATUWVSH`, `D$ H`), which on a real
+    /// binary bury the data-section strings under tens of thousands of false
+    /// positives.
+    pub scan_executable: bool,
 }
 
 impl Default for StringsManager {
@@ -26,6 +33,7 @@ impl Default for StringsManager {
         Self {
             strings: Vec::new(),
             min_length: 4,
+            scan_executable: false,
         }
     }
 }
@@ -34,6 +42,9 @@ impl StringsManager {
     pub fn scan_memory(&mut self, memory: &crate::memory::MemoryMap) {
         self.strings.clear();
         for segment in &memory.segments {
+            if !self.scan_executable && segment.permissions.contains(Permissions::EXECUTE) {
+                continue;
+            }
             self.scan_ascii(segment);
             self.scan_utf16le(segment);
             self.scan_utf16be(segment);
@@ -205,6 +216,41 @@ mod tests {
             data,
             permissions: Permissions::READ,
         }
+    }
+
+    /// Code bytes routinely decode as short ASCII runs; those must not be
+    /// reported as strings unless explicitly requested.
+    #[test]
+    fn executable_segments_are_skipped_by_default() {
+        let mut map = MemoryMap::default();
+        map.add_segment(MemorySegment {
+            name: ".text".to_string(),
+            start: 0x1000,
+            size: 16,
+            data: b"\x00AUATUWVSH\x00\x00\x00\x00\x00\x00".to_vec(),
+            permissions: Permissions::READ | Permissions::EXECUTE,
+        })
+        .unwrap();
+        map.add_segment(MemorySegment {
+            name: ".rdata".to_string(),
+            start: 0x2000,
+            size: 16,
+            data: b"\x00RealString\x00\x00\x00\x00\x00".to_vec(),
+            permissions: Permissions::READ,
+        })
+        .unwrap();
+
+        let mut mgr = StringsManager::default();
+        mgr.scan_memory(&map);
+        let values: Vec<&str> = mgr.strings.iter().map(|s| s.value.as_str()).collect();
+        assert_eq!(values, vec!["RealString"]);
+
+        mgr.scan_executable = true;
+        mgr.scan_memory(&map);
+        assert!(
+            mgr.strings.iter().any(|s| s.value == "AUATUWVSH"),
+            "opt-in must include executable segments"
+        );
     }
 
     #[test]
