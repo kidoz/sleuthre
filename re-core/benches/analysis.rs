@@ -5,12 +5,13 @@
 //! signature engine would actually see, so the numbers track real-world
 //! costs rather than empty-pipeline overhead.
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use re_core::analysis::recompile_diff::{CategoryHistogram, InstructionCategory};
 use re_core::arch::Architecture;
 use re_core::disasm::{Disassembler, Instruction};
 use re_core::memory::{MemoryMap, MemorySegment, Permissions};
 use re_core::signatures::SignatureDatabase;
+use std::hint::black_box;
 
 /// 64 KiB of repeated x86-64 function prologues with NOP padding so the
 /// signature scanner has plenty of candidate match points.
