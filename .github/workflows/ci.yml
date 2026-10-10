@@ -49,8 +49,8 @@ jobs:
 
   bench-build:
     # Build the criterion bench binaries on every PR so a regression in the
-    # signatures or analysis hot paths fails fast — actually running the
-    # benches is left to a manual workflow_dispatch to keep CI minutes low.
+    # signatures or analysis hot paths fails fast — benches are compile-only
+    # in CI; run them locally with `cargo bench` to keep CI minutes low.
     name: Bench compile
     runs-on: ubuntu-latest
     needs: check
