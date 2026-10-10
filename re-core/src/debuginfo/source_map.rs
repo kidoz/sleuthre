@@ -2,10 +2,17 @@ use crate::types::SourceLineInfo;
 use gimli::{Dwarf, Reader, Unit};
 use std::collections::BTreeMap;
 
-/// Parse line number programs from a DWARF compilation unit.
+/// Upper bound on line-table rows collected across all compilation units —
+/// a crafted `.debug_line` cannot balloon memory (mirrors `MAX_PDB_LINE_ROWS`
+/// in the PDB parser).
+pub(crate) const MAX_DWARF_LINE_ROWS: usize = 2_000_000;
+
+/// Parse line number programs from a DWARF compilation unit. `line_budget`
+/// is shared across units so the total row count stays bounded.
 pub fn parse_source_lines<R: Reader>(
     dwarf: &Dwarf<R>,
     unit: &Unit<R>,
+    line_budget: &mut usize,
 ) -> BTreeMap<u64, SourceLineInfo> {
     let mut result = BTreeMap::new();
 
@@ -16,6 +23,9 @@ pub fn parse_source_lines<R: Reader>(
 
     let mut rows = program.rows();
     while let Ok(Some((header, row))) = rows.next_row() {
+        if *line_budget == 0 {
+            break;
+        }
         if !row.is_stmt() {
             continue;
         }
@@ -35,9 +45,10 @@ pub fn parse_source_lines<R: Reader>(
             None => continue,
         };
 
-        let file = file_name_from_entry(dwarf, unit, file_entry);
+        let file = file_name_from_entry(dwarf, unit, header, file_entry);
 
         result.insert(address, SourceLineInfo { file, line, column });
+        *line_budget -= 1;
     }
 
     result
@@ -46,12 +57,13 @@ pub fn parse_source_lines<R: Reader>(
 fn file_name_from_entry<R: Reader>(
     dwarf: &Dwarf<R>,
     unit: &Unit<R>,
+    header: &gimli::LineProgramHeader<R>,
     file_entry: &gimli::FileEntry<R>,
 ) -> String {
     let mut path = String::new();
 
     // Get directory
-    if let Some(dir) = file_entry.directory(unit.line_program.as_ref().unwrap().header())
+    if let Some(dir) = file_entry.directory(header)
         && let Ok(dir_str) = dwarf.attr_string(unit, dir)
         && let Ok(s) = dir_str.to_string()
     {

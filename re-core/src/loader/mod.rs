@@ -335,7 +335,7 @@ fn load_pe(pe: pe::PE, bytes: &[u8]) -> Result<LoadedBinary> {
             perms.insert(Permissions::EXECUTE);
         }
 
-        let start = image_base + section.virtual_address as u64;
+        let start = image_base.saturating_add(section.virtual_address as u64);
         let virtual_size = section.virtual_size as usize;
         let raw_offset = section.pointer_to_raw_data as usize;
         let raw_size = section.size_of_raw_data as usize;
@@ -379,7 +379,7 @@ fn load_pe(pe: pe::PE, bytes: &[u8]) -> Result<LoadedBinary> {
         imports.push(Import {
             name: import.name.to_string(),
             library: import.dll.to_string(),
-            address: image_base + import.offset as u64,
+            address: image_base.saturating_add(import.offset as u64),
         });
     }
 
@@ -389,12 +389,12 @@ fn load_pe(pe: pe::PE, bytes: &[u8]) -> Result<LoadedBinary> {
         if let Some(ref name) = exp.name {
             exports.push(Export {
                 name: name.to_string(),
-                address: image_base + exp.rva as u64,
+                address: image_base.saturating_add(exp.rva as u64),
             });
         } else if let Some(offset) = exp.offset {
             exports.push(Export {
                 name: format!("ordinal_{}", exp.rva),
-                address: image_base + offset as u64,
+                address: image_base.saturating_add(offset as u64),
             });
         }
     }
@@ -420,7 +420,7 @@ fn load_pe(pe: pe::PE, bytes: &[u8]) -> Result<LoadedBinary> {
 
     Ok(LoadedBinary {
         memory_map,
-        entry_point: pe.entry as u64 + image_base,
+        entry_point: image_base.saturating_add(pe.entry as u64),
         arch,
         endianness: Endianness::Little, // PE is always little-endian
         symbols,
@@ -809,5 +809,52 @@ mod tests {
         let data = vec![0x00; 4];
         let loaded = load_raw_binary(&data, 0, Architecture::Mips, None).unwrap();
         assert_eq!(loaded.endianness, Endianness::Big);
+    }
+
+    /// Build a minimal PE32+ (x86-64) image with the given section count and
+    /// image_base, so loader address arithmetic can be exercised directly.
+    fn minimal_pe64(image_base: u64, with_section: bool) -> Vec<u8> {
+        let mut bytes = vec![0u8; 0x200];
+        bytes[0..2].copy_from_slice(b"MZ");
+        bytes[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes()); // e_lfanew
+        bytes[0x40..0x44].copy_from_slice(b"PE\0\0");
+        // COFF header
+        bytes[0x44..0x46].copy_from_slice(&0x8664u16.to_le_bytes()); // AMD64
+        bytes[0x46..0x48].copy_from_slice(&(with_section as u16).to_le_bytes());
+        bytes[0x54..0x56].copy_from_slice(&0xF0u16.to_le_bytes()); // size_of_optional_header
+        bytes[0x58..0x5a].copy_from_slice(&0x20bu16.to_le_bytes()); // PE32+ magic
+        bytes[0x58 + 16..0x58 + 20].copy_from_slice(&0x1000u32.to_le_bytes()); // entry RVA
+        bytes[0x58 + 24..0x58 + 32].copy_from_slice(&image_base.to_le_bytes());
+        bytes[0x58 + 32..0x58 + 36].copy_from_slice(&0x1000u32.to_le_bytes()); // section align
+        bytes[0x58 + 36..0x58 + 40].copy_from_slice(&0x200u32.to_le_bytes()); // file align
+        bytes[0x58 + 56..0x58 + 60].copy_from_slice(&0x2000u32.to_le_bytes()); // size_of_image
+        bytes[0x58 + 60..0x58 + 64].copy_from_slice(&0x200u32.to_le_bytes()); // size_of_headers
+        bytes[0x58 + 68..0x58 + 70].copy_from_slice(&3u16.to_le_bytes()); // subsystem
+        if with_section {
+            let sh = 0x58 + 0xF0;
+            bytes[sh..sh + 5].copy_from_slice(b".text");
+            bytes[sh + 8..sh + 12].copy_from_slice(&0x10u32.to_le_bytes()); // virtual_size
+            bytes[sh + 12..sh + 16].copy_from_slice(&0x1000u32.to_le_bytes()); // virtual_address
+            bytes[sh + 36..sh + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes()); // code|exec|read
+        }
+        bytes
+    }
+
+    /// A pathological PE image_base near u64::MAX must not overflow the
+    /// address arithmetic (debug panic / release wrap) — addresses saturate
+    /// or are rejected cleanly.
+    #[test]
+    fn pe_huge_image_base_saturates_addresses() {
+        // No sections: the entry point saturates and the load succeeds.
+        let loaded = load_binary_from_bytes(&minimal_pe64(0xFFFF_FFFF_FFFF_F000, false)).unwrap();
+        assert_eq!(loaded.entry_point, u64::MAX);
+
+        // With a section, its saturated start fails the memory-map bounds
+        // check — a clean error, not a wrap or panic.
+        let err = load_binary_from_bytes(&minimal_pe64(0xFFFF_FFFF_FFFF_F000, true)).unwrap_err();
+        assert!(
+            err.to_string().contains("overflows address space"),
+            "got: {err}"
+        );
     }
 }

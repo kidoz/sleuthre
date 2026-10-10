@@ -3,6 +3,11 @@ use crate::error::Error;
 use std::collections::HashMap;
 use std::io::Read;
 
+/// Hard cap on the decompressed size of a single archive entry — the declared
+/// size is attacker-controlled and must not drive multi-GB allocations
+/// (mirrors the loader's per-segment cap).
+const MAX_DECOMPRESSED_SIZE: usize = 256 * 1024 * 1024;
+
 /// Describes a single entry inside an archive.
 #[derive(Debug, Clone)]
 pub struct ArchiveEntry {
@@ -233,11 +238,23 @@ fn check_lod_compression(data: &[u8]) -> (bool, u64) {
 }
 
 fn decompress_zlib(compressed: &[u8], expected_size: usize) -> Result<Vec<u8>> {
-    let mut decoder = flate2::read::ZlibDecoder::new(compressed);
-    let mut decompressed = Vec::with_capacity(expected_size);
+    decompress_zlib_capped(compressed, expected_size, MAX_DECOMPRESSED_SIZE)
+}
+
+fn decompress_zlib_capped(compressed: &[u8], expected_size: usize, cap: usize) -> Result<Vec<u8>> {
+    // Read at most cap+1 bytes so a zip bomb is caught instead of exhausting
+    // memory; the declared size only bounds the pre-allocation.
+    let mut decoder = flate2::read::ZlibDecoder::new(compressed).take(cap as u64 + 1);
+    let mut decompressed = Vec::with_capacity(expected_size.min(cap));
     decoder
         .read_to_end(&mut decompressed)
         .map_err(|e| Error::Loader(format!("Decompression failed: {}", e)))?;
+    if decompressed.len() > cap {
+        return Err(Error::Loader(format!(
+            "Decompressed data exceeds {} byte limit",
+            cap
+        )));
+    }
     Ok(decompressed)
 }
 
@@ -436,5 +453,26 @@ mod tests {
         assert_eq!(read_cstring(b"hello\0world"), "hello");
         assert_eq!(read_cstring(b"no_null"), "no_null");
         assert_eq!(read_cstring(b"\0empty"), "");
+    }
+
+    /// A stream whose declared decompressed size is astronomical must neither
+    /// pre-allocate it nor emit more than the cap (zip-bomb guard).
+    #[test]
+    fn decompress_zlib_enforces_output_cap() {
+        use flate2::write::ZlibEncoder;
+        use std::io::Write;
+
+        let payload = vec![7u8; 4096];
+        let mut enc = ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(&payload).unwrap();
+        let compressed = enc.finish().unwrap();
+
+        let err = decompress_zlib_capped(&compressed, u32::MAX as usize, 1024).unwrap_err();
+        assert!(err.to_string().contains("limit"), "got: {err}");
+
+        // The same stream with a huge declared size succeeds when the actual
+        // output fits the cap — the declared size only bounds pre-allocation.
+        let out = decompress_zlib_capped(&compressed, u32::MAX as usize, 4096).unwrap();
+        assert_eq!(out, payload);
     }
 }

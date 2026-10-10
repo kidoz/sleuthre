@@ -188,7 +188,7 @@ fn walk_unwind_loop<L, F>(
                 let Some(&base) = state.get(&register.0) else {
                     break;
                 };
-                (base as i64 + offset) as u64
+                (base as i64).wrapping_add(*offset) as u64
             }
             // CfaRule::Expression references bytes via an UnwindExpression
             // handle that needs section-relative resolution; our evaluator
@@ -253,11 +253,11 @@ where
     match rule {
         RegisterRule::Undefined | RegisterRule::SameValue => None,
         RegisterRule::Offset(off) => {
-            let addr = cfa as i64 + off;
+            let addr = (cfa as i64).wrapping_add(*off);
             let bytes = read_memory(addr as u64, ptr_size)?;
             Some(read_le_pointer(&bytes))
         }
-        RegisterRule::ValOffset(off) => Some((cfa as i64 + off) as u64),
+        RegisterRule::ValOffset(off) => Some((cfa as i64).wrapping_add(*off) as u64),
         RegisterRule::Register(other) => state.get(&other.0).copied(),
         // CFI expression rules reference the section via `UnwindExpression`
         // and need section-relative resolution before we can evaluate them.
@@ -508,6 +508,32 @@ mod tests {
     fn read_le_pointer_handles_both_widths() {
         assert_eq!(read_le_pointer(&[0x78, 0x56, 0x34, 0x12]), 0x12345678);
         assert_eq!(read_le_pointer(&[0x01, 0, 0, 0, 0, 0, 0, 0]), 1);
+    }
+
+    /// A hostile CFI offset (i64::MIN) against a near-wrapping CFA/base must
+    /// wrap rather than overflow the i64 addition (debug panic).
+    #[test]
+    fn register_rule_offsets_wrap_instead_of_overflowing() {
+        let state = HashMap::new();
+        let mut read_memory = |_addr: u64, size: usize| Some(vec![0u8; size]);
+
+        let val = resolve_register_rule(
+            &RegisterRule::<usize>::ValOffset(i64::MIN),
+            u64::MAX,
+            &state,
+            8,
+            &mut read_memory,
+        );
+        assert_eq!(val, Some((-1i64).wrapping_add(i64::MIN) as u64));
+
+        let val = resolve_register_rule(
+            &RegisterRule::<usize>::Offset(i64::MIN),
+            u64::MAX,
+            &state,
+            8,
+            &mut read_memory,
+        );
+        assert_eq!(val, Some(0), "zeroed memory at the wrapped address");
     }
 
     #[test]

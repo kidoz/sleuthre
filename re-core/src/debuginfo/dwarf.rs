@@ -1,5 +1,5 @@
 use crate::debuginfo::DebugInfo;
-use crate::debuginfo::source_map::parse_source_lines;
+use crate::debuginfo::source_map::{MAX_DWARF_LINE_ROWS, parse_source_lines};
 use crate::debuginfo::type_mapper::{TypeContext, attr_to_unit_offset, die_name_string};
 use crate::types::{
     FunctionParameter, FunctionSignature, PrimitiveType, TypeRef, VariableInfo, VariableLocation,
@@ -68,6 +68,7 @@ fn parse_dwarf<'a>(
     let mut info = DebugInfo::default();
     let mut type_ctx: TypeContext<SliceReader<'a>> = TypeContext::new(arch);
     let mut prepass_budget = MAX_SCOPE_PREPASS_DIES;
+    let mut line_budget = MAX_DWARF_LINE_ROWS;
 
     let mut units = dwarf.units();
     while let Ok(Some(header)) = units.next() {
@@ -77,7 +78,7 @@ fn parse_dwarf<'a>(
         };
 
         // Parse source lines for this compilation unit
-        let source_lines = parse_source_lines(dwarf, &unit);
+        let source_lines = parse_source_lines(dwarf, &unit, &mut line_budget);
         info.source_lines.extend(source_lines);
 
         // Record namespace/class scopes before any type or subprogram is
@@ -1012,6 +1013,63 @@ mod tests {
         );
         // Unknown conventions keep the raw value visible instead of vanishing
         assert_eq!(map_dwarf_calling_convention(gimli::DwCc(0x99)), "cc_0x99");
+    }
+
+    /// An exhausted line budget stops row collection — a hostile
+    /// `.debug_line` cannot insert unbounded rows into the source map.
+    #[test]
+    fn source_line_budget_caps_rows() {
+        let encoding = gimli::Encoding {
+            format: gimli::Format::Dwarf32,
+            version: 4,
+            address_size: 8,
+        };
+        let mut dw = DwarfUnit::new(encoding);
+        let mut line_program = LineProgram::new(
+            encoding,
+            gimli::LineEncoding::default(),
+            LineString::String(b"/src".to_vec()),
+            None,
+            LineString::String(b"main.cpp".to_vec()),
+            None,
+        );
+        let dir = line_program.default_directory();
+        let file = line_program.add_file(LineString::String(b"main.cpp".to_vec()), dir, None);
+        line_program.begin_sequence(Some(Address::Constant(0x1000)));
+        for i in 0..10u64 {
+            line_program.row().address_offset = i;
+            line_program.row().file = file;
+            line_program.row().line = 10 + i;
+            line_program.generate_row();
+        }
+        line_program.end_sequence(10);
+        dw.unit.line_program = line_program;
+
+        let mut sections = Sections::new(EndianVec::new(gimli::LittleEndian));
+        dw.write(&mut sections).expect("write DWARF sections");
+        let mut blobs: HashMap<gimli::SectionId, Vec<u8>> = HashMap::new();
+        sections
+            .for_each(|id, data| -> gimli::write::Result<()> {
+                blobs.insert(id, data.slice().to_vec());
+                Ok(())
+            })
+            .expect("collect sections");
+
+        let load_section = |id: gimli::SectionId| -> Result<SliceReader<'_>, gimli::Error> {
+            Ok(EndianSlice::new(
+                blobs.get(&id).map(Vec::as_slice).unwrap_or(&[]),
+                RunTimeEndian::Little,
+            ))
+        };
+        let dwarf = Dwarf::load(&load_section).expect("load DWARF");
+        let mut units = dwarf.units();
+        let header = units.next().expect("unit header").expect("unit header");
+        let unit = dwarf.unit(header).expect("unit");
+
+        let mut budget = 4;
+        let lines = parse_source_lines(&dwarf, &unit, &mut budget);
+        assert_eq!(lines.len(), 4, "budget must cap inserted rows");
+        assert_eq!(budget, 0);
     }
 
     #[test]
