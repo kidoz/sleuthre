@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use re_core::analysis::cfg::ControlFlowGraph;
 use re_core::analysis::type_propagation::FunctionTypeInfo;
 use re_core::debuginfo;
@@ -256,7 +256,7 @@ impl McpServer {
                     "tools": [
                         {
                             "name": "open_binary",
-                            "description": "Load a binary file (ELF/PE) for analysis",
+                            "description": "Load a binary file (ELF/PE/Mach-O/raw) for analysis",
                             "inputSchema": {
                                 "type": "object",
                                 "properties": { "path": { "type": "string" } },
@@ -1440,12 +1440,14 @@ fn main() -> Result<()> {
     let mut server = McpServer::new();
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
-        let line = line?;
+        let line = line.context("failed to read request line from stdin")?;
         match serde_json::from_str::<Value>(&line) {
             Ok(request) => {
                 let response = server.handle_request(request);
                 if response != Value::Null {
-                    println!("{}", serde_json::to_string(&response)?);
+                    let text =
+                        serde_json::to_string(&response).context("failed to serialize response")?;
+                    println!("{}", text);
                 }
             }
             Err(e) => {
@@ -1454,7 +1456,9 @@ fn main() -> Result<()> {
                     "id": Value::Null,
                     "error": { "code": -32700, "message": format!("Parse error: {}", e) }
                 });
-                println!("{}", serde_json::to_string(&error_response)?);
+                let text = serde_json::to_string(&error_response)
+                    .context("failed to serialize error response")?;
+                println!("{}", text);
             }
         }
     }
