@@ -41,7 +41,12 @@ impl SleuthreApp {
         let mut navigate_to = None;
 
         egui::ScrollArea::vertical().show(ui, |ui| {
-            let overlays = self.project.as_ref().unwrap().struct_overlays.to_vec();
+            let overlays = self
+                .project
+                .as_ref()
+                .expect("project presence checked at the top of show_data_inspector")
+                .struct_overlays
+                .to_vec();
 
             for (idx, overlay) in overlays.iter().enumerate() {
                 let header = format!(
@@ -63,7 +68,10 @@ impl SleuthreApp {
                         }
                         ui.separator();
 
-                        let project = self.project.as_ref().unwrap();
+                        let project = self
+                            .project
+                            .as_ref()
+                            .expect("project presence checked at the top of show_data_inspector");
 
                         // Resolve the type
                         let compound = project.types.types.get(&overlay.type_name);

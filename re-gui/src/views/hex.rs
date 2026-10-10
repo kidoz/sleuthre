@@ -74,7 +74,10 @@ impl SleuthreApp {
 
         let bytes_per_row = 16usize;
         let (total_rows, start_addr) = {
-            let project = self.project.as_ref().unwrap();
+            let project = self
+                .project
+                .as_ref()
+                .expect("project presence checked at the top of show_hex_view");
             let segment = project
                 .memory_map
                 .segments

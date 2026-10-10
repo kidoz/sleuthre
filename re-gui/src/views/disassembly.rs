@@ -39,7 +39,10 @@ impl SleuthreApp {
             return;
         }
 
-        let project = self.project.as_ref().unwrap();
+        let project = self
+            .project
+            .as_ref()
+            .expect("project presence checked at the top of show_disassembly");
 
         egui::ScrollArea::vertical().show_rows(ui, 18.0, total_rows, |ui, range| {
             for i in range {
