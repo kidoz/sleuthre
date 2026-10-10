@@ -108,7 +108,7 @@ The MCP server exposes tools for AI agents to interact with a loaded binary:
 
 | Tool | Description |
 |------|-------------|
-| `open_binary` | Load an ELF/PE binary for analysis |
+| `open_binary` | Load a binary file (ELF/PE/Mach-O/raw) for analysis |
 | `get_disasm` | Get disassembly listing at an address |
 | `get_xrefs` | Get cross-references (to/from/both) |
 | `get_cfg` | Get control flow graph for a function |
@@ -117,7 +117,7 @@ The MCP server exposes tools for AI agents to interact with a loaded binary:
 | `add_comment` | Add or remove a comment at an address |
 | `save_project` | Save the current project to a file |
 
-Resources are available at `sleuthre://project/{functions,strings,xrefs,comments}`.
+Resources are available at `sleuthre://project/{functions,strings,xrefs,comments,imports,exports,bookmarks}`.
 
 ## License
 
