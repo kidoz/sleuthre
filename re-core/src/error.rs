@@ -20,6 +20,9 @@ pub enum Error {
     #[error("Debugger error: {0}")]
     Debugger(String),
 
+    #[error("Internal error: {0}")]
+    Internal(String),
+
     #[error("Unknown error")]
     Unknown,
 }

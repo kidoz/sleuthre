@@ -8,7 +8,6 @@ license.workspace = true
 re-core = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
-anyhow = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
 serde = { workspace = true }

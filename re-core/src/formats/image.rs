@@ -1,3 +1,5 @@
+use crate::Result;
+use crate::error::Error;
 use std::collections::HashMap;
 
 /// Upper bound on a single decoded-image buffer, so a malformed header cannot
@@ -5,10 +7,12 @@ use std::collections::HashMap;
 const MAX_IMAGE_BYTES: u64 = 128 * 1024 * 1024;
 
 /// RGBA byte length for `width`×`height`, rejecting empty or oversized images.
-fn rgba_len(width: u32, height: u32) -> Result<usize, String> {
+fn rgba_len(width: u32, height: u32) -> Result<usize> {
     let bytes = (width as u64) * (height as u64) * 4;
     if bytes == 0 || bytes > MAX_IMAGE_BYTES {
-        return Err(format!("image dimensions too large: {width}x{height}"));
+        return Err(Error::Loader(format!(
+            "image dimensions too large: {width}x{height}"
+        )));
     }
     Ok(bytes as usize)
 }
@@ -34,7 +38,7 @@ pub trait ImageDecoder: Send + Sync {
     /// `context` may be a filename or parent archive format hint.
     fn matches(&self, header: &[u8], context: &str) -> bool;
     /// Decode the image data into RGBA pixels.
-    fn decode(&self, data: &[u8]) -> Result<DecodedImage, String>;
+    fn decode(&self, data: &[u8]) -> Result<DecodedImage>;
 }
 
 /// Registry of image format decoders.
@@ -93,9 +97,9 @@ impl ImageDecoder for BmpDecoder {
         header.len() >= 2 && &header[0..2] == b"BM"
     }
 
-    fn decode(&self, data: &[u8]) -> Result<DecodedImage, String> {
+    fn decode(&self, data: &[u8]) -> Result<DecodedImage> {
         if data.len() < 54 {
-            return Err("BMP too small".to_string());
+            return Err(Error::Loader("BMP too small".to_string()));
         }
 
         let pixel_offset = u32::from_le_bytes(data[10..14].try_into().unwrap()) as usize;
@@ -104,7 +108,7 @@ impl ImageDecoder for BmpDecoder {
         let bits_per_pixel = u16::from_le_bytes(data[28..30].try_into().unwrap());
 
         if width <= 0 || width > 16384 {
-            return Err(format!("Invalid BMP width: {}", width));
+            return Err(Error::Loader(format!("Invalid BMP width: {}", width)));
         }
         let width = width as u32;
         let (height, bottom_up) = if height < 0 {
@@ -113,7 +117,7 @@ impl ImageDecoder for BmpDecoder {
             (height as u32, true)
         };
         if height > 16384 {
-            return Err(format!("Invalid BMP height: {}", height));
+            return Err(Error::Loader(format!("Invalid BMP height: {}", height)));
         }
 
         let mut pixels = vec![0u8; rgba_len(width, height)?];
@@ -166,7 +170,12 @@ impl ImageDecoder for BmpDecoder {
                     }
                 }
             }
-            _ => return Err(format!("Unsupported BMP bit depth: {}", bits_per_pixel)),
+            _ => {
+                return Err(Error::Loader(format!(
+                    "Unsupported BMP bit depth: {}",
+                    bits_per_pixel
+                )));
+            }
         }
 
         Ok(DecodedImage {
@@ -202,9 +211,9 @@ impl ImageDecoder for TgaDecoder {
         matches!(image_type, 2 | 10) && (header[16] == 24 || header[16] == 32)
     }
 
-    fn decode(&self, data: &[u8]) -> Result<DecodedImage, String> {
+    fn decode(&self, data: &[u8]) -> Result<DecodedImage> {
         if data.len() < 18 {
-            return Err("TGA too small".to_string());
+            return Err(Error::Loader("TGA too small".to_string()));
         }
         let id_len = data[0] as usize;
         let image_type = data[2];
@@ -214,32 +223,37 @@ impl ImageDecoder for TgaDecoder {
         let descriptor = data[17];
 
         if width == 0 || width > 16384 || height == 0 || height > 16384 {
-            return Err("Invalid TGA dimensions".to_string());
+            return Err(Error::Loader("Invalid TGA dimensions".to_string()));
         }
         if image_type != 2 {
-            return Err(format!("Unsupported TGA type: {}", image_type));
+            return Err(Error::Loader(format!(
+                "Unsupported TGA type: {}",
+                image_type
+            )));
         }
 
         let bytes_pp = match bpp {
             24 => 3usize,
             32 => 4usize,
-            _ => return Err(format!("Unsupported TGA bpp: {}", bpp)),
+            _ => return Err(Error::Loader(format!("Unsupported TGA bpp: {}", bpp))),
         };
         let pixel_start = 18usize
             .checked_add(id_len)
-            .ok_or_else(|| "TGA ID field offset overflow".to_string())?;
+            .ok_or_else(|| Error::Loader("TGA ID field offset overflow".to_string()))?;
         if pixel_start > data.len() {
-            return Err("TGA pixel data starts beyond file".to_string());
+            return Err(Error::Loader(
+                "TGA pixel data starts beyond file".to_string(),
+            ));
         }
         let pixel_bytes = (width as usize)
             .checked_mul(height as usize)
             .and_then(|n| n.checked_mul(bytes_pp))
-            .ok_or_else(|| "TGA pixel data size overflow".to_string())?;
+            .ok_or_else(|| Error::Loader("TGA pixel data size overflow".to_string()))?;
         let pixel_end = pixel_start
             .checked_add(pixel_bytes)
-            .ok_or_else(|| "TGA pixel data offset overflow".to_string())?;
+            .ok_or_else(|| Error::Loader("TGA pixel data offset overflow".to_string()))?;
         if pixel_end > data.len() {
-            return Err("TGA pixel data truncated".to_string());
+            return Err(Error::Loader("TGA pixel data truncated".to_string()));
         }
         let top_to_bottom = (descriptor & 0x20) != 0;
 
@@ -283,12 +297,12 @@ impl ImageDecoder for PcxDecoder {
         context.ends_with(".pcx") || (header.len() >= 4 && header[0] == 0x0A && header[3] == 8)
     }
 
-    fn decode(&self, data: &[u8]) -> Result<DecodedImage, String> {
+    fn decode(&self, data: &[u8]) -> Result<DecodedImage> {
         if data.len() < 128 {
-            return Err("PCX too small".to_string());
+            return Err(Error::Loader("PCX too small".to_string()));
         }
         if data[0] != 0x0A {
-            return Err("Invalid PCX signature".to_string());
+            return Err(Error::Loader("Invalid PCX signature".to_string()));
         }
 
         let _version = data[1];
@@ -303,24 +317,24 @@ impl ImageDecoder for PcxDecoder {
         // Guard the subtraction: a malformed header with xmax<xmin would
         // underflow (panic in debug, wrap in release).
         if xmax < xmin || ymax < ymin {
-            return Err("Invalid PCX dimensions".to_string());
+            return Err(Error::Loader("Invalid PCX dimensions".to_string()));
         }
         let width = xmax - xmin + 1;
         let height = ymax - ymin + 1;
 
         if width == 0 || width > 16384 || height == 0 || height > 16384 {
-            return Err("Invalid PCX dimensions".to_string());
+            return Err(Error::Loader("Invalid PCX dimensions".to_string()));
         }
 
         if bpp != 8 {
-            return Err(format!("Unsupported PCX bpp: {}", bpp));
+            return Err(Error::Loader(format!("Unsupported PCX bpp: {}", bpp)));
         }
 
         // Decode RLE pixel data. Cap the scanline buffer (height × bytes_per_line)
         // so a malformed bytes_per_line can't drive a huge allocation.
         let index_len = (height as u64) * (bytes_per_line as u64);
         if index_len > MAX_IMAGE_BYTES {
-            return Err("PCX scanline buffer too large".to_string());
+            return Err(Error::Loader("PCX scanline buffer too large".to_string()));
         }
         let mut indices = vec![0u8; index_len as usize];
         let mut src = 128usize;
@@ -448,7 +462,7 @@ mod tests {
         data[22..26].copy_from_slice(&16384i32.to_le_bytes());
         data[28..30].copy_from_slice(&24u16.to_le_bytes());
         let err = d.decode(&data).unwrap_err();
-        assert!(err.contains("too large"), "got: {err}");
+        assert!(err.to_string().contains("too large"), "got: {err}");
     }
 
     #[test]
@@ -473,7 +487,7 @@ mod tests {
         data[16] = 8; // unsupported for this decoder
 
         let err = d.decode(&data).unwrap_err();
-        assert!(err.contains("Unsupported TGA bpp"));
+        assert!(err.to_string().contains("Unsupported TGA bpp"));
     }
 
     #[test]
@@ -486,7 +500,7 @@ mod tests {
         data[16] = 24;
 
         let err = d.decode(&data).unwrap_err();
-        assert!(err.contains("truncated"));
+        assert!(err.to_string().contains("truncated"));
     }
 
     #[test]

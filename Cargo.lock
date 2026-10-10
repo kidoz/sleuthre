@@ -3094,7 +3094,6 @@ dependencies = [
 name = "re-core"
 version = "0.7.1"
 dependencies = [
- "anyhow",
  "bitflags 2.13.2",
  "capstone",
  "criterion",
@@ -3118,7 +3117,6 @@ dependencies = [
 name = "re-gui"
 version = "0.7.1"
 dependencies = [
- "anyhow",
  "eframe",
  "egui",
  "egui_dock",

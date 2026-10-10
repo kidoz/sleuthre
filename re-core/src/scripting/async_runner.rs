@@ -73,7 +73,7 @@ impl AsyncPluginRunner {
 
     /// Submit a script for background execution. Returns the job id so the
     /// caller can correlate the eventual result.
-    pub fn submit(&self, source: String, snapshot: ProjectSnapshot) -> Result<u64, String> {
+    pub fn submit(&self, source: String, snapshot: ProjectSnapshot) -> crate::Result<u64> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let job = ScriptJob {
             id,
@@ -82,9 +82,11 @@ impl AsyncPluginRunner {
         };
         self.job_tx
             .lock()
-            .map_err(|_| "plugin runner mutex poisoned".to_string())?
+            .map_err(|_| crate::error::Error::Internal("plugin runner mutex poisoned".to_string()))?
             .send(Some(job))
-            .map_err(|e| e.to_string())?;
+            .map_err(|_| {
+                crate::error::Error::Internal("plugin runner worker exited".to_string())
+            })?;
         Ok(id)
     }
 

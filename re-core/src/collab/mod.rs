@@ -82,8 +82,10 @@ impl CollabBroadcaster {
     }
 
     /// Publish an event. Returns `Err` only if the worker has already exited.
-    pub fn publish(&self, event: CollabEvent) -> Result<(), String> {
-        self.tx.send(event).map_err(|e| e.to_string())
+    pub fn publish(&self, event: CollabEvent) -> crate::Result<()> {
+        self.tx.send(event).map_err(|_| {
+            crate::error::Error::Internal("collab broadcast worker exited".to_string())
+        })
     }
 
     /// Drain any events sent *back* by viewers (bidirectional collab). Each

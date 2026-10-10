@@ -128,7 +128,7 @@ impl ScriptEngine {
                 let registry = default_archive_registry();
                 let (dir, format) = registry
                     .open(&data, &ext)
-                    .map_err(|e| Box::new(EvalAltResult::from(e)))?;
+                    .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?;
                 let mut out = rhai::Map::new();
                 out.insert("path".into(), Dynamic::from(path.to_string()));
                 out.insert("format".into(), Dynamic::from(format.name().to_string()));
@@ -149,7 +149,7 @@ impl ScriptEngine {
                 let registry = default_archive_registry();
                 let (dir, _fmt) = registry
                     .open(&data, &ext)
-                    .map_err(|e| Box::new(EvalAltResult::from(e)))?;
+                    .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?;
                 let arr: rhai::Array = dir
                     .entries
                     .iter()
@@ -184,7 +184,7 @@ impl ScriptEngine {
                 let registry = default_archive_registry();
                 let (dir, format) = registry
                     .open(&data, &ext)
-                    .map_err(|e| Box::new(EvalAltResult::from(e)))?;
+                    .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?;
                 let entry = dir
                     .entries
                     .iter()
@@ -197,7 +197,7 @@ impl ScriptEngine {
                     })?;
                 let bytes = format
                     .extract(&data, entry)
-                    .map_err(|e| Box::new(EvalAltResult::from(e)))?;
+                    .map_err(|e| Box::new(EvalAltResult::from(e.to_string())))?;
                 Ok(bytes)
             },
         );

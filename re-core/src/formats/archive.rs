@@ -1,3 +1,5 @@
+use crate::Result;
+use crate::error::Error;
 use std::collections::HashMap;
 use std::io::Read;
 
@@ -50,10 +52,10 @@ pub trait ArchiveFormat: Send + Sync {
     fn matches(&self, header: &[u8], extension: &str) -> bool;
 
     /// Parse the archive data and return a directory of entries.
-    fn parse(&self, data: &[u8]) -> Result<ArchiveDirectory, String>;
+    fn parse(&self, data: &[u8]) -> Result<ArchiveDirectory>;
 
     /// Extract raw (decompressed) bytes for a single entry.
-    fn extract(&self, data: &[u8], entry: &ArchiveEntry) -> Result<Vec<u8>, String>;
+    fn extract(&self, data: &[u8], entry: &ArchiveEntry) -> Result<Vec<u8>>;
 }
 
 /// Registry of known archive formats.
@@ -85,10 +87,10 @@ impl FormatRegistry {
         &self,
         data: &[u8],
         extension: &str,
-    ) -> Result<(ArchiveDirectory, &dyn ArchiveFormat), String> {
+    ) -> Result<(ArchiveDirectory, &dyn ArchiveFormat)> {
         let format = self
             .detect(data, extension)
-            .ok_or_else(|| "Unknown archive format".to_string())?;
+            .ok_or_else(|| Error::Loader("Unknown archive format".to_string()))?;
         let dir = format.parse(data)?;
         Ok((dir, format))
     }
@@ -123,12 +125,12 @@ impl ArchiveFormat for LodArchiveFormat {
         extension == "lod" || (header.len() >= 4 && &header[0..4] == b"LOD\0")
     }
 
-    fn parse(&self, data: &[u8]) -> Result<ArchiveDirectory, String> {
+    fn parse(&self, data: &[u8]) -> Result<ArchiveDirectory> {
         if data.len() < 0x104 + 32 {
-            return Err("File too small for LOD header".to_string());
+            return Err(Error::Loader("File too small for LOD header".to_string()));
         }
         if &data[0..4] != b"LOD\0" {
-            return Err("Invalid LOD signature".to_string());
+            return Err(Error::Loader("Invalid LOD signature".to_string()));
         }
 
         let version = read_cstring(&data[4..84]);
@@ -139,7 +141,7 @@ impl ArchiveFormat for LodArchiveFormat {
         let num_items = u16::from_le_bytes(data[0x120..0x122].try_into().unwrap()) as usize;
 
         if dir_offset as usize + num_items * 32 > data.len() {
-            return Err("Directory extends beyond file".to_string());
+            return Err(Error::Loader("Directory extends beyond file".to_string()));
         }
 
         let mut entries = Vec::with_capacity(num_items);
@@ -190,10 +192,10 @@ impl ArchiveFormat for LodArchiveFormat {
         })
     }
 
-    fn extract(&self, data: &[u8], entry: &ArchiveEntry) -> Result<Vec<u8>, String> {
+    fn extract(&self, data: &[u8], entry: &ArchiveEntry) -> Result<Vec<u8>> {
         let start = entry.offset as usize;
         if start >= data.len() {
-            return Err("Entry offset beyond file".to_string());
+            return Err(Error::Loader("Entry offset beyond file".to_string()));
         }
 
         if entry.is_compressed {
@@ -230,12 +232,12 @@ fn check_lod_compression(data: &[u8]) -> (bool, u64) {
     }
 }
 
-fn decompress_zlib(compressed: &[u8], expected_size: usize) -> Result<Vec<u8>, String> {
+fn decompress_zlib(compressed: &[u8], expected_size: usize) -> Result<Vec<u8>> {
     let mut decoder = flate2::read::ZlibDecoder::new(compressed);
     let mut decompressed = Vec::with_capacity(expected_size);
     decoder
         .read_to_end(&mut decompressed)
-        .map_err(|e| format!("Decompression failed: {}", e))?;
+        .map_err(|e| Error::Loader(format!("Decompression failed: {}", e)))?;
     Ok(decompressed)
 }
 
@@ -266,13 +268,13 @@ impl ArchiveFormat for VidArchiveFormat {
                 .all(|&b| b == 0 || (0x20..=0x7E).contains(&b))
     }
 
-    fn parse(&self, data: &[u8]) -> Result<ArchiveDirectory, String> {
+    fn parse(&self, data: &[u8]) -> Result<ArchiveDirectory> {
         if data.len() < 4 {
-            return Err("File too small".to_string());
+            return Err(Error::Loader("File too small".to_string()));
         }
         let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
         if 4 + count * 44 > data.len() {
-            return Err("Directory extends beyond file".to_string());
+            return Err(Error::Loader("Directory extends beyond file".to_string()));
         }
 
         let mut entries = Vec::with_capacity(count);
@@ -311,11 +313,11 @@ impl ArchiveFormat for VidArchiveFormat {
         })
     }
 
-    fn extract(&self, data: &[u8], entry: &ArchiveEntry) -> Result<Vec<u8>, String> {
+    fn extract(&self, data: &[u8], entry: &ArchiveEntry) -> Result<Vec<u8>> {
         let start = entry.offset as usize;
         let end = std::cmp::min(start + entry.compressed_size as usize, data.len());
         if start >= data.len() {
-            return Err("Entry offset beyond file".to_string());
+            return Err(Error::Loader("Entry offset beyond file".to_string()));
         }
         Ok(data[start..end].to_vec())
     }
@@ -347,13 +349,13 @@ impl ArchiveFormat for SndArchiveFormat {
                 .all(|&b| b == 0 || (0x20..=0x7E).contains(&b))
     }
 
-    fn parse(&self, data: &[u8]) -> Result<ArchiveDirectory, String> {
+    fn parse(&self, data: &[u8]) -> Result<ArchiveDirectory> {
         if data.len() < 4 {
-            return Err("File too small".to_string());
+            return Err(Error::Loader("File too small".to_string()));
         }
         let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
         if 4 + count * 52 > data.len() {
-            return Err("Directory extends beyond file".to_string());
+            return Err(Error::Loader("Directory extends beyond file".to_string()));
         }
 
         let mut entries = Vec::with_capacity(count);
@@ -385,11 +387,11 @@ impl ArchiveFormat for SndArchiveFormat {
         })
     }
 
-    fn extract(&self, data: &[u8], entry: &ArchiveEntry) -> Result<Vec<u8>, String> {
+    fn extract(&self, data: &[u8], entry: &ArchiveEntry) -> Result<Vec<u8>> {
         let start = entry.offset as usize;
         let end = std::cmp::min(start + entry.compressed_size as usize, data.len());
         if start >= data.len() {
-            return Err("Entry offset beyond file".to_string());
+            return Err(Error::Loader("Entry offset beyond file".to_string()));
         }
         let raw = &data[start..end];
 

@@ -12,7 +12,6 @@ log = { workspace = true }
 tracing = { workspace = true }
 goblin = { workspace = true }
 bitflags = { workspace = true }
-anyhow = { workspace = true }
 capstone = { workspace = true }
 rusqlite = { workspace = true }
 petgraph = { workspace = true }

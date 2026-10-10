@@ -113,15 +113,18 @@ impl SignatureDatabase {
     }
 
     /// Load signatures from a JSON file on disk.
-    pub fn load_from_file(path: &std::path::Path) -> Result<Self, String> {
-        let data = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-        serde_json::from_str(&data).map_err(|e| e.to_string())
+    pub fn load_from_file(path: &std::path::Path) -> crate::Result<Self> {
+        let data = std::fs::read_to_string(path)?;
+        serde_json::from_str(&data)
+            .map_err(|e| crate::error::Error::Analysis(format!("invalid signature JSON: {}", e)))
     }
 
     /// Save signatures to a JSON file on disk.
-    pub fn save_to_file(&self, path: &std::path::Path) -> Result<(), String> {
-        let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(path, json).map_err(|e| e.to_string())
+    pub fn save_to_file(&self, path: &std::path::Path) -> crate::Result<()> {
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| crate::error::Error::Analysis(e.to_string()))?;
+        std::fs::write(path, json)?;
+        Ok(())
     }
 
     /// Load signatures from a Hex-Rays FLIRT PAT file.
@@ -136,21 +139,26 @@ impl SignatureDatabase {
     /// Only the leading pattern and the trailing name are used here; CRC and
     /// length fields are accepted but ignored. Lines starting with `---` mark
     /// the end of the module and are skipped.
-    pub fn load_from_pat_file(path: &std::path::Path, library: &str) -> Result<Self, String> {
-        let data = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    pub fn load_from_pat_file(path: &std::path::Path, library: &str) -> crate::Result<Self> {
+        let data = std::fs::read_to_string(path)?;
         Self::load_from_pat_str(&data, library)
     }
 
     /// Parse PAT text content into a SignatureDatabase.
-    pub fn load_from_pat_str(content: &str, library: &str) -> Result<Self, String> {
+    pub fn load_from_pat_str(content: &str, library: &str) -> crate::Result<Self> {
         let mut db = SignatureDatabase::default();
         for (line_no, raw) in content.lines().enumerate() {
             let line = raw.trim();
             if line.is_empty() || line.starts_with("---") || line.starts_with(';') {
                 continue;
             }
-            let sig = parse_pat_line(line)
-                .ok_or_else(|| format!("line {}: malformed PAT entry: {}", line_no + 1, raw))?;
+            let sig = parse_pat_line(line).ok_or_else(|| {
+                crate::error::Error::Analysis(format!(
+                    "line {}: malformed PAT entry: {}",
+                    line_no + 1,
+                    raw
+                ))
+            })?;
             db.signatures.push(Signature {
                 name: sig.name,
                 pattern: sig.pattern,
