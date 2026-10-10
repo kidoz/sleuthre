@@ -26,9 +26,17 @@ script returns:
 - `rename(address, new_name)`
 - `set_comment(address, text)`
 - `println(message)` — streamed to the output panel
-- `import_symbols(path)` — auto-detects IDA MAP / IDC / CSV / text formats
-- `open_archive(path)`, `archive_entries(path)`, `archive_extract(path, name)`
-- `disassemble_bytecode(blob, opcode_table)`
+
+`hex(n)` is also registered as a pure helper that formats an integer as
+`0x…`; it performs no action.
+
+The interactive console (the **Console** panel) registers a larger API —
+`import_symbols(path)`, `open_archive(path)` / `archive_entries(path)` /
+`archive_extract(path, name)`, `disassemble_bytecode(blob, opcode_table)`,
+`parse_symbol_file(path)`, and the `BinaryFile` reader (`open_binary`,
+`read_u32_le`, `read_u16_le`, `read_string`, `len`). These are
+console-only: the plugin runner does not register them, so a plugin
+script calling them fails with an unknown-function error.
 
 Scripts run on a background thread; the UI never freezes regardless of how
 long your logic takes.
