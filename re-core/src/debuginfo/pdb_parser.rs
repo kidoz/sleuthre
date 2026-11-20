@@ -43,7 +43,7 @@ pub fn extract_pdb_from_bytes(
 }
 
 pub(crate) fn extract_pdb<'s>(
-    source: impl pdb::Source<'s> + 's,
+    source: impl pdb::Source<'s> + Send + 's,
     arch: crate::arch::Architecture,
     image_base: u64,
 ) -> crate::Result<DebugInfo> {
