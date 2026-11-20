@@ -1,14 +1,5 @@
-//! Verify decompiler semantics by recompiling the emitted C and comparing the
-//! resulting instruction categories against the original function.
-//!
-//! This is a capability no commercial RE tool ships: it answers "does the
-//! decompilation actually mean what the original bytes mean?" with a
-//! reproducible yes/no per basic block.
-//!
-//! The comparison is **category-level**, not byte-level — compilers differ in
-//! register allocation, scheduling, and address layout, so exact bytes rarely
-//! match. Instead we bucket each instruction into a coarse class (call, branch,
-//! arithmetic, memory) and report divergence at the bucket level.
+//! Compare instruction-category counts in the original function and compiled
+//! pseudocode. The result measures instruction mix, not semantic equivalence.
 
 use crate::Result;
 use crate::disasm::{Disassembler, Instruction};
@@ -170,9 +161,7 @@ pub struct RecompileDiffResult {
     pub recompiled_histogram: CategoryHistogram,
     pub diff: CategoryDiff,
     pub l1_norm: u64,
-    /// Ratio of L1 divergence to original function size. Values near zero mean
-    /// the decompilation preserved semantics; values approaching 1.0 mean the
-    /// recompiled code looks nothing like the original.
+    /// Ratio of L1 divergence to original function size. Zero indicates identical category counts.
     pub divergence_ratio: f64,
     /// Path to the compiled object file, kept for manual inspection.
     pub artifact_path: Option<PathBuf>,
@@ -216,22 +205,14 @@ pub fn recompile_and_diff(
 
     if !output.status.success() {
         let _ = std::fs::remove_file(&obj_path);
-        let empty = CategoryHistogram::default();
-        let diff_to_empty = original_histogram.diff(&empty);
-        let total = original_histogram.total as u64;
-        return Ok(RecompileDiffResult {
-            function_name: function_name.to_string(),
-            original_histogram,
-            recompiled_histogram: empty,
-            diff: diff_to_empty,
-            l1_norm: total,
-            divergence_ratio: 1.0,
-            artifact_path: None,
-            compiler_stderr,
-        });
+        return Err(Error::Analysis(format!(
+            "Compiler failed: {compiler_stderr}"
+        )));
     }
 
-    let recompiled_insns = disassemble_object(&obj_path, function_name, arch)?;
+    let recompiled_insns = disassemble_object(&obj_path, arch).inspect_err(|_| {
+        let _ = std::fs::remove_file(&obj_path);
+    })?;
     let recompiled_histogram = CategoryHistogram::from_instructions(&recompiled_insns);
     let diff = original_histogram.diff(&recompiled_histogram);
     let l1 = diff.l1_norm();
@@ -253,53 +234,49 @@ pub fn recompile_and_diff(
     })
 }
 
-/// Disassemble an ELF/Mach-O object file and return instructions belonging to
-/// the named function. We walk all sections whose names start with `__text`
-/// (Mach-O) or contain `text` (ELF) and disassemble each; this avoids a hard
-/// dependency on a symbol table (useful when `cc` strips or renames symbols).
-fn disassemble_object(
-    path: &Path,
-    _function_name: &str,
-    arch: crate::arch::Architecture,
-) -> Result<Vec<Instruction>> {
-    let data = std::fs::read(path)
-        .map_err(|e| Error::Analysis(format!("read object {}: {}", path.display(), e)))?;
-
-    let mut insns = Vec::new();
-    let disasm = Disassembler::new(arch)?;
-
-    if let Ok(obj) = goblin::Object::parse(&data) {
-        match obj {
-            goblin::Object::Elf(elf) => {
-                for section in &elf.section_headers {
-                    let name = elf.shdr_strtab.get_at(section.sh_name).unwrap_or("");
-                    if !name.contains("text") {
-                        continue;
-                    }
-                    let start = section.sh_offset as usize;
-                    let end = start + section.sh_size as usize;
-                    if end <= data.len() {
-                        let chunk = &data[start..end];
-                        insns.extend(disasm.disassemble_bytes(chunk, section.sh_addr)?);
-                    }
-                }
-            }
-            goblin::Object::Mach(goblin::mach::Mach::Binary(macho)) => {
-                for seg in &macho.segments {
-                    for (sec, section_data) in seg.into_iter().flatten() {
-                        let name = sec.name().unwrap_or("");
-                        if !name.contains("text") {
-                            continue;
-                        }
-                        insns.extend(disasm.disassemble_bytes(section_data, sec.addr)?);
-                    }
-                }
-            }
-            _ => {}
-        }
+/// The compiler emits its configured target. Verify its object header before
+/// interpreting any instructions or reporting a comparison.
+fn disassemble_object(path: &Path, arch: crate::arch::Architecture) -> Result<Vec<Instruction>> {
+    use crate::arch::{Architecture, Endianness};
+    use object::{Object, ObjectSection};
+    let data = std::fs::read(path)?;
+    let file = object::File::parse(data.as_slice())
+        .map_err(|e| Error::Analysis(format!("Invalid compiler output: {e}")))?;
+    let expected = match arch {
+        Architecture::X86 => object::Architecture::I386,
+        Architecture::X86_64 => object::Architecture::X86_64,
+        Architecture::Arm => object::Architecture::Arm,
+        Architecture::Arm64 => object::Architecture::Aarch64,
+        Architecture::Mips => object::Architecture::Mips,
+        Architecture::Mips64 => object::Architecture::Mips64,
+        Architecture::RiscV32 => object::Architecture::Riscv32,
+        Architecture::RiscV64 => object::Architecture::Riscv64,
+    };
+    if file.architecture() != expected
+        || file.is_little_endian() != (arch.default_endianness() == Endianness::Little)
+    {
+        return Err(Error::Analysis(format!(
+            "Unsupported comparison: compiler produced {:?} ({:?}), target is {arch} ({:?})",
+            file.architecture(),
+            file.endianness(),
+            arch.default_endianness()
+        )));
     }
-
-    Ok(insns)
+    let disasm = Disassembler::new(arch)?;
+    let mut instructions = Vec::new();
+    for section in file
+        .sections()
+        .filter(|s| s.kind() == object::SectionKind::Text)
+    {
+        let bytes = section.data().map_err(|e| Error::Analysis(e.to_string()))?;
+        instructions.extend(disasm.disassemble_bytes(bytes, section.address())?);
+    }
+    if instructions.is_empty() {
+        return Err(Error::Analysis(
+            "Compiler output contains no decodable instructions".into(),
+        ));
+    }
+    Ok(instructions)
 }
 
 fn find_c_compiler() -> Option<PathBuf> {
@@ -428,6 +405,17 @@ mod tests {
             result.compiler_stderr
         );
         if let Some(p) = result.artifact_path {
+            let other_arch = if arch == crate::arch::Architecture::Arm64 {
+                crate::arch::Architecture::X86_64
+            } else {
+                crate::arch::Architecture::Arm64
+            };
+            assert!(
+                disassemble_object(&p, other_arch)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Unsupported comparison")
+            );
             let _ = std::fs::remove_file(p);
         }
     }
