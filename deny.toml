@@ -22,6 +22,11 @@ ignore = [
     { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained; transitive dependency with no safe upgrade path" },
     { id = "RUSTSEC-2026-0249", reason = "smartstring is unmaintained; pulled in via rhai, no safe upgrade path" },
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser 0.25.1 is unmaintained; via ab_glyph -> winit -> eframe, no safe upgrade path" },
+    # Linux screen reader support uses AccessKit/AT-SPI. Remove these three
+    # exceptions when that stack migrates to zbus 6 and its integrated modules.
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names is required by zbus 5 and atspi-common for Linux accessibility" },
+    { id = "RUSTSEC-2026-0370", reason = "zvariant is required by the zbus 5 AT-SPI stack for D-Bus serialization" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant 5 requires zvariant_derive 5 for the Linux accessibility stack" },
 ]
 
 [bans]
