@@ -1958,7 +1958,7 @@ fn structure_range(
             && back_addr == insts[i].address
         {
             // While loop: condition at top, body in middle, jump back at end
-            let cond = hlil::mlil_to_hlil_expr(&branch_stmt.0);
+            let cond = negate_branch_condition(hlil::mlil_to_hlil_expr(&branch_stmt.0));
 
             let loop_ctx = ControlFlowContext {
                 loop_head: Some(insts[i].address),
@@ -1974,22 +1974,41 @@ fn structure_range(
 
         // Check for if-pattern: BranchIf followed by linear blocks
         if let Some(branch_stmt) = find_branch_if(&inst.stmts)
-            && let Some((then_end, else_end)) = find_if_else_bounds(insts, i, &branch_stmt)
+            && let MlilExpr::Const(target) = branch_stmt.1
+            && let Some(taken_idx) = insts.iter().position(|inst| inst.address == target)
+            && taken_idx > i + 1
         {
             let cond = hlil::mlil_to_hlil_expr(&branch_stmt.0);
-            let then_body = structure_range(&insts[i + 1..then_end], ctx, jump_targets, dispatches);
-            let else_body = if else_end > then_end {
-                structure_range(&insts[then_end..else_end], ctx, jump_targets, dispatches)
+            let fallthrough_last = &insts[taken_idx - 1];
+            if let [
+                MlilStmt::Jump {
+                    target: MlilExpr::Const(join),
+                },
+            ] = fallthrough_last.stmts.as_slice()
+                && !jump_targets.contains(&fallthrough_last.address)
+                && let Some(join_idx) = insts.iter().position(|inst| inst.address == *join)
+                && join_idx > taken_idx
+            {
+                let then_body =
+                    structure_range(&insts[taken_idx..join_idx], ctx, jump_targets, dispatches);
+                let else_body =
+                    structure_range(&insts[i + 1..taken_idx - 1], ctx, jump_targets, dispatches);
+                stmts.push(HlilStmt::If {
+                    cond,
+                    then_body,
+                    else_body,
+                });
+                i = join_idx;
             } else {
-                vec![]
-            };
-
-            stmts.push(HlilStmt::If {
-                cond,
-                then_body,
-                else_body,
-            });
-            i = else_end.max(then_end);
+                let then_body =
+                    structure_range(&insts[i + 1..taken_idx], ctx, jump_targets, dispatches);
+                stmts.push(HlilStmt::If {
+                    cond: negate_branch_condition(cond),
+                    then_body,
+                    else_body: vec![],
+                });
+                i = taken_idx;
+            }
             continue;
         }
 
@@ -2041,40 +2060,33 @@ fn find_do_while_back_edge(
     None
 }
 
-/// Try to identify if/else bounds.
-/// Returns (then_block_end, else_block_end).
-fn find_if_else_bounds(
-    insts: &[crate::il::mlil::MlilInst],
-    branch_idx: usize,
-    branch: &BranchInfo,
-) -> Option<(usize, usize)> {
-    let target_addr = match &branch.1 {
-        MlilExpr::Const(addr) => *addr,
-        _ => return None,
-    };
+fn negate_branch_condition(mut cond: HlilExpr) -> HlilExpr {
+    use crate::il::llil::BinOp;
 
-    // Find the instruction index that matches the branch target
-    let target_idx = insts.iter().position(|inst| inst.address == target_addr)?;
-
-    if target_idx <= branch_idx {
-        // Back edge — this is a loop, not an if/else
-        return None;
-    }
-
-    // The "then" block is from branch_idx+1 to target_idx
-    // Look for a jump at the end of the then block → else block
-    if target_idx > branch_idx + 1 {
-        let last_then = &insts[target_idx - 1];
-        if let Some(jump_target) = find_jump_target(&last_then.stmts) {
-            let else_end = insts
-                .iter()
-                .position(|inst| inst.address == jump_target)
-                .unwrap_or(target_idx);
-            return Some((target_idx - 1, else_end));
+    if let HlilExpr::BinOp { op, .. } = &mut cond
+        && let Some(inverse) = match op {
+            BinOp::CmpEq => Some(BinOp::CmpNe),
+            BinOp::CmpNe => Some(BinOp::CmpEq),
+            BinOp::CmpLt => Some(BinOp::CmpGe),
+            BinOp::CmpLe => Some(BinOp::CmpGt),
+            BinOp::CmpGt => Some(BinOp::CmpLe),
+            BinOp::CmpGe => Some(BinOp::CmpLt),
+            BinOp::CmpUlt => Some(BinOp::CmpUge),
+            BinOp::CmpUle => Some(BinOp::CmpUgt),
+            BinOp::CmpUgt => Some(BinOp::CmpUle),
+            BinOp::CmpUge => Some(BinOp::CmpUlt),
+            _ => None,
         }
+    {
+        *op = inverse;
+        return cond;
     }
 
-    Some((target_idx, target_idx))
+    HlilExpr::BinOp {
+        op: BinOp::CmpEq,
+        left: Box::new(cond),
+        right: Box::new(HlilExpr::Const(0)),
+    }
 }
 
 fn find_jump_target(stmts: &[MlilStmt]) -> Option<u64> {

@@ -186,6 +186,39 @@ fn branch_select_code() -> Vec<u8> {
     ]
 }
 
+#[test]
+fn test_branch_with_shared_return_keeps_both_paths() {
+    let code = [
+        0x55, // push rbp
+        0x48, 0x89, 0xe5, // mov rbp, rsp
+        0x89, 0x7d, 0xfc, // mov [rbp - 4], edi
+        0x83, 0x7d, 0xfc, 0x05, // cmp dword ptr [rbp - 4], 5
+        0x7e, 0x0b, // jle double_input
+        0x8b, 0x45, 0xfc, // mov eax, [rbp - 4]
+        0x83, 0xc0, 0x03, // add eax, 3
+        0x89, 0x45, 0xf8, // mov [rbp - 8], eax
+        0xeb, 0x08, // jmp shared_return
+        0x8b, 0x45, 0xfc, // double_input: mov eax, [rbp - 4]
+        0xd1, 0xe0, // shl eax, 1
+        0x89, 0x45, 0xf8, // mov [rbp - 8], eax
+        0x8b, 0x45, 0xf8, // shared_return: mov eax, [rbp - 8]
+        0x5d, // pop rbp
+        0xc3, // ret
+    ];
+    let text = decompile_case("score", &code, &HashMap::new());
+    let (_, taken) = text.split_once("if (var_4 <= 5) {").expect(&text);
+    let (taken, fallthrough) = taken.split_once("} else {").expect(&text);
+    assert!(
+        taken.contains(" << 1;") && taken.contains("var_8 = "),
+        "{text}"
+    );
+    assert!(
+        fallthrough.contains(" + 3;") && fallthrough.contains("var_8 = "),
+        "{text}"
+    );
+    assert!(fallthrough.contains("return var_8;"), "{text}");
+}
+
 /// Case c: a counted accumulation loop (back edge → loop structuring).
 ///
 /// ```text

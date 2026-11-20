@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
+const DECOMPILER_CACHE_VERSION: &str = "3";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ActionKind {
     Rename {
@@ -941,7 +943,7 @@ impl Project {
                 &serde_json::to_string(&self.pending_actions)
                     .map_err(|e| Error::Database(e.to_string()))?,
             )?;
-            db.set_metadata("decompiler_version", "2")?;
+            db.set_metadata("decompiler_version", DECOMPILER_CACHE_VERSION)?;
 
             for seg in &self.memory_map.segments {
                 db.save_segment(seg)?;
@@ -1164,7 +1166,7 @@ impl Project {
         project.types.source_lines = db.load_source_lines()?;
 
         // Restore decompilation cache
-        if db.get_metadata("decompiler_version")?.as_deref() == Some("2") {
+        if db.get_metadata("decompiler_version")?.as_deref() == Some(DECOMPILER_CACHE_VERSION) {
             project.decompilation_cache = db.load_decompilation_cache()?;
             for (&address, code) in &project.decompilation_cache {
                 let (callees, types) = code.dependencies();
