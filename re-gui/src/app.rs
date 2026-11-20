@@ -21,11 +21,11 @@ pub(crate) struct SleuthreApp {
     pub(crate) dock_state: egui_dock::DockState<Tab>,
     pub(crate) current_address: u64,
 
-    pub(crate) rename_active: bool,
+    pub(crate) rename_address: Option<u64>,
     pub(crate) rename_input: String,
-    pub(crate) comment_active: bool,
+    pub(crate) comment_address: Option<u64>,
     pub(crate) comment_input: String,
-    pub(crate) xref_active: bool,
+    pub(crate) xref_address: Option<u64>,
     pub(crate) focused_address: Option<u64>,
 
     pub(crate) approval_queue_open: bool,
@@ -536,9 +536,7 @@ impl Default for SleuthreApp {
                 "Sleuthre v",
                 env!("CARGO_PKG_VERSION"),
                 " started.\n\
-                 Analysis subsystem has been initialized.\n\
-                 Hotkeys: F5 decompile, Space graph, N rename, ; comment, X xrefs,\n\
-                 Ctrl+G goto, Ctrl+D bookmark, Ctrl+F search, Alt+Left/Right navigate.\n"
+                 Analysis subsystem has been initialized.\n"
             )
             .to_owned(),
             function_filter: String::new(),
@@ -546,11 +544,11 @@ impl Default for SleuthreApp {
             active_tab: Tab::Disassembly,
             dock_state: egui_dock::DockState::new(vec![Tab::Disassembly]),
             current_address: 0,
-            rename_active: false,
+            rename_address: None,
             rename_input: String::new(),
-            comment_active: false,
+            comment_address: None,
             comment_input: String::new(),
-            xref_active: false,
+            xref_address: None,
             focused_address: None,
             approval_queue_open: false,
             decompiled_code: re_core::il::hlil::DecompiledCode {
@@ -1101,6 +1099,30 @@ impl SleuthreApp {
         }
     }
 
+    pub(crate) fn selected_address(&self) -> Option<u64> {
+        let address = self.focused_address.unwrap_or(self.current_address);
+        self.project
+            .as_ref()?
+            .memory_map
+            .contains_address(address)
+            .then_some(address)
+    }
+
+    pub(crate) fn open_rename(&mut self, address: u64) {
+        self.rename_address = Some(address);
+        self.rename_input.clear();
+    }
+
+    pub(crate) fn open_comment(&mut self, address: u64) {
+        self.comment_address = Some(address);
+        self.comment_input = self
+            .project
+            .as_ref()
+            .and_then(|project| project.comments.get(&address))
+            .cloned()
+            .unwrap_or_default();
+    }
+
     pub(crate) fn decompile_current_function(&mut self) {
         let (project, disasm) = match (&mut self.project, &self.disasm) {
             (Some(p), Some(d)) => (p, d),
@@ -1180,9 +1202,9 @@ impl SleuthreApp {
     }
 
     pub(crate) fn any_modal_active(&self) -> bool {
-        self.rename_active
-            || self.comment_active
-            || self.xref_active
+        self.rename_address.is_some()
+            || self.comment_address.is_some()
+            || self.xref_address.is_some()
             || self.approval_queue_open
             || self.goto_active
             || self.bookmark_active

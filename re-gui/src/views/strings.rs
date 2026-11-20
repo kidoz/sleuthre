@@ -92,8 +92,7 @@ impl SleuthreApp {
                         )
                         .clicked()
                     {
-                        self.focused_address = Some(s.address);
-                        self.xref_active = true;
+                        self.xref_address = Some(s.address);
                     }
 
                     ui.add_space(8.0);
@@ -108,6 +107,7 @@ impl SleuthreApp {
                 project.navigate_to(addr);
             }
             self.current_address = addr;
+            self.focused_address = None;
             self.focus_or_open_tab(Tab::HexView);
         }
     }

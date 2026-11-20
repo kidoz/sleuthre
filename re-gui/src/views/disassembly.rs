@@ -72,14 +72,17 @@ impl SleuthreApp {
                                 .rect_filled(rect, 0.0, self.syntax.selection_bg);
                         }
 
-                        if ui.selectable_label(is_focused, "").clicked() {
+                        if ui
+                            .selectable_label(
+                                is_focused,
+                                egui::RichText::new(format!("{:08X}", insn.address))
+                                    .monospace()
+                                    .color(self.syntax.address),
+                            )
+                            .clicked()
+                        {
                             self.focused_address = Some(insn.address);
                         }
-
-                        ui.monospace(
-                            egui::RichText::new(format!("{:08X}", insn.address))
-                                .color(self.syntax.address),
-                        );
                         ui.add_space(8.0);
                         let bytes_str = insn
                             .bytes
@@ -123,20 +126,18 @@ impl SleuthreApp {
                 let addr = insn.address;
                 response.context_menu(|ui| {
                     if ui.button("Rename (N)").clicked() {
-                        self.rename_active = true;
-                        self.rename_input = String::new();
+                        self.rename_address = Some(addr);
+                        self.rename_input.clear();
                         ui.close();
                     }
                     if ui.button("Comment (;)").clicked() {
-                        self.comment_active = true;
-                        if let Some(project) = &self.project {
-                            self.comment_input =
-                                project.comments.get(&addr).cloned().unwrap_or_default();
-                        }
+                        self.comment_address = Some(addr);
+                        self.comment_input =
+                            project.comments.get(&addr).cloned().unwrap_or_default();
                         ui.close();
                     }
                     if ui.button("Xrefs (X)").clicked() {
-                        self.xref_active = true;
+                        self.xref_address = Some(addr);
                         ui.close();
                     }
                     if ui.button("Decompile (F5)").clicked() {

@@ -435,16 +435,17 @@ impl SleuthreApp {
     }
 
     fn show_rename_dialog(&mut self, ctx: &egui::Context) {
-        if !self.rename_active {
+        let Some(addr) = self.rename_address else {
             return;
-        }
+        };
         // The rename mutation is broadcast automatically by the per-frame
         // `broadcast_pending_undo_events` hook — no per-dialog plumbing needed.
         egui::Window::new("Rename").show(ctx, |ui| {
+            ui.monospace(format!("Address {addr:08X}"));
             ui.text_edit_singleline(&mut self.rename_input);
             ui.horizontal(|ui| {
                 if ui.button("OK").clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    if let (Some(p), Some(addr)) = (&mut self.project, self.focused_address) {
+                    if let Some(p) = &mut self.project {
                         let old_name = p
                             .functions
                             .functions
@@ -457,24 +458,25 @@ impl SleuthreApp {
                             new_name: self.rename_input.clone(),
                         });
                     }
-                    self.rename_active = false;
+                    self.rename_address = None;
                 }
                 if ui.button("Cancel").clicked() {
-                    self.rename_active = false;
+                    self.rename_address = None;
                 }
             });
         });
     }
 
     fn show_comment_dialog(&mut self, ctx: &egui::Context) {
-        if !self.comment_active {
+        let Some(addr) = self.comment_address else {
             return;
-        }
+        };
         egui::Window::new("Comment").show(ctx, |ui| {
+            ui.monospace(format!("Address {addr:08X}"));
             ui.text_edit_singleline(&mut self.comment_input);
             ui.horizontal(|ui| {
                 if ui.button("OK").clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    if let (Some(p), Some(addr)) = (&mut self.project, self.focused_address) {
+                    if let Some(p) = &mut self.project {
                         let old_comment = p.comments.get(&addr).cloned();
                         let new_comment = if self.comment_input.is_empty() {
                             None
@@ -487,20 +489,19 @@ impl SleuthreApp {
                             new_comment,
                         });
                     }
-                    self.comment_active = false;
+                    self.comment_address = None;
                 }
                 if ui.button("Cancel").clicked() {
-                    self.comment_active = false;
+                    self.comment_address = None;
                 }
             });
         });
     }
 
     fn show_xref_dialog(&mut self, ctx: &egui::Context) {
-        if !self.xref_active {
+        let Some(addr) = self.xref_address else {
             return;
-        }
-        let addr = self.focused_address.unwrap_or(0);
+        };
         egui::Window::new(format!("Xrefs to {:08X}", addr)).show(ctx, |ui| {
             if let Some(project) = &self.project {
                 if let Some(xrefs) = project.xrefs.to_address_xrefs.get(&addr) {
@@ -525,7 +526,7 @@ impl SleuthreApp {
                 }
             }
             if ui.button("Close").clicked() {
-                self.xref_active = false;
+                self.xref_address = None;
             }
         });
     }

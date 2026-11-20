@@ -7,6 +7,21 @@ use crate::app::{
 };
 use crate::theme::{SyntaxColors, ThemeMode, apply_theme};
 
+const GOTO_SHORTCUT: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::G);
+const PALETTE_SHORTCUT: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::P);
+const SEARCH_SHORTCUT: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::F);
+const BOOKMARK_SHORTCUT: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::D);
+const UNDO_SHORTCUT: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Z);
+const REDO_SHORTCUT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(
+    egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
+    egui::Key::Z,
+);
+
 struct SleuthreTabViewer<'a> {
     app: &'a mut SleuthreApp,
 }
@@ -115,51 +130,38 @@ impl eframe::App for SleuthreApp {
 
         // Keyboard shortcuts (only when no modal is active)
         if !self.any_modal_active() {
+            if ctx.input_mut(|i| i.consume_shortcut(&GOTO_SHORTCUT)) {
+                self.open_command_bar(&ctx, "");
+            } else if ctx.input_mut(|i| i.consume_shortcut(&PALETTE_SHORTCUT)) {
+                self.open_command_bar(&ctx, ">");
+            } else if ctx.input_mut(|i| i.consume_shortcut(&SEARCH_SHORTCUT)) {
+                self.search_active = true;
+            } else if ctx.input_mut(|i| i.consume_shortcut(&BOOKMARK_SHORTCUT)) {
+                self.open_bookmark();
+            }
+            let editing_text = ctx.text_edit_focused();
             ctx.input(|i| {
                 if i.key_pressed(egui::Key::F5) {
                     self.trigger_decompile = true;
                 }
-                if i.key_pressed(egui::Key::Space) {
-                    self.focus_or_open_tab(Tab::Graph);
-                }
-                if i.key_pressed(egui::Key::N) && self.focused_address.is_some() {
-                    self.rename_active = true;
-                    self.rename_input = String::new();
-                }
-                if i.key_pressed(egui::Key::Semicolon) && self.focused_address.is_some() {
-                    self.comment_active = true;
-                    if let (Some(project), Some(addr)) = (&self.project, self.focused_address) {
-                        self.comment_input =
-                            project.comments.get(&addr).cloned().unwrap_or_default();
+                if !editing_text && i.modifiers.is_none() {
+                    if i.key_pressed(egui::Key::Space) {
+                        self.focus_or_open_tab(Tab::Graph);
+                    }
+                    if let Some(address) = self.selected_address() {
+                        if i.key_pressed(egui::Key::N) {
+                            self.open_rename(address);
+                        }
+                        if i.key_pressed(egui::Key::Semicolon) {
+                            self.open_comment(address);
+                        }
+                        if i.key_pressed(egui::Key::X) {
+                            self.xref_address = Some(address);
+                        }
                     }
                 }
-                if i.key_pressed(egui::Key::X) && self.focused_address.is_some() {
-                    self.xref_active = true;
-                }
-                if i.modifiers.command && i.key_pressed(egui::Key::G) {
-                    self.command_bar_active = true;
-                    self.command_bar_input.clear();
-                    self.command_bar_results.clear();
-                }
-                if i.modifiers.command && i.key_pressed(egui::Key::P) {
-                    self.command_bar_active = true;
-                    self.command_bar_input = ">".to_string();
-                    self.update_command_bar_results();
-                }
-                if i.modifiers.command && i.key_pressed(egui::Key::D) {
-                    self.bookmark_active = true;
-                    if let Some(project) = &self.project {
-                        self.bookmark_input = project
-                            .bookmarks
-                            .get(&self.current_address)
-                            .cloned()
-                            .unwrap_or_default();
-                    }
-                }
-                if i.modifiers.command && i.key_pressed(egui::Key::F) {
-                    self.search_active = true;
-                }
-                if i.modifiers.command
+                if !editing_text
+                    && i.modifiers.command
                     && !i.modifiers.shift
                     && i.key_pressed(egui::Key::Z)
                     && let Some(ref mut project) = self.project
@@ -167,7 +169,8 @@ impl eframe::App for SleuthreApp {
                 {
                     self.output.push_str(&format!("{}\n", msg));
                 }
-                if i.modifiers.command
+                if !editing_text
+                    && i.modifiers.command
                     && i.modifiers.shift
                     && i.key_pressed(egui::Key::Z)
                     && let Some(ref mut project) = self.project
@@ -476,10 +479,31 @@ impl SleuthreApp {
         });
     }
 
+    fn open_command_bar(&mut self, ctx: &egui::Context, input: &str) {
+        self.command_bar_active = true;
+        self.command_bar_input = input.to_owned();
+        self.command_bar_results.clear();
+        if !input.is_empty() {
+            self.update_command_bar_results();
+        }
+        ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("command_bar")));
+    }
+
+    fn open_bookmark(&mut self) {
+        self.bookmark_active = true;
+        self.bookmark_input = self
+            .project
+            .as_ref()
+            .and_then(|project| project.bookmarks.get(&self.current_address))
+            .cloned()
+            .unwrap_or_default();
+    }
+
     fn show_command_bar(&mut self, ui: &mut egui::Ui) {
         let placeholder = format!("{:08X}", self.current_address);
         let response = ui.add(
             egui::TextEdit::singleline(&mut self.command_bar_input)
+                .id(egui::Id::new("command_bar"))
                 .hint_text(placeholder)
                 .desired_width(300.0)
                 .font(egui::TextStyle::Monospace),
@@ -864,42 +888,55 @@ impl SleuthreApp {
                 }
             });
             ui.menu_button("Edit", |ui| {
-                if ui.button("Rename (N)").clicked() {
-                    if self.focused_address.is_some() {
-                        self.rename_active = true;
-                        self.rename_input = String::new();
-                    }
+                let address = self.selected_address();
+                if ui
+                    .add_enabled(address.is_some(), egui::Button::new("Rename (N)"))
+                    .clicked()
+                    && let Some(address) = address
+                {
+                    self.open_rename(address);
                     ui.close();
                 }
-                if ui.button("Comment (;)").clicked() {
-                    if self.focused_address.is_some() {
-                        self.comment_active = true;
-                    }
+                if ui
+                    .add_enabled(address.is_some(), egui::Button::new("Comment (;)"))
+                    .clicked()
+                    && let Some(address) = address
+                {
+                    self.open_comment(address);
                     ui.close();
                 }
             });
             ui.menu_button("Jump", |ui| {
-                if ui.button("Go to Address (Ctrl+G)").clicked() {
-                    self.command_bar_active = true;
-                    self.command_bar_input.clear();
-                    self.command_bar_results.clear();
+                if ui
+                    .add(
+                        egui::Button::new("Go to Address")
+                            .shortcut_text(ctx.format_shortcut(&GOTO_SHORTCUT)),
+                    )
+                    .clicked()
+                {
                     ui.close();
+                    self.open_command_bar(ctx, "");
                 }
                 ui.separator();
-                if ui.button("Bookmark (Ctrl+D)").clicked() {
-                    self.bookmark_active = true;
-                    if let Some(project) = &self.project {
-                        self.bookmark_input = project
-                            .bookmarks
-                            .get(&self.current_address)
-                            .cloned()
-                            .unwrap_or_default();
-                    }
+                if ui
+                    .add(
+                        egui::Button::new("Bookmark")
+                            .shortcut_text(ctx.format_shortcut(&BOOKMARK_SHORTCUT)),
+                    )
+                    .clicked()
+                {
+                    self.open_bookmark();
                     ui.close();
                 }
             });
             ui.menu_button("Search", |ui| {
-                if ui.button("Search... (Ctrl+F)").clicked() {
+                if ui
+                    .add(
+                        egui::Button::new("Search...")
+                            .shortcut_text(ctx.format_shortcut(&SEARCH_SHORTCUT)),
+                    )
+                    .clicked()
+                {
                     self.search_active = true;
                     ui.close();
                 }
@@ -1082,11 +1119,16 @@ impl SleuthreApp {
                 ui.monospace("N         Rename");
                 ui.monospace(";         Comment");
                 ui.monospace("X         Xrefs");
-                ui.monospace("Ctrl+G    Command bar");
-                ui.monospace("Ctrl+D    Bookmark");
-                ui.monospace("Ctrl+F    Search");
-                ui.monospace("Ctrl+Z    Undo");
-                ui.monospace("Ctrl+Shift+Z  Redo");
+                for (shortcut, action) in [
+                    (GOTO_SHORTCUT, "Go to Address"),
+                    (PALETTE_SHORTCUT, "Command Palette"),
+                    (BOOKMARK_SHORTCUT, "Bookmark"),
+                    (SEARCH_SHORTCUT, "Search"),
+                    (UNDO_SHORTCUT, "Undo"),
+                    (REDO_SHORTCUT, "Redo"),
+                ] {
+                    ui.monospace(format!("{:<13} {action}", ctx.format_shortcut(&shortcut)));
+                }
                 ui.monospace("Alt+Left  Navigate back");
                 ui.monospace("Alt+Right Navigate forward");
             });
@@ -1999,9 +2041,12 @@ impl SleuthreApp {
                 if let Some(project) = &self.project {
                     if project.bookmarks.is_empty() {
                         ui.label(
-                            egui::RichText::new("No bookmarks. Ctrl+D to add.")
-                                .color(egui::Color32::GRAY)
-                                .size(11.0),
+                            egui::RichText::new(format!(
+                                "No bookmarks. {} to add.",
+                                ui.ctx().format_shortcut(&BOOKMARK_SHORTCUT)
+                            ))
+                            .color(egui::Color32::GRAY)
+                            .size(11.0),
                         );
                     }
                     for (&addr, note) in &project.bookmarks {
