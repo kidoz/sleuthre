@@ -1,7 +1,6 @@
 use eframe::egui;
 use re_core::analysis::cfg::ControlFlowGraph;
 use re_core::analysis::pipeline::{AnalysisCancellation, AnalysisMode};
-use re_core::analysis::type_propagation::FunctionTypeInfo;
 use re_core::disasm::Disassembler;
 use re_core::plugin::{AnalysisFinding, PluginManager};
 use re_core::project::{ActionKind, PendingAction, Project};
@@ -1090,73 +1089,12 @@ impl SleuthreApp {
             return;
         }
 
-        if let Ok(insns) = disasm.disassemble_range(&project.memory_map, self.current_address, 500)
-        {
-            let func_name = project
-                .functions
-                .functions
-                .get(&self.current_address)
-                .map(|f| f.name.as_str())
-                .unwrap_or("sub_unknown");
-            let arch = self
-                .disasm
-                .as_ref()
-                .map(|d| d.arch)
-                .unwrap_or(re_core::arch::Architecture::X86_64);
-
-            // Build symbol map
-            let mut symbols = HashMap::new();
-            for f in project.functions.functions.values() {
-                symbols.insert(f.start_address, f.name.clone());
+        match project.decompile_at(disasm, self.current_address) {
+            Ok(code) => self.decompiled_code = code,
+            Err(error) => {
+                self.decompiled_code = Default::default();
+                self.decompiled_code.text = error.to_string();
             }
-            for sym in &project.symbols {
-                symbols.insert(sym.address, sym.name.clone());
-            }
-            for imp in &project.imports {
-                symbols.insert(imp.address, imp.name.clone());
-            }
-
-            // Build type info for the current function
-            let type_info = project
-                .types
-                .function_signatures
-                .get(&self.current_address)
-                .map(|sig| FunctionTypeInfo {
-                    signature: Some(sig.clone()),
-                    var_types: Default::default(),
-                });
-
-            let conventions: std::collections::HashMap<
-                u64,
-                re_core::analysis::functions::CallingConvention,
-            > = project
-                .functions
-                .functions
-                .values()
-                .map(|f| (f.start_address, f.calling_convention))
-                .collect();
-
-            let code = re_core::il::structuring::decompile(
-                func_name,
-                &insns,
-                arch,
-                &symbols,
-                type_info.as_ref(),
-                &project.types,
-                &project.memory_map,
-                &conventions,
-            );
-
-            // Cache it and record what it referenced so a future rename or
-            // type edit invalidates this entry without a project-wide clear.
-            let (callees, types) = code.dependencies();
-            project
-                .cache_deps
-                .set_dependencies(self.current_address, callees, types);
-            project
-                .decompilation_cache
-                .insert(self.current_address, code.clone());
-            self.decompiled_code = code;
         }
     }
 

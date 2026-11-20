@@ -1,3 +1,5 @@
+mod decompile;
+
 use crate::Result;
 use crate::analysis::constants::ConstantScanner;
 use crate::analysis::functions::FunctionManager;

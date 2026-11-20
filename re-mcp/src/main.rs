@@ -1,17 +1,15 @@
 use anyhow::{Context, Result};
 use re_core::analysis::cfg::ControlFlowGraph;
-use re_core::analysis::type_propagation::FunctionTypeInfo;
 use re_core::debuginfo;
 use re_core::disasm::Disassembler;
-use re_core::il::structuring::decompile;
 use re_core::project::{ActionKind, PendingAction, Project};
 use re_core::signatures::SignatureDatabase;
 use serde_json::{Value, json};
-use std::collections::HashMap;
 use std::io::{self, BufRead};
 use std::path::PathBuf;
 use uuid::Uuid;
 
+const MAX_SEARCH_RESULTS: u64 = 1000;
 const MAX_DISASM_COUNT: usize = 1_000;
 
 struct McpServer {
@@ -801,91 +799,32 @@ impl McpServer {
                 let Some(addr) = args.get("address").and_then(|a| a.as_u64()) else {
                     return missing_param_error(&id, "address");
                 };
-                if let (Some(project), Some(disasm)) = (&self.project, &self.disasm) {
-                    if let Some(func) = project.functions.get_function(addr) {
-                        let size = func
-                            .end_address
-                            .and_then(|end| end.checked_sub(func.start_address))
-                            .map(|s| s as usize)
-                            .unwrap_or(0x100);
-                        match disasm.disassemble_range(
-                            &project.memory_map,
-                            func.start_address,
-                            size,
-                        ) {
-                            Ok(instructions) => {
-                                let arch = self
-                                    .disasm
-                                    .as_ref()
-                                    .map(|d| d.arch)
-                                    .unwrap_or(re_core::arch::Architecture::X86_64);
-
-                                let mut symbols = HashMap::new();
-                                for f in project.functions.functions.values() {
-                                    symbols.insert(f.start_address, f.name.clone());
-                                }
-                                for sym in &project.symbols {
-                                    symbols.insert(sym.address, sym.name.clone());
-                                }
-                                for imp in &project.imports {
-                                    symbols.insert(imp.address, imp.name.clone());
-                                }
-
-                                // Build type info
-                                let type_info =
-                                    project.types.function_signatures.get(&addr).map(|sig| {
-                                        FunctionTypeInfo {
-                                            signature: Some(sig.clone()),
-                                            var_types: Default::default(),
-                                        }
-                                    });
-
-                                let conventions: std::collections::HashMap<
-                                    u64,
-                                    re_core::analysis::functions::CallingConvention,
-                                > = project
-                                    .functions
-                                    .functions
-                                    .values()
-                                    .map(|f| (f.start_address, f.calling_convention))
-                                    .collect();
-                                let pseudocode = decompile(
-                                    &func.name,
-                                    &instructions,
-                                    arch,
-                                    &symbols,
-                                    type_info.as_ref(),
-                                    &project.types,
-                                    &project.memory_map,
-                                    &conventions,
-                                );
-                                let response = tool_text_result(&id, &pseudocode.text);
-                                // Cache + record dependencies so a later
-                                // rename or type edit invalidates exactly
-                                // the right entries (matches the GUI path).
-                                let (callees, refd_types) = pseudocode.dependencies();
-                                if let Some(p) = self.project.as_mut() {
-                                    p.cache_deps.set_dependencies(addr, callees, refd_types);
-                                    p.decompilation_cache.insert(addr, pseudocode);
-                                }
-                                response
-                            }
-                            Err(e) => {
-                                json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32002, "message": e.to_string() } })
-                            }
-                        }
-                    } else {
-                        json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32004, "message": format!("No function found at address 0x{:x}", addr) } })
+                let (Some(project), Some(disasm)) = (&mut self.project, &self.disasm) else {
+                    return json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":"No project loaded"}});
+                };
+                if project.functions.get_function(addr).is_none() {
+                    return json!({"jsonrpc":"2.0","id":id,"error":{"code":-32004,"message":format!("No function found at address {addr:#x}")}});
+                }
+                match project.decompile_at(disasm, addr) {
+                    Ok(code) => tool_text_result(&id, &code.text),
+                    Err(e) => {
+                        json!({"jsonrpc":"2.0","id":id,"error":{"code":-32002,"message":e.to_string()}})
                     }
-                } else {
-                    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": "No project loaded" } })
                 }
             }
             "search_memory" => {
                 let Some(pattern_str) = args.get("pattern").and_then(|p| p.as_str()) else {
                     return missing_param_error(&id, "pattern");
                 };
-                let limit = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(50) as usize;
+                let limit = match args.get("limit") {
+                    None => 50,
+                    Some(value) => match value.as_u64() {
+                        Some(n) if n <= MAX_SEARCH_RESULTS => n as usize,
+                        _ => {
+                            return json!({"jsonrpc":"2.0", "id":id, "error":{"code":-32602, "message":"limit must be an integer from 0 to 1000"}});
+                        }
+                    },
+                };
                 if let Some(project) = &self.project {
                     let mut pattern: Vec<Option<u8>> = Vec::new();
                     for tok in pattern_str.split_whitespace() {
@@ -1286,44 +1225,13 @@ impl McpServer {
                 let Some(func) = project.functions.get_function(addr) else {
                     return json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32004, "message": format!("No function at 0x{:x}", addr) } });
                 };
-                let size = func
-                    .end_address
-                    .and_then(|end| end.checked_sub(func.start_address))
-                    .map(|s| s as usize)
-                    .unwrap_or(0x100);
-                let original = match disasm.disassemble_range(
-                    &project.memory_map,
-                    func.start_address,
-                    size,
-                ) {
+                let original = match project.function_instructions(disasm, addr) {
                     Ok(insns) => insns,
                     Err(e) => {
                         return json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32002, "message": e.to_string() } });
                     }
                 };
-                let mut symbols = HashMap::new();
-                for f in project.functions.functions.values() {
-                    symbols.insert(f.start_address, f.name.clone());
-                }
-                let conventions: std::collections::HashMap<
-                    u64,
-                    re_core::analysis::functions::CallingConvention,
-                > = project
-                    .functions
-                    .functions
-                    .values()
-                    .map(|f| (f.start_address, f.calling_convention))
-                    .collect();
-                let pseudocode = decompile(
-                    &func.name,
-                    &original,
-                    disasm.arch,
-                    &symbols,
-                    None,
-                    &project.types,
-                    &project.memory_map,
-                    &conventions,
-                );
+                let pseudocode = project.decompile_instructions(addr, &original);
                 match re_core::analysis::recompile_diff::recompile_and_diff(
                     &func.name,
                     &pseudocode.text,

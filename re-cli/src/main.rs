@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -6,7 +5,6 @@ use clap::{Parser, Subcommand};
 use serde::Serialize;
 
 use re_core::analysis::pipeline;
-use re_core::analysis::type_propagation::FunctionTypeInfo;
 use re_core::arch::Architecture;
 use re_core::disasm::Disassembler;
 use re_core::loader;
@@ -134,41 +132,10 @@ fn parse_hex_address(s: &str) -> Result<u64, String> {
     }
 }
 
-/// Result of the full analysis pipeline.
-struct AnalysisResult {
-    project: re_core::project::Project,
-    type_info: HashMap<u64, FunctionTypeInfo>,
-    entry_point: u64,
-}
-
-/// Run the full analysis pipeline using the shared `re_core::analysis::pipeline`.
-fn run_analysis(path: &Path) -> Result<AnalysisResult> {
-    let pipeline_result = pipeline::analyze_binary(path, |stage| {
-        eprintln!("[*] {}", stage);
-    })
-    .map_err(|e| anyhow::anyhow!("{}", e))?;
-
-    let type_info: HashMap<u64, FunctionTypeInfo> = pipeline_result
-        .project
-        .types
-        .function_signatures
-        .iter()
-        .map(|(&addr, sig)| {
-            (
-                addr,
-                FunctionTypeInfo {
-                    signature: Some(sig.clone()),
-                    var_types: Default::default(),
-                },
-            )
-        })
-        .collect();
-
-    Ok(AnalysisResult {
-        project: pipeline_result.project,
-        type_info,
-        entry_point: pipeline_result.entry_point,
-    })
+fn run_analysis(path: &Path) -> Result<pipeline::AnalysisResult> {
+    Ok(pipeline::analyze_binary(path, |stage| {
+        eprintln!("[*] {stage}")
+    })?)
 }
 
 fn main() -> Result<()> {
@@ -366,59 +333,10 @@ fn cmd_disasm(path: &Path, address: u64, count: usize, json: bool) -> Result<()>
 // -- decompile ----------------------------------------------------------------
 
 fn cmd_decompile(path: &Path, address: u64) -> Result<()> {
-    let result = run_analysis(path)?;
-
-    if let Some(func) = result.project.functions.functions.get(&address) {
-        // Disassemble the function first
-        let size = func
-            .end_address
-            .unwrap_or(address + 0x100)
-            .saturating_sub(address);
-        // Limit size to avoid huge functions if something goes wrong
-        let size = size.min(0x10000) as usize;
-
-        let disasm = Disassembler::new(result.project.arch).with_context(|| {
-            format!("Failed to create disassembler for {}", result.project.arch)
-        })?;
-
-        let instructions = disasm.disassemble_range(&result.project.memory_map, address, size)?;
-
-        // Build symbol map for resolution
-        let mut symbols = HashMap::new();
-        // 1. Functions
-        for f in result.project.functions.functions.values() {
-            symbols.insert(f.start_address, f.name.clone());
-        }
-        // 2. Imports/Symbols from binary
-        for sym in &result.project.symbols {
-            symbols.insert(sym.address, sym.name.clone());
-        }
-        for imp in &result.project.imports {
-            symbols.insert(imp.address, imp.name.clone());
-        }
-
-        // Per-function calling conventions, for recovering implicit register
-        // arguments (x86 thiscall `this`, fastcall ecx/edx) at call sites.
-        let conventions: HashMap<u64, re_core::analysis::functions::CallingConvention> = result
-            .project
-            .functions
-            .functions
-            .values()
-            .map(|f| (f.start_address, f.calling_convention))
-            .collect();
-
-        let code = re_core::il::structuring::decompile(
-            &func.name,
-            &instructions,
-            result.project.arch,
-            &symbols,
-            result.type_info.get(&address),
-            &re_core::types::TypeManager::default(),
-            &result.project.memory_map,
-            &conventions,
-        );
-
-        println!("{}", code.text);
+    let mut project = run_analysis(path)?.project;
+    if project.functions.get_function(address).is_some() {
+        let disasm = Disassembler::new(project.arch)?;
+        println!("{}", project.decompile_at(&disasm, address)?.text);
     } else {
         println!("No function found at address 0x{:x}", address);
     }

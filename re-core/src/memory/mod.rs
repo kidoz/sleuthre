@@ -81,6 +81,11 @@ impl MemoryMap {
             .ok()
     }
 
+    pub fn segment_at(&self, address: u64) -> Option<&MemorySegment> {
+        self.find_segment(address)
+            .map(|index| &self.segments[index])
+    }
+
     pub fn get_data(&self, address: u64, size: usize) -> Option<&[u8]> {
         let end = address.checked_add(size as u64)?;
         let idx = self.find_segment(address)?;
