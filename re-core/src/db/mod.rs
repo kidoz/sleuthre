@@ -454,6 +454,12 @@ impl Database {
         Ok(())
     }
 
+    pub fn begin_read_transaction(&self) -> Result<()> {
+        self.conn
+            .execute_batch("BEGIN")
+            .map_err(|e| Error::Database(e.to_string()))
+    }
+
     pub fn begin_transaction(&self) -> Result<()> {
         self.conn
             .execute_batch("BEGIN IMMEDIATE")

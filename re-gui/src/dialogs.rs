@@ -535,29 +535,58 @@ impl SleuthreApp {
             return;
         }
         egui::Window::new("AI Approval Queue").show(ctx, |ui| {
-            let mut to_remove = None;
-            if let Some(ref mut project) = self.project {
+            let mut decision = None;
+            if let Some(project) = &self.project {
                 if project.pending_actions.is_empty() {
                     ui.label("No pending actions.");
                 }
-                for (i, action) in project.pending_actions.iter().enumerate() {
-                    ui.group(|ui| {
-                        ui.label(format!("Confidence: {:.0}%", action.confidence * 100.0));
-                        ui.label(&action.rationale);
-                        if ui.button("Approve").clicked() {
-                            if let ActionKind::Rename {
-                                address, new_name, ..
-                            } = &action.kind
-                                && let Some(f) = project.functions.functions.get_mut(address)
-                            {
-                                f.name = new_name.clone();
+                for action in &project.pending_actions {
+                    ui.push_id(action.id, |ui| {
+                        ui.group(|ui| {
+                            let change = match &action.kind {
+                                ActionKind::Rename {
+                                    address, new_name, ..
+                                } => format!("Rename {address:#x} to {new_name}"),
+                                ActionKind::Comment {
+                                    address,
+                                    new_comment,
+                                } if new_comment.is_empty() => {
+                                    format!("Remove comment at {address:#x}")
+                                }
+                                ActionKind::Comment {
+                                    address,
+                                    new_comment,
+                                } => format!("Comment at {address:#x}: {new_comment}"),
+                                ActionKind::SetLocalType {
+                                    function,
+                                    variable,
+                                    type_name,
+                                } => format!("Set {variable} in {function:#x} to {type_name}"),
+                            };
+                            ui.label(change);
+                            ui.label(&action.rationale);
+                            if ui.button("Approve").clicked() {
+                                decision = Some((action.id, true));
                             }
-                            to_remove = Some(i);
-                        }
+                            if ui.button("Reject").clicked() {
+                                decision = Some((action.id, false));
+                            }
+                        })
                     });
                 }
-                if let Some(idx) = to_remove {
-                    project.pending_actions.remove(idx);
+            }
+            if let (Some(project), Some((id, approve))) = (&mut self.project, decision) {
+                if approve {
+                    match project.approve_action(id) {
+                        Ok(change) => {
+                            self.cached_func_list_dirty = true;
+                            self.output.push_str(&format!("{change}\n"));
+                            self.decompile_current_function();
+                        }
+                        Err(e) => self.add_toast(crate::app::ToastKind::Error, e.to_string()),
+                    }
+                } else {
+                    project.pending_actions.retain(|action| action.id != id);
                 }
             }
             if ui.button("Close").clicked() {

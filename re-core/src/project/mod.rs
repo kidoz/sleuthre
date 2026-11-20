@@ -28,6 +28,11 @@ pub enum ActionKind {
         address: u64,
         new_comment: String,
     },
+    SetLocalType {
+        function: u64,
+        variable: String,
+        type_name: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,6 +55,12 @@ pub enum UndoCommand {
         address: u64,
         old_comment: Option<String>,
         new_comment: Option<String>,
+    },
+    SetLocalType {
+        function: u64,
+        variable: String,
+        old: Option<crate::types::VariableInfo>,
+        new: crate::types::VariableInfo,
     },
     AddBookmark {
         address: u64,
@@ -106,6 +117,7 @@ pub struct Project {
     pub comments: HashMap<u64, String>,
     pub pending_actions: Vec<PendingAction>,
     pub db: Option<Database>,
+    saved_revision: Option<String>,
     pub imports: Vec<Import>,
     pub exports: Vec<Export>,
     pub symbols: Vec<Symbol>,
@@ -284,6 +296,7 @@ impl Project {
             comments: HashMap::new(),
             pending_actions: Vec::new(),
             db: None,
+            saved_revision: None,
             imports: Vec::new(),
             exports: Vec::new(),
             symbols: Vec::new(),
@@ -306,6 +319,74 @@ impl Project {
             struct_candidates: Vec::new(),
             overlay_derived_globals: Vec::new(),
         }
+    }
+
+    /// Apply a reviewed proposal using current values for undo.
+    pub fn approve_action(&mut self, id: uuid::Uuid) -> Result<String> {
+        let index = self
+            .pending_actions
+            .iter()
+            .position(|action| action.id == id)
+            .ok_or_else(|| Error::Analysis("Unknown proposal".into()))?;
+        let cmd = match &self.pending_actions[index].kind {
+            ActionKind::Rename {
+                address, new_name, ..
+            } => {
+                let func = self
+                    .functions
+                    .get_function(*address)
+                    .ok_or_else(|| Error::Analysis("Unknown function".into()))?;
+                UndoCommand::Rename {
+                    address: *address,
+                    old_name: func.name.clone(),
+                    new_name: new_name.clone(),
+                }
+            }
+            ActionKind::Comment {
+                address,
+                new_comment,
+            } => UndoCommand::Comment {
+                address: *address,
+                old_comment: self.comments.get(address).cloned(),
+                new_comment: (!new_comment.is_empty()).then(|| new_comment.clone()),
+            },
+            ActionKind::SetLocalType {
+                function,
+                variable,
+                type_name,
+            } => {
+                if self.functions.get_function(*function).is_none()
+                    || type_name.len() > 256
+                    || variable.is_empty()
+                    || type_name.trim().is_empty()
+                {
+                    return Err(Error::Analysis("Invalid local type proposal".into()));
+                }
+                let old = self
+                    .types
+                    .local_variables
+                    .get(function)
+                    .and_then(|locals| locals.iter().find(|v| v.name == *variable))
+                    .cloned();
+                let location = old
+                    .as_ref()
+                    .map(|v| v.location.clone())
+                    .unwrap_or_else(|| crate::types::VariableLocation::Register(variable.clone()));
+                let new = crate::types::VariableInfo {
+                    name: variable.clone(),
+                    type_ref: crate::types::parse_type_str(type_name),
+                    location,
+                };
+                UndoCommand::SetLocalType {
+                    function: *function,
+                    variable: variable.clone(),
+                    old,
+                    new,
+                }
+            }
+        };
+        self.pending_actions.remove(index);
+        Ok(self.execute(cmd))
     }
 
     /// Execute a command and push it onto the undo stack, clearing redo.
@@ -403,6 +484,27 @@ impl Project {
                 } else {
                     format!("Comment at {:08X}", address)
                 }
+            }
+            UndoCommand::SetLocalType {
+                function,
+                variable,
+                old,
+                new,
+            } => {
+                let locals = self.types.local_variables.entry(*function).or_default();
+                let replacement = if undo { old.as_ref() } else { Some(new) };
+                let index = locals.iter().position(|v| v.name == *variable);
+                match (index, replacement) {
+                    (Some(i), Some(v)) => locals[i] = v.clone(),
+                    (None, Some(v)) => locals.push(v.clone()),
+                    (Some(i), None) => {
+                        locals.remove(i);
+                    }
+                    (None, None) => {}
+                }
+                self.decompilation_cache.remove(function);
+                self.cache_deps.forget(*function);
+                format!("Updated type of {variable} at {function:#x}")
             }
             UndoCommand::AddBookmark { address, note } => {
                 if undo {
@@ -783,27 +885,63 @@ impl Project {
         }
     }
 
-    pub fn save(&mut self, db_path: &std::path::Path) -> Result<()> {
-        // Always open the target path so "Save As" to a new file works correctly.
-        let needs_new_db = match &self.db {
-            None => true,
-            Some(db) => db.path() != db_path,
-        };
-        if needs_new_db {
-            self.db = Some(Database::open(db_path)?);
+    /// Autosave only to the database owned by this session. For a newly
+    /// analyzed binary reserve a distinct recovery file before the first save.
+    pub fn autosave(&mut self) -> Result<PathBuf> {
+        if let Some(db) = &self.db {
+            let path = db.path().to_owned();
+            self.save(&path)?;
+            return Ok(path);
         }
+        let path = self
+            .path
+            .with_extension(format!("recovery-{}.slre", uuid::Uuid::new_v4()));
+        self.save_new(&path)?;
+        Ok(path)
+    }
 
-        // Update project path so auto-save targets the same file.
-        self.path = db_path.with_extension("").to_path_buf();
+    /// Create a new project snapshot without replacing an existing file.
+    pub fn save_new(&mut self, path: &std::path::Path) -> Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options.open(path)?;
+        self.save(path)
+    }
 
-        let db = self.db.as_ref().unwrap();
-
+    pub fn save(&mut self, db_path: &std::path::Path) -> Result<()> {
+        let existing = self.db.as_ref().filter(|db| db.path() == db_path);
+        let new_db = if existing.is_none() {
+            Some(Database::open(db_path)?)
+        } else {
+            None
+        };
+        let db = existing
+            .or(new_db.as_ref())
+            .expect("destination database is open");
+        let revision = uuid::Uuid::new_v4().to_string();
         // Wrap the entire clear + reinsert in a transaction so a mid-save
         // error leaves the previous data intact instead of an empty database.
         db.begin_transaction()?;
 
         let result = (|| -> Result<()> {
+            if existing.is_some() && db.get_metadata("revision")? != self.saved_revision {
+                return Err(Error::Database(
+                    "Project changed on disk; reopen it or save a separate copy".into(),
+                ));
+            }
             db.clear_all()?;
+            db.set_metadata("revision", &revision)?;
+            db.set_metadata(
+                "pending_actions",
+                &serde_json::to_string(&self.pending_actions)
+                    .map_err(|e| Error::Database(e.to_string()))?,
+            )?;
+            db.set_metadata("decompiler_version", "2")?;
 
             for seg in &self.memory_map.segments {
                 db.save_segment(seg)?;
@@ -930,17 +1068,20 @@ impl Project {
             Ok(())
         })();
 
-        match result {
-            Ok(()) => db.commit_transaction(),
-            Err(e) => {
-                let _ = db.rollback_transaction();
-                Err(e)
-            }
+        if let Err(error) = result.and_then(|()| db.commit_transaction()) {
+            let _ = db.rollback_transaction();
+            return Err(error);
         }
+        if let Some(db) = new_db {
+            self.db = Some(db);
+        }
+        self.saved_revision = Some(revision);
+        Ok(())
     }
 
     pub fn load(db_path: &std::path::Path) -> Result<Self> {
         let db = Database::open(db_path)?;
+        db.begin_read_transaction()?;
 
         // Reject project files written by a newer, incompatible schema rather
         // than silently misreading them. Absent (legacy) version = compatible.
@@ -1023,7 +1164,13 @@ impl Project {
         project.types.source_lines = db.load_source_lines()?;
 
         // Restore decompilation cache
-        project.decompilation_cache = db.load_decompilation_cache()?;
+        if db.get_metadata("decompiler_version")?.as_deref() == Some("2") {
+            project.decompilation_cache = db.load_decompilation_cache()?;
+            for (&address, code) in &project.decompilation_cache {
+                let (callees, types) = code.dependencies();
+                project.cache_deps.set_dependencies(address, callees, types);
+            }
+        }
 
         // Restore struct overlays
         project.struct_overlays = db.load_struct_overlays()?;
@@ -1058,6 +1205,12 @@ impl Project {
             project.image_base = base;
         }
 
+        project.saved_revision = db.get_metadata("revision")?;
+        if let Some(actions) = db.get_metadata("pending_actions")? {
+            project.pending_actions = serde_json::from_str(&actions)
+                .map_err(|e| Error::Database(format!("Invalid pending actions: {e}")))?;
+        }
+        db.commit_transaction()?;
         project.db = Some(db);
         Ok(project)
     }
@@ -1494,6 +1647,35 @@ mod tests {
             stack_frame_size: 0,
         });
         p
+    }
+
+    #[test]
+    fn fresh_autosave_preserves_sidecar_and_save_as_uses_exact_name() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir(&dir).unwrap();
+        {
+            let mut project = test_project();
+            project.path = dir.join("program.exe");
+            let sidecar = dir.join("program.slre");
+            let mut existing = test_project();
+            existing.comments.insert(0x1000, "reviewed".into());
+            existing.save(&sidecar).unwrap();
+
+            let recovery = project.autosave().unwrap();
+            assert_ne!(recovery, sidecar);
+            assert_eq!(project.autosave().unwrap(), recovery);
+            assert_eq!(
+                Project::load(&sidecar).unwrap().comments[&0x1000],
+                "reviewed"
+            );
+            let named = dir.join("program.review.slre");
+            project.save(&named).unwrap();
+            assert_eq!(project.path, dir.join("program.exe"));
+            assert!(project.save(&dir.join("missing/subdir.slre")).is_err());
+            assert_eq!(project.autosave().unwrap(), named);
+            assert_eq!(Project::load(&named).unwrap().autosave().unwrap(), named);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

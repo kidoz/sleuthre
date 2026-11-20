@@ -98,9 +98,15 @@ impl eframe::App for SleuthreApp {
         if now - self.last_save_time > 300.0 {
             // 5 minutes
             if let Some(ref mut project) = self.project {
-                let path = project.path.with_extension("slre");
-                if let Ok(()) = project.save(&path) {
-                    self.add_toast(crate::app::ToastKind::Info, "Project auto-saved.".into());
+                match project.autosave() {
+                    Ok(path) => self.add_toast(
+                        crate::app::ToastKind::Info,
+                        format!("Auto-saved to {}", path.display()),
+                    ),
+                    Err(e) => self.add_toast(
+                        crate::app::ToastKind::Error,
+                        format!("Auto-save failed: {e}"),
+                    ),
                 }
             }
             self.last_save_time = now;
@@ -838,6 +844,10 @@ impl SleuthreApp {
                 }
                 if ui.button("Load Project...").clicked() {
                     self.load_project();
+                    ui.close();
+                }
+                if ui.button("Review pending changes…").clicked() {
+                    self.approval_queue_open = true;
                     ui.close();
                 }
                 ui.separator();
@@ -2390,6 +2400,15 @@ fn undo_command_to_event(cmd: &re_core::project::UndoCommand) -> re_core::collab
                 "address": format!("0x{:x}", address),
                 "text": new_comment,
             }),
+        ),
+        UndoCommand::SetLocalType {
+            function,
+            variable,
+            new,
+            ..
+        } => (
+            "set_local_type",
+            serde_json::json!({"function": function, "variable": variable, "type": new.type_ref.display_name()}),
         ),
         UndoCommand::AddBookmark { address, note } => (
             "add_bookmark",

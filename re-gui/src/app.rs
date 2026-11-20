@@ -1052,6 +1052,7 @@ impl SleuthreApp {
                     self.output
                         .push_str(&format!("Project loaded from '{}'.\n", path.display()));
                     self.disasm = Disassembler::new(project.arch).ok();
+                    self.approval_queue_open = !project.pending_actions.is_empty();
                     self.project = Some(project);
                     self.cached_func_list_dirty = true;
                     self.update_cfg();

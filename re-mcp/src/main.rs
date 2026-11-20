@@ -17,6 +17,22 @@ struct McpServer {
     disasm: Option<Disassembler>,
 }
 
+fn propose(project: &mut Project, kind: ActionKind, rationale: String, id: &Value) -> Value {
+    if project.pending_actions.len() >= 1024 {
+        return json!({"jsonrpc":"2.0", "id":id, "error":{"code":-32003,"message":"Proposal queue is full"}});
+    }
+    project.pending_actions.push(PendingAction {
+        id: Uuid::new_v4(),
+        kind,
+        rationale,
+        confidence: 0.9,
+    });
+    tool_text_result(
+        id,
+        "Change queued. Save the project and open the saved file in the GUI to review it.",
+    )
+}
+
 /// Return a JSON-RPC invalid-params error if a required argument is missing.
 fn missing_param_error(id: &Value, name: &str) -> Value {
     json!({
@@ -80,7 +96,7 @@ fn confine_save_path(
     let workspace = binary_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
-        .ok_or_else(|| "project has no workspace directory".to_string())?
+        .unwrap_or_else(|| std::path::Path::new("."))
         .canonicalize()
         .map_err(|e| format!("cannot resolve workspace: {}", e))?;
     let file_name = target
@@ -300,7 +316,7 @@ impl McpServer {
                         },
                         {
                             "name": "add_comment",
-                            "description": "Add a comment at an address",
+                            "description": "Propose adding or removing a comment for GUI approval",
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
@@ -480,7 +496,7 @@ impl McpServer {
                         },
                         {
                             "name": "rewrite_il",
-                            "description": "Assert a type for a local variable so the decompiler lifts it with that type (IL-level rewrite).",
+                            "description": "Propose a local variable type for GUI approval.",
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
@@ -638,22 +654,15 @@ impl McpServer {
                     .unwrap_or("AI Suggestion")
                     .to_string();
                 if let Some(project) = &mut self.project {
-                    let old_name = project
-                        .functions
-                        .get_function(addr)
-                        .map(|f| f.name.clone())
-                        .unwrap_or_else(|| format!("sub_{:X}", addr));
-                    project.pending_actions.push(PendingAction {
-                        id: Uuid::new_v4(),
-                        kind: ActionKind::Rename {
-                            address: addr,
-                            new_name: name,
-                            old_name,
-                        },
-                        rationale,
-                        confidence: 0.9,
-                    });
-                    tool_text_result(&id, "Rename submitted for approval")
+                    let Some(func) = project.functions.get_function(addr) else {
+                        return json!({"jsonrpc":"2.0","id":id,"error":{"code":-32004,"message":"Unknown function"}});
+                    };
+                    let kind = ActionKind::Rename {
+                        address: addr,
+                        new_name: name,
+                        old_name: func.name.clone(),
+                    };
+                    propose(project, kind, rationale, &id)
                 } else {
                     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": "No project loaded" } })
                 }
@@ -709,12 +718,15 @@ impl McpServer {
                     return missing_param_error(&id, "text");
                 };
                 if let Some(project) = &mut self.project {
-                    if text.is_empty() {
-                        project.comments.remove(&addr);
-                    } else {
-                        project.comments.insert(addr, text.clone());
-                    }
-                    tool_text_result(&id, &format!("Comment set at 0x{:x}", addr))
+                    propose(
+                        project,
+                        ActionKind::Comment {
+                            address: addr,
+                            new_comment: text,
+                        },
+                        "MCP comment proposal".into(),
+                        &id,
+                    )
                 } else {
                     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": "No project loaded" } })
                 }
@@ -782,7 +794,12 @@ impl McpServer {
                             return json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32602, "message": msg } });
                         }
                     };
-                    match project.save(&resolved) {
+                    let saved = if project.db.as_ref().is_some_and(|db| db.path() == resolved) {
+                        project.save(&resolved)
+                    } else {
+                        project.save_new(&resolved)
+                    };
+                    match saved {
                         Ok(()) => tool_text_result(
                             &id,
                             &format!("Project saved to {}", resolved.display()),
@@ -1130,27 +1147,22 @@ impl McpServer {
                 let Some(project) = &mut self.project else {
                     return json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": "No project loaded" } });
                 };
-                let type_ref = re_core::types::parse_type_str(type_str);
-                let var_info = re_core::types::VariableInfo {
-                    name: var_name.to_string(),
-                    type_ref,
-                    location: re_core::types::VariableLocation::Register(var_name.to_string()),
-                };
-                project
-                    .types
-                    .local_variables
-                    .entry(func_addr)
-                    .or_default()
-                    .push(var_info);
-                // Invalidate any cached decompilation for this function so the
-                // next request picks up the new variable type.
-                project.decompilation_cache.remove(&func_addr);
-                tool_text_result(
+                if project.functions.get_function(func_addr).is_none()
+                    || type_str.len() > 256
+                    || type_str.trim().is_empty()
+                    || var_name.is_empty()
+                {
+                    return json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":"Invalid function, variable or type"}});
+                }
+                propose(
+                    project,
+                    ActionKind::SetLocalType {
+                        function: func_addr,
+                        variable: var_name.into(),
+                        type_name: type_str.into(),
+                    },
+                    "MCP local type proposal".into(),
                     &id,
-                    &format!(
-                        "Applied type `{}` to `{}` in function 0x{:x}",
-                        type_str, var_name, func_addr
-                    ),
                 )
             }
             "get_variable_uses" => {
@@ -1397,6 +1409,66 @@ mod tests {
         assert!(names.contains(&"open_binary"));
         assert!(names.contains(&"get_disasm"));
         assert!(names.contains(&"get_xrefs"));
+    }
+
+    #[test]
+    fn proposals_survive_handoff_and_stale_saves_cannot_revert_review() {
+        use re_core::analysis::functions::{CallingConvention, Function};
+        let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        std::fs::create_dir(&dir).unwrap();
+        {
+            let mut server = McpServer::new();
+            let mut project = Project::new("sample".into(), dir.join("sample.exe"));
+            project.functions.add_function(Function {
+                start_address: 16,
+                end_address: None,
+                name: "entry".into(),
+                calling_convention: CallingConvention::default(),
+                stack_frame_size: 0,
+            });
+            server.project = Some(project);
+            let save = json!({"path":"handoff.slre"});
+            for (name, args) in [
+                ("submit_rename", json!({"address":16,"name":"main"})),
+                ("add_comment", json!({"address":16,"text":"reviewed"})),
+                (
+                    "rewrite_il",
+                    json!({"function":16,"variable":"v","type":"int"}),
+                ),
+                ("add_comment", json!({"address":17,"text":"reject this"})),
+                ("save_project", save.clone()),
+            ] {
+                let response = server.call_tool(name, args, json!(1));
+                assert!(response["error"].is_null(), "{response}");
+            }
+            let path = dir.join("handoff.slre");
+            let mut reviewer = Project::load(&path).unwrap();
+            assert_eq!(reviewer.functions.functions[&16].name, "entry");
+            assert!(reviewer.comments.is_empty());
+            assert!(reviewer.types.local_variables.is_empty());
+            assert_eq!(reviewer.pending_actions.len(), 4);
+            for _ in 0..3 {
+                reviewer
+                    .approve_action(reviewer.pending_actions[0].id)
+                    .unwrap();
+            }
+            reviewer.pending_actions.clear(); // reject remaining proposal
+            assert_eq!(
+                reviewer.types.local_variables[&16][0]
+                    .type_ref
+                    .display_name(),
+                "int32_t"
+            );
+            reviewer.autosave().unwrap();
+            assert!(server.call_tool("save_project", save, json!(2))["error"].is_object());
+            let saved = Project::load(&path).unwrap();
+            assert!(saved.pending_actions.is_empty());
+            assert_eq!(saved.functions.functions[&16].name, "main");
+            assert_eq!(saved.comments[&16], "reviewed");
+            assert!(!saved.comments.contains_key(&17));
+            assert_eq!(saved.types.local_variables[&16].len(), 1);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

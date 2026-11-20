@@ -114,8 +114,11 @@ The MCP server exposes tools for AI agents to interact with a loaded binary:
 | `get_cfg` | Get control flow graph for a function |
 | `get_strings` | Get discovered strings (with filter) |
 | `submit_rename` | Propose a function rename (requires approval) |
-| `add_comment` | Add or remove a comment at an address |
-| `save_project` | Save the current project to a file |
+| `add_comment` | Propose adding or removing a comment |
+| `rewrite_il` | Propose a local variable type |
+| `save_project` | Save the analysis and pending proposals to a project file |
+
+To review MCP proposals, call `save_project` with a new `.slre` filename and open that file in the GUI. Approve or reject each edit in the review window, then save the project. The File menu can reopen the review window.
 
 Resources are available at `sleuthre://project/{functions,strings,xrefs,comments,imports,exports,bookmarks}`.
 
