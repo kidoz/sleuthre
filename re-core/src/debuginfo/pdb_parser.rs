@@ -30,8 +30,7 @@ pub fn extract_pdb_info(
     arch: crate::arch::Architecture,
     image_base: u64,
 ) -> crate::Result<DebugInfo> {
-    let bytes = std::fs::read(pdb_path).map_err(Error::Io)?;
-    extract_pdb_from_bytes(&bytes, arch, image_base)
+    extract_pdb(std::fs::File::open(pdb_path)?, arch, image_base)
 }
 
 /// Extract debug info from in-memory PDB (MSF container) bytes.
@@ -40,9 +39,16 @@ pub fn extract_pdb_from_bytes(
     arch: crate::arch::Architecture,
     image_base: u64,
 ) -> crate::Result<DebugInfo> {
-    let cursor = std::io::Cursor::new(bytes);
+    extract_pdb(std::io::Cursor::new(bytes), arch, image_base)
+}
+
+pub(crate) fn extract_pdb<'s>(
+    source: impl pdb::Source<'s> + 's,
+    arch: crate::arch::Architecture,
+    image_base: u64,
+) -> crate::Result<DebugInfo> {
     let mut pdb =
-        PDB::open(cursor).map_err(|e| Error::DebugInfo(format!("PDB open error: {}", e)))?;
+        PDB::open(source).map_err(|e| Error::DebugInfo(format!("PDB open error: {}", e)))?;
 
     // Maps section-relative symbol offsets to RVAs. Without it, symbol
     // addresses below would be wrong (raw `offset.offset` drops the section).

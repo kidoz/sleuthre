@@ -17,3 +17,4 @@ uuid = { workspace = true }
 petgraph = { workspace = true }
 rhai = { workspace = true }
 egui_dock = { workspace = true }
+tempfile = "3"

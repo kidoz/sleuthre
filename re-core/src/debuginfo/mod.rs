@@ -1,5 +1,6 @@
 mod dwarf;
 mod pdb_parser;
+pub(crate) use pdb_parser::extract_pdb;
 mod source_map;
 mod type_mapper;
 pub mod unwind;

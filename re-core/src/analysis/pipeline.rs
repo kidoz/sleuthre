@@ -179,6 +179,66 @@ fn platform_string(arch: Architecture, format: BinaryFormat) -> String {
     format!("{}_{}", os, arch_str)
 }
 
+/// Resolve CodeView names beside the selected PE, including Windows paths
+/// encountered on Unix. Only the leaf is ever passed to filesystem APIs.
+fn sibling_pdb_info(
+    binary: &Path,
+    embedded: Option<&Path>,
+    arch: Architecture,
+    image_base: u64,
+) -> debuginfo::DebugInfo {
+    let fallback = binary.with_extension("pdb");
+    let fallback_name = fallback.file_name().and_then(|s| s.to_str());
+    let embedded_name = embedded
+        .and_then(Path::to_str)
+        .and_then(|s| s.rsplit(['/', '\\']).next())
+        .filter(|name| Some(*name) != fallback_name);
+    for name in [embedded_name, fallback_name].into_iter().flatten() {
+        if let Some(path) = sibling_pdb_path(binary, name)
+            && let Ok(file) = open_regular_sibling(&path)
+            && let Ok(info) = debuginfo::extract_pdb(file, arch, image_base)
+        {
+            return info;
+        }
+    }
+    debuginfo::DebugInfo::default()
+}
+
+fn sibling_pdb_path(binary: &Path, name: &str) -> Option<PathBuf> {
+    (crate::formats::filename::is_safe_file_name(name)
+        && name.to_ascii_lowercase().ends_with(".pdb"))
+    .then(|| binary.with_file_name(name))
+}
+
+fn open_regular_sibling(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            // FILE_ATTRIBUTE_REPARSE_POINT
+            return Err(std::io::Error::other("PDB is a reparse point"));
+        }
+    }
+    if !metadata.is_file() {
+        return Err(std::io::Error::other("PDB is not a regular file"));
+    }
+    Ok(file)
+}
+
 /// Run the full analysis pipeline on a binary file.
 ///
 /// `on_progress` is called at each stage; pass `|_| {}` to ignore progress.
@@ -352,33 +412,14 @@ fn analyze_loaded_with_bytes(
         on_progress(AnalysisStage::ExtractingDebugInfo);
         debug_info = debuginfo::extract_debug_info(raw_bytes, loaded.arch).unwrap_or_default();
 
-        // PDB resolution chain:
-        //   1. Path embedded in the PE debug directory (loaded.debug_info_path).
-        //   2. Same filename next to the PE (handles relocated builds).
-        //   3. <basename>.pdb sibling — covers stripped binaries whose PE no
-        //      longer references the .pdb but it ships beside the EXE anyway.
-        let mut pdb_candidates: Vec<PathBuf> = Vec::new();
-        if let Some(ref pdb_path) = loaded.debug_info_path {
-            if let Some(parent) = path.parent()
-                && let Some(name) = pdb_path.file_name()
-            {
-                pdb_candidates.push(parent.join(name));
-            }
-            pdb_candidates.push(pdb_path.clone());
+        if loaded.format == BinaryFormat::Pe {
+            pdb_debug = sibling_pdb_info(
+                path,
+                loaded.debug_info_path.as_deref(),
+                loaded.arch,
+                loaded.image_base,
+            );
         }
-        if loaded.format == BinaryFormat::Pe
-            && let Some(stem) = path.file_stem()
-        {
-            let sibling = path.with_file_name(format!("{}.pdb", stem.to_string_lossy()));
-            pdb_candidates.push(sibling);
-        }
-        pdb_debug = pdb_candidates
-            .into_iter()
-            .find(|p| p.exists())
-            .map(|p| {
-                debuginfo::extract_pdb_info(&p, loaded.arch, loaded.image_base).unwrap_or_default()
-            })
-            .unwrap_or_default();
     }
 
     for di in [&debug_info, &pdb_debug] {
@@ -796,6 +837,46 @@ pub fn reanalyze_with_cancellation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_pdb_candidates_are_sibling_files_only() {
+        let binary = Path::new("samples").join("program.exe");
+        assert_eq!(
+            sibling_pdb_path(&binary, "program.PDB"),
+            Some(binary.with_file_name("program.PDB"))
+        );
+        for name in [
+            "../symbols.pdb",
+            r"other\symbols.pdb",
+            "NUL.pdb",
+            "program.txt",
+            "program.pdb:stream",
+        ] {
+            assert!(sibling_pdb_path(&binary, name).is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_pdb_open_refuses_links_and_directories() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir(&dir).unwrap();
+        let regular = dir.join("regular.pdb");
+        std::fs::write(&regular, b"debug data").unwrap();
+        let link = dir.join("linked.pdb");
+        std::os::unix::fs::symlink(&regular, &link).unwrap();
+        assert_eq!(
+            open_regular_sibling(&regular)
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .len(),
+            10
+        );
+        assert!(open_regular_sibling(&link).is_err());
+        assert!(open_regular_sibling(&dir).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn stage_display() {

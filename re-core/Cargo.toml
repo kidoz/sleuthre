@@ -22,6 +22,9 @@ pdb = { workspace = true }
 rhai = { workspace = true }
 flate2 = "1.1"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 # The `write` feature lets tests synthesize DWARF sections in memory instead of

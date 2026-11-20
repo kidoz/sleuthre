@@ -1,4 +1,23 @@
 use eframe::egui;
+use re_core::formats::filename::is_safe_file_name;
+use std::io::Write;
+use std::path::Path;
+
+fn write_new_entry(directory: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+    if !is_safe_file_name(name) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid archive filename",
+        ));
+    }
+    // Publish complete files only. Flat names keep every destination directly
+    // under the selected folder; persist_noclobber refuses existing links too.
+    let mut file = tempfile::NamedTempFile::new_in(directory)?;
+    file.write_all(bytes)?;
+    file.persist_noclobber(directory.join(name))?;
+    Ok(())
+}
+
 use re_core::formats::archive::ArchiveEntryType;
 
 use crate::app::{SleuthreApp, ToastKind};
@@ -498,7 +517,11 @@ impl SleuthreApp {
         let entry_name = entry.name.clone();
 
         let Some(save_path) = rfd::FileDialog::new()
-            .set_file_name(&entry_name)
+            .set_file_name(if is_safe_file_name(&entry_name) {
+                &entry_name
+            } else {
+                "entry.bin"
+            })
             .save_file()
         else {
             return;
@@ -547,8 +570,7 @@ impl SleuthreApp {
             }
             match format.extract(data, entry) {
                 Ok(bytes) => {
-                    let dest = out_dir.join(&entry.name);
-                    if std::fs::write(&dest, &bytes).is_ok() {
+                    if write_new_entry(&out_dir, &entry.name, &bytes).is_ok() {
                         extracted_count += 1;
                     } else {
                         error_count += 1;
@@ -561,7 +583,11 @@ impl SleuthreApp {
         }
 
         self.add_toast(
-            ToastKind::Success,
+            if error_count == 0 {
+                ToastKind::Success
+            } else {
+                ToastKind::Warning
+            },
             format!(
                 "Extracted {} files to '{}' ({} errors)",
                 extracted_count,
@@ -629,4 +655,28 @@ fn format_hex_preview(data: &[u8], max_bytes: usize) -> String {
         output.push_str(&format!("... ({} more bytes)\n", data.len() - limit));
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extraction_only_publishes_new_files_in_the_output_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let out = root.path().join("output");
+        std::fs::create_dir(&out).unwrap();
+        write_new_entry(&out, "image.bmp", b"original").unwrap();
+        assert!(write_new_entry(&out, "image.bmp", b"replacement").is_err());
+        assert!(write_new_entry(&out, "../other", b"data").is_err());
+        assert_eq!(std::fs::read(out.join("image.bmp")).unwrap(), b"original");
+        assert!(!root.path().join("other").exists());
+        #[cfg(unix)]
+        {
+            let other = root.path().join("other");
+            std::os::unix::fs::symlink(&other, out.join("alias")).unwrap();
+            assert!(write_new_entry(&out, "alias", b"data").is_err());
+            assert!(!other.exists());
+        }
+    }
 }
