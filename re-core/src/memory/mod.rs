@@ -129,8 +129,12 @@ impl MemoryMap {
 
     /// Search for a byte pattern in all segments. Wildcards represented as None.
     pub fn search_bytes(&self, pattern: &[Option<u8>]) -> Vec<u64> {
+        self.search_bytes_limited(pattern, usize::MAX)
+    }
+
+    pub fn search_bytes_limited(&self, pattern: &[Option<u8>], limit: usize) -> Vec<u64> {
         let mut results = Vec::new();
-        if pattern.is_empty() {
+        if limit == 0 || pattern.is_empty() {
             return results;
         }
         for segment in &self.segments {
@@ -149,6 +153,9 @@ impl MemoryMap {
                 }
                 if matched {
                     results.push(segment.start + i as u64);
+                    if results.len() == limit {
+                        return results;
+                    }
                 }
             }
         }
@@ -194,6 +201,16 @@ mod tests {
             data: vec![0u8; size as usize],
             permissions: Permissions::READ,
         }
+    }
+
+    #[test]
+    fn limited_search_returns_first_matches_across_segments() {
+        let mut map = MemoryMap::default();
+        map.add_segment(make_segment("a", 0x100, 2)).unwrap();
+        map.add_segment(make_segment("b", 0x200, 3)).unwrap();
+        assert!(map.search_bytes_limited(&[None], 0).is_empty());
+        assert_eq!(map.search_bytes_limited(&[None], 3), [0x100, 0x101, 0x200]);
+        assert_eq!(map.search_bytes(&[None]).len(), 5);
     }
 
     #[test]

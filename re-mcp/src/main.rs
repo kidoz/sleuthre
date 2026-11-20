@@ -361,7 +361,7 @@ impl McpServer {
                                 "type": "object",
                                 "properties": {
                                     "pattern": { "type": "string" },
-                                    "limit": { "type": "number" }
+                                    "limit": { "type": "integer", "minimum": 0, "maximum": MAX_SEARCH_RESULTS }
                                 },
                                 "required": ["pattern"]
                             }
@@ -845,9 +845,8 @@ impl McpServer {
                     }
                     let results: Vec<String> = project
                         .memory_map
-                        .search_bytes(&pattern)
+                        .search_bytes_limited(&pattern, limit)
                         .into_iter()
-                        .take(limit)
                         .map(|addr| format!("0x{:x}", addr))
                         .collect();
                     tool_result(&id, &results)
@@ -1398,6 +1397,19 @@ mod tests {
         assert!(names.contains(&"open_binary"));
         assert!(names.contains(&"get_disasm"));
         assert!(names.contains(&"get_xrefs"));
+    }
+
+    #[test]
+    fn search_rejects_limits_outside_the_advertised_range() {
+        let mut server = McpServer::new();
+        for limit in [json!(1001), json!(-1), json!(0.5)] {
+            let response = server.call_tool(
+                "search_memory",
+                json!({"limit":limit,"pattern":"00"}),
+                json!(1),
+            );
+            assert_eq!(response["error"]["code"], -32602);
+        }
     }
 
     #[test]
