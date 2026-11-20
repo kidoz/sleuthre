@@ -423,7 +423,11 @@ impl SleuthreApp {
                             }
                         }
                     });
-                if ui.button("Save").clicked() {
+                let has_project = self.project.is_some();
+                if ui
+                    .add_enabled(has_project, egui::Button::new("Save"))
+                    .clicked()
+                {
                     self.save_project();
                 }
                 ui.separator();
@@ -450,7 +454,6 @@ impl SleuthreApp {
                     self.search_active = true;
                 }
                 ui.separator();
-                let has_project = self.project.is_some();
                 if ui
                     .add_enabled(has_project, egui::Button::new("Back"))
                     .clicked()
@@ -863,11 +866,17 @@ impl SleuthreApp {
                     self.open_binary(ui.ctx());
                     ui.close();
                 }
-                if ui.button("Save Project...").clicked() {
+                if ui
+                    .add_enabled(self.project.is_some(), egui::Button::new("Save Project..."))
+                    .clicked()
+                {
                     self.save_project();
                     ui.close();
                 }
-                if ui.button("Load Project...").clicked() {
+                if ui
+                    .add_enabled(!self.is_loading(), egui::Button::new("Load Project..."))
+                    .clicked()
+                {
                     self.load_project();
                     ui.close();
                 }

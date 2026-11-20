@@ -614,7 +614,7 @@ impl Default for SleuthreApp {
             script_engine: re_core::scripting::ScriptEngine::new(),
             script_input: String::new(),
             last_save_time: 0.0,
-            output_panel_visible: true,
+            output_panel_visible: false,
             output_panel_height: 150.0,
             func_sort_column: FunctionSortColumn::Address,
             func_sort_ascending: true,

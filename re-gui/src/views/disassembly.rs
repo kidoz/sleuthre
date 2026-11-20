@@ -26,8 +26,29 @@ impl SleuthreApp {
     }
 
     pub(crate) fn show_disassembly(&mut self, ui: &mut egui::Ui) {
-        if self.project.is_none() || self.disasm.is_none() {
-            ui.label("No binary loaded");
+        if self.project.is_none() {
+            let can_open = !self.is_loading();
+            ui.vertical_centered(|ui| {
+                ui.add_space(32.0);
+                ui.heading("No binary loaded");
+                ui.add_space(8.0);
+                if ui
+                    .add_enabled(can_open, egui::Button::new("Open Binary…"))
+                    .clicked()
+                {
+                    self.open_binary(ui.ctx());
+                }
+                if ui
+                    .add_enabled(can_open, egui::Button::new("Load Project…"))
+                    .clicked()
+                {
+                    self.load_project();
+                }
+            });
+            return;
+        }
+        if self.disasm.is_none() {
+            ui.label("Disassembly is unavailable for this architecture.");
             return;
         }
 
