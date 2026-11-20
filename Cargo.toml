@@ -25,7 +25,11 @@ env_logger = "0.11"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 goblin = "0.10"
-capstone = "0.14"
+# Match the backends in re-core's Disassembler. Recheck the bundled C engine
+# when upgrading: capstone-sys 0.18 ships 5.0.6, upstream fixes landed in 5.0.9.
+capstone = { version = "0.14", default-features = false, features = [
+    "std", "full", "arch_x86", "arch_arm", "arch_arm64", "arch_mips", "arch_riscv",
+] }
 rusqlite = { version = "0.43", features = ["bundled"] }
 petgraph = "0.8"
 bitflags = { version = "2.13", features = ["serde"] }
