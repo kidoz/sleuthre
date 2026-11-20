@@ -1206,6 +1206,9 @@ impl Project {
         {
             project.image_base = base;
         }
+        if project.binary_format == BinaryFormat::MachO && !project.strings.strings.is_empty() {
+            project.strings.scan_macho_cstrings(&project.memory_map);
+        }
 
         project.saved_revision = db.get_metadata("revision")?;
         if let Some(actions) = db.get_metadata("pending_actions")? {

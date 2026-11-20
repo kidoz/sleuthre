@@ -1,6 +1,7 @@
+use object::read::macho::{MachHeader, Section, Segment};
 use serde::{Deserialize, Serialize};
 
-use crate::memory::Permissions;
+use crate::memory::{MemoryMap, Permissions};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StringEncoding {
@@ -39,15 +40,105 @@ impl Default for StringsManager {
 }
 
 impl StringsManager {
-    pub fn scan_memory(&mut self, memory: &crate::memory::MemoryMap) {
+    pub fn scan_memory(&mut self, memory: &MemoryMap) {
         self.strings.clear();
         for segment in &memory.segments {
             if !self.scan_executable && segment.permissions.contains(Permissions::EXECUTE) {
                 continue;
             }
-            self.scan_ascii(segment);
+            self.scan_ascii(&segment.data, segment.start, &segment.name);
             self.scan_utf16le(segment);
             self.scan_utf16be(segment);
+        }
+        if !self.scan_executable {
+            self.scan_macho_cstrings(memory);
+        }
+    }
+
+    pub(crate) fn scan_macho_cstrings(&mut self, memory: &MemoryMap) {
+        // Mach-O maps the header and C string literals alongside code in __TEXT.
+        // Read section headers from the mapping so saved projects work without
+        // the original binary or a second copy of the mapped sections.
+        let Some(text) = memory
+            .segments
+            .iter()
+            .find(|segment| segment.name == "__TEXT")
+        else {
+            return;
+        };
+        let data = text.data.as_slice();
+        let original_len = self.strings.len();
+        if let Ok(header) = object::macho::MachHeader64::<object::Endianness>::parse(data, 0) {
+            self.scan_macho_cstring_sections(header, data, memory);
+        } else if let Ok(header) = object::macho::MachHeader32::<object::Endianness>::parse(data, 0)
+        {
+            self.scan_macho_cstring_sections(header, data, memory);
+        }
+        if original_len > 0 && self.strings.len() > original_len {
+            let mut literals = self.strings.split_off(original_len);
+            let mut addresses: std::collections::HashSet<_> =
+                self.strings.iter().map(|string| string.address).collect();
+            literals.retain(|string| addresses.insert(string.address));
+            self.strings.extend(literals);
+        }
+    }
+
+    fn scan_macho_cstring_sections<M: MachHeader>(
+        &mut self,
+        header: &M,
+        data: &[u8],
+        memory: &MemoryMap,
+    ) {
+        let Ok(endian) = header.endian() else {
+            return;
+        };
+        let Ok(mut commands) = header.load_commands(endian, data, 0) else {
+            return;
+        };
+        let mut ranges = Vec::new();
+        while let Ok(Some(command)) = commands.next() {
+            let Ok(Some((segment, section_headers))) = M::Segment::from_command(command) else {
+                continue;
+            };
+            let start = segment.vmaddr(endian).into();
+            let Some(mapping) = memory.segment_at(start).filter(|mapping| {
+                mapping.start == start && mapping.permissions.contains(Permissions::EXECUTE)
+            }) else {
+                continue;
+            };
+            let Ok(sections) = segment.sections(endian, section_headers) else {
+                continue;
+            };
+            for section in sections {
+                if section.flags(endian).typ() != object::macho::S_CSTRING_LITERALS {
+                    continue;
+                }
+                let address = section.addr(endian).into();
+                let size: u64 = section.size(endian).into();
+                if let Some(offset) = address
+                    .checked_sub(start)
+                    .and_then(|offset| usize::try_from(offset).ok())
+                    && (offset as u64)
+                        .checked_add(size)
+                        .is_some_and(|end| end <= mapping.size)
+                    && let Ok(size) = usize::try_from(size)
+                    && let Some(bytes) =
+                        mapping.data.get(offset..).and_then(|tail| tail.get(..size))
+                    && let Ok(name) = std::str::from_utf8(section.name())
+                {
+                    ranges.push((address, name, bytes));
+                }
+            }
+        }
+        // Bound scanning to the mapped data even if section headers overlap.
+        ranges
+            .sort_unstable_by_key(|&(address, _, bytes)| (address, std::cmp::Reverse(bytes.len())));
+        let mut previous_end = 0;
+        for (address, name, bytes) in ranges {
+            if address >= previous_end {
+                self.scan_ascii(bytes, address, name);
+                previous_end = address + bytes.len() as u64;
+            }
         }
     }
 
@@ -55,11 +146,10 @@ impl StringsManager {
         (0x20..=0x7E).contains(&byte) || byte == b'\t' || byte == b'\n' || byte == b'\r'
     }
 
-    fn scan_ascii(&mut self, segment: &crate::memory::MemorySegment) {
+    fn scan_ascii(&mut self, data: &[u8], base: u64, section_name: &str) {
         let mut run_start = 0usize;
         let mut in_run = false;
 
-        let data = &segment.data;
         for (offset, &byte) in data.iter().enumerate() {
             if Self::is_printable_ascii(byte) {
                 if !in_run {
@@ -72,10 +162,10 @@ impl StringsManager {
                     && let Ok(s) = std::str::from_utf8(run)
                 {
                     self.strings.push(DiscoveredString {
-                        address: segment.start + run_start as u64,
+                        address: base + run_start as u64,
                         value: s.to_string(),
                         length: run.len(),
-                        section_name: segment.name.clone(),
+                        section_name: section_name.to_owned(),
                         encoding: StringEncoding::Ascii,
                     });
                 }
@@ -90,10 +180,10 @@ impl StringsManager {
                 && let Ok(s) = std::str::from_utf8(run)
             {
                 self.strings.push(DiscoveredString {
-                    address: segment.start + run_start as u64,
+                    address: base + run_start as u64,
                     value: s.to_string(),
                     length: run.len(),
-                    section_name: segment.name.clone(),
+                    section_name: section_name.to_owned(),
                     encoding: StringEncoding::Ascii,
                 });
             }
@@ -350,4 +440,53 @@ mod tests {
         assert_eq!(ascii.len(), 1);
         assert_eq!(ascii[0].value, "TestEnd");
     }
+}
+#[test]
+fn test_macho_cstrings_in_executable_segment() {
+    const BASE: u64 = 0x1000;
+    const STRING_OFFSET: usize = 184;
+    let mut data = vec![0; STRING_OFFSET];
+    data.extend_from_slice(b"embedded literal\0unrelated code bytes\0");
+    let mapped_size = data.len() as u64;
+
+    // Header and one LC_SEGMENT_64 command with a single __cstring section.
+    for (offset, value) in [
+        (0, 0xfeed_facf_u32), // 64-bit magic
+        (16, 1),              // one command
+        (20, 152),            // segment command plus section header
+        (32, 0x19),           // LC_SEGMENT_64
+        (36, 152),            // command size
+        (96, 1),              // one section
+        (168, 2),             // S_CSTRING_LITERALS
+    ] {
+        data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    data[40..46].copy_from_slice(b"__TEXT");
+    data[56..64].copy_from_slice(&BASE.to_le_bytes());
+    data[64..72].copy_from_slice(&mapped_size.to_le_bytes());
+    data[104..113].copy_from_slice(b"__cstring");
+    data[120..126].copy_from_slice(b"__TEXT");
+    let address = BASE + STRING_OFFSET as u64;
+    data[136..144].copy_from_slice(&address.to_le_bytes());
+    data[144..152].copy_from_slice(&17_u64.to_le_bytes());
+
+    let mut memory = MemoryMap::default();
+    memory
+        .add_segment(crate::memory::MemorySegment {
+            name: "__TEXT".into(),
+            start: BASE,
+            size: mapped_size,
+            data,
+            permissions: Permissions::READ | Permissions::EXECUTE,
+        })
+        .unwrap();
+    let mut strings = StringsManager::default();
+    strings.scan_memory(&memory);
+    assert_eq!(strings.strings.len(), 1);
+    assert_eq!(strings.strings[0].value, "embedded literal");
+    assert_eq!(strings.strings[0].address, address);
+    assert_eq!(strings.strings[0].section_name, "__cstring");
+
+    strings.scan_macho_cstrings(&memory);
+    assert_eq!(strings.strings.len(), 1);
 }
