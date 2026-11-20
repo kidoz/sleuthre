@@ -3104,7 +3104,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
- "tracing",
  "uuid",
 ]
 
@@ -3113,7 +3112,6 @@ name = "re-gui"
 version = "0.7.1"
 dependencies = [
  "eframe",
- "egui",
  "egui_dock",
  "env_logger",
  "log",
@@ -3121,7 +3119,6 @@ dependencies = [
  "re-core",
  "rfd",
  "rhai",
- "serde",
  "serde_json",
  "tempfile",
  "uuid",
@@ -3132,9 +3129,6 @@ name = "re-mcp"
 version = "0.7.1"
 dependencies = [
  "anyhow",
- "capstone",
- "env_logger",
- "log",
  "re-core",
  "serde",
  "serde_json",

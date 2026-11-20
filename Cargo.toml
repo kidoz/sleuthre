@@ -16,7 +16,6 @@ repository = "https://github.com/kidoz/sleuthre"
 description = "An open-source reverse engineering desktop application."
 
 [workspace.dependencies]
-egui = "0.36"
 eframe = "0.36"
 re-core = { path = "re-core" }
 anyhow = "1.0"
@@ -29,7 +28,6 @@ goblin = "0.10"
 capstone = "0.14"
 rusqlite = { version = "0.43", features = ["bundled"] }
 petgraph = "0.8"
-tracing = "0.1"
 bitflags = { version = "2.13", features = ["serde"] }
 rfd = "0.18"
 uuid = { version = "1.29", features = ["v4", "serde"] }
