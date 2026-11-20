@@ -12,7 +12,7 @@
 - RIP-relative memory operands resolve to their absolute targets, producing data and call xrefs and folded operands in the x86 lifter instead of opaque `rip`-relative expressions
 - String scan skips executable segments by default, keeping code bytes out of the strings view
 - Signature matching: generic prologue shapes dropped from the built-in signature databases, and prologue patterns only match at decoded instruction starts
-- Dependencies refreshed to their latest compatible versions; benchmarks moved to criterion 0.8
+- Dependencies upgraded to their latest releases: rusqlite 0.43, object 0.41, rfd 0.18, rhai 1.27, uuid 1.29, bitflags 2.13, and flate2 1.1, plus compatible patch updates throughout; `egui`/`eframe` stay on 0.36 until `egui_dock` supports 0.37; benchmarks moved to criterion 0.8
 
 ### Fixed
 

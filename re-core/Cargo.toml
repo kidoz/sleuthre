@@ -20,7 +20,7 @@ gimli = { workspace = true }
 object = { workspace = true }
 pdb = { workspace = true }
 rhai = { workspace = true }
-flate2 = "1.0"
+flate2 = "1.1"
 
 [dev-dependencies]
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
