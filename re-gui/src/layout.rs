@@ -97,6 +97,7 @@ impl eframe::App for SleuthreApp {
 
         if now - self.last_save_time > 300.0 {
             // 5 minutes
+            self.remember_view_address();
             if let Some(ref mut project) = self.project {
                 match project.autosave() {
                     Ok(path) => self.add_toast(

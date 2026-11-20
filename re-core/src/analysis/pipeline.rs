@@ -310,6 +310,10 @@ fn analyze_loaded_with_bytes(
     project.arch = loaded.arch;
     project.binary_format = loaded.format;
     project.image_base = loaded.image_base;
+    project.view_address = project
+        .memory_map
+        .contains_address(loaded.entry_point)
+        .then_some(loaded.entry_point);
 
     // --- Disassembler (created and dropped in this scope) ---
     let disasm = Disassembler::new(loaded.arch).ok();

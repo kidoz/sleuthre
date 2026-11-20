@@ -140,6 +140,8 @@ pub struct Project {
     /// PE load/image base (0 for non-PE); used to relate PDB/external symbol
     /// offsets to the loaded segment addresses.
     pub image_base: u64,
+    /// Preferred address when reopening the project in the UI.
+    pub view_address: Option<u64>,
     pub struct_overlays: Vec<StructOverlay>,
     pub debug_profiles: Vec<DebugProfile>,
     /// Struct-pointer inference evidence, reviewable in the UI. Statuses
@@ -316,6 +318,7 @@ impl Project {
             arch: Architecture::X86_64,
             binary_format: BinaryFormat::Raw,
             image_base: 0,
+            view_address: None,
             struct_overlays: Vec::new(),
             debug_profiles: Vec::new(),
             struct_candidates: Vec::new(),
@@ -944,6 +947,9 @@ impl Project {
                     .map_err(|e| Error::Database(e.to_string()))?,
             )?;
             db.set_metadata("decompiler_version", DECOMPILER_CACHE_VERSION)?;
+            if let Some(address) = self.view_address {
+                db.set_metadata("view_address", &address.to_string())?;
+            }
 
             for seg in &self.memory_map.segments {
                 db.save_segment(seg)?;
@@ -1206,6 +1212,10 @@ impl Project {
         {
             project.image_base = base;
         }
+        project.view_address = db
+            .get_metadata("view_address")?
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|&address| project.memory_map.contains_address(address));
         if project.binary_format == BinaryFormat::MachO && !project.strings.strings.is_empty() {
             project.strings.scan_macho_cstrings(&project.memory_map);
         }
@@ -2211,7 +2221,7 @@ mod tests {
     }
 
     #[test]
-    fn save_load_preserves_arch_and_format() {
+    fn save_load_preserves_arch_format_and_view_address() {
         use crate::arch::Architecture;
         use crate::loader::BinaryFormat;
 
@@ -2222,12 +2232,23 @@ mod tests {
         p.arch = Architecture::Arm64;
         p.binary_format = BinaryFormat::Elf;
         p.image_base = 0x1_4000_0000;
+        p.memory_map
+            .add_segment(crate::memory::MemorySegment {
+                name: ".text".into(),
+                start: p.image_base,
+                size: 16,
+                data: vec![0; 16],
+                permissions: crate::memory::Permissions::READ | crate::memory::Permissions::EXECUTE,
+            })
+            .unwrap();
+        p.view_address = Some(p.image_base + 4);
         p.save(&path).unwrap();
 
         let loaded = Project::load(&path).unwrap();
         assert_eq!(loaded.arch, Architecture::Arm64);
         assert_eq!(loaded.binary_format, BinaryFormat::Elf);
         assert_eq!(loaded.image_base, 0x1_4000_0000);
+        assert_eq!(loaded.view_address, Some(0x1_4000_0004));
         let _ = std::fs::remove_file(&path);
     }
 

@@ -841,7 +841,8 @@ impl SleuthreApp {
                     // Create a fresh Disassembler on the main thread
                     // (Capstone is !Send so it cannot come from the worker)
                     self.disasm = Disassembler::new(result.project.arch).ok();
-                    self.current_address = result.entry_point;
+                    self.current_address =
+                        project_start_address(&result.project).unwrap_or(result.entry_point);
                     self.func_xref_counts = result.func_xref_counts;
                     if !result.findings.is_empty() {
                         self.add_toast(
@@ -856,8 +857,7 @@ impl SleuthreApp {
                     );
                     self.output.push_str(&result.summary);
                     self.output.push('\n');
-                    self.project = Some(result.project);
-                    self.cached_func_list_dirty = true;
+                    self.set_project(result.project);
                     // Compute entropy map
                     if let Some(ref project) = self.project {
                         self.entropy_map = Some(re_core::analysis::entropy::compute_entropy_map(
@@ -876,7 +876,6 @@ impl SleuthreApp {
                         self.debugger_unwinder =
                             re_core::debuginfo::unwind::StackUnwinder::from_bytes(&bytes);
                     }
-                    self.update_cfg();
                     self.load_receiver = None;
                     self.load_stage = None;
                     self.load_cancel = None;
@@ -1018,9 +1017,11 @@ impl SleuthreApp {
         }
 
         let file_dialog = rfd::FileDialog::new().add_filter("Sleuthre Project", &["slre"]);
-        if let Some(path) = file_dialog.save_file()
-            && let Some(ref mut project) = self.project
-        {
+        if let Some(path) = file_dialog.save_file() {
+            self.remember_view_address();
+            let Some(project) = &mut self.project else {
+                return;
+            };
             match project.save(&path) {
                 Ok(()) => {
                     self.add_toast(
@@ -1035,6 +1036,14 @@ impl SleuthreApp {
                     self.output.push_str(&format!("Save error: {}\n", e));
                 }
             }
+        }
+    }
+
+    pub(crate) fn remember_view_address(&mut self) {
+        if let Some(project) = &mut self.project
+            && project.memory_map.contains_address(self.current_address)
+        {
+            project.view_address = Some(self.current_address);
         }
     }
 
@@ -1053,9 +1062,8 @@ impl SleuthreApp {
                         .push_str(&format!("Project loaded from '{}'.\n", path.display()));
                     self.disasm = Disassembler::new(project.arch).ok();
                     self.approval_queue_open = !project.pending_actions.is_empty();
-                    self.project = Some(project);
-                    self.cached_func_list_dirty = true;
-                    self.update_cfg();
+                    self.current_address = project_start_address(&project).unwrap_or_default();
+                    self.set_project(project);
                 }
                 Err(e) => {
                     self.add_toast(ToastKind::Error, format!("Load error: {}", e));
@@ -1065,7 +1073,22 @@ impl SleuthreApp {
         }
     }
 
+    fn set_project(&mut self, mut project: Project) {
+        if project.memory_map.contains_address(self.current_address) {
+            project.navigate_to(self.current_address);
+        }
+        self.project = Some(project);
+        self.cached_func_list_dirty = true;
+        self.rename_address = None;
+        self.comment_address = None;
+        self.xref_address = None;
+        self.search_results.clear();
+        self.search_performed = false;
+        self.update_cfg();
+    }
+
     pub(crate) fn update_cfg(&mut self) {
+        self.focused_address = None;
         if let (Some(project), Some(disasm)) = (&self.project, &self.disasm) {
             let mut cfg = ControlFlowGraph::new();
             let _ = cfg.build_for_function(&project.memory_map, disasm, self.current_address);
@@ -1177,4 +1200,33 @@ impl SleuthreApp {
         }
         self.active_tab = tab;
     }
+}
+
+fn project_start_address(project: &Project) -> Option<u64> {
+    project
+        .view_address
+        .or_else(|| {
+            let mut mapped = project
+                .functions
+                .functions
+                .values()
+                .filter(|function| project.memory_map.is_executable(function.start_address));
+            mapped
+                .clone()
+                .find(|function| matches!(function.name.as_str(), "main" | "_main" | "_start"))
+                .or_else(|| mapped.next())
+                .map(|function| function.start_address)
+        })
+        .or_else(|| {
+            let segments = &project.memory_map.segments;
+            segments
+                .iter()
+                .find(|segment| {
+                    segment
+                        .permissions
+                        .contains(re_core::memory::Permissions::EXECUTE)
+                })
+                .or_else(|| segments.first())
+                .map(|segment| segment.start)
+        })
 }
