@@ -751,6 +751,7 @@ impl SleuthreApp {
             .collapsible(false)
             .default_width(400.0)
             .show(ctx, |ui| {
+                let previous_mode = self.search_mode;
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.search_mode, SearchMode::String, "String");
                     ui.selectable_value(
@@ -766,15 +767,22 @@ impl SleuthreApp {
                     SearchMode::HexPattern => "e.g. 48 89 e5 ?? ??",
                     SearchMode::Address => "e.g. 0x401000",
                 };
-                ui.horizontal(|ui| {
-                    ui.label("Query:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.search_input)
-                            .hint_text(hint)
-                            .desired_width(280.0),
-                    );
-                });
+                let query = ui
+                    .horizontal(|ui| {
+                        ui.label("Query:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.search_input)
+                                .hint_text(hint)
+                                .desired_width(280.0),
+                        )
+                    })
+                    .inner;
+                if query.changed() || previous_mode != self.search_mode {
+                    self.search_performed = false;
+                    self.search_results.clear();
+                }
                 if ui.button("Search").clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    self.search_performed = true;
                     self.search_results.clear();
                     if let Some(ref project) = self.project {
                         match self.search_mode {
@@ -832,7 +840,13 @@ impl SleuthreApp {
                         }
                     }
                 }
-                if !self.search_results.is_empty() {
+                if self.search_performed && self.search_results.is_empty() {
+                    ui.label(if self.project.is_some() {
+                        "No matches found."
+                    } else {
+                        "Open a binary or load a project to search."
+                    });
+                } else if !self.search_results.is_empty() {
                     ui.separator();
                     ui.label(format!("{} results:", self.search_results.len()));
                     let mut jump_to = None;

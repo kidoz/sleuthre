@@ -50,6 +50,7 @@ pub(crate) struct SleuthreApp {
     pub(crate) search_active: bool,
     pub(crate) search_input: String,
     pub(crate) search_results: Vec<(u64, String)>,
+    pub(crate) search_performed: bool,
     pub(crate) search_mode: SearchMode,
 
     pub(crate) structure_filter: String,
@@ -567,6 +568,7 @@ impl Default for SleuthreApp {
             search_active: false,
             search_input: String::new(),
             search_results: Vec::new(),
+            search_performed: false,
             search_mode: SearchMode::String,
             structure_filter: String::new(),
             call_graph_filter: String::new(),
