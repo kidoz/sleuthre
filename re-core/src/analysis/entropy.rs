@@ -27,7 +27,7 @@ pub fn shannon_entropy(data: &[u8]) -> f64 {
     if data.is_empty() {
         return 0.0;
     }
-    let mut counts = [0u32; 256];
+    let mut counts = [0usize; 256];
     for &b in data {
         counts[b as usize] += 1;
     }

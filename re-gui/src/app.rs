@@ -1,6 +1,7 @@
 use eframe::egui;
 use re_core::analysis::cfg::ControlFlowGraph;
 use re_core::analysis::pipeline::{AnalysisCancellation, AnalysisMode};
+use re_core::analysis::triage::TriageReport;
 use re_core::disasm::Disassembler;
 use re_core::plugin::{AnalysisFinding, PluginManager};
 use re_core::project::{ActionKind, PendingAction, Project};
@@ -96,6 +97,12 @@ pub(crate) struct SleuthreApp {
     pub(crate) create_enum_active: bool,
     pub(crate) new_enum_name: String,
     pub(crate) new_enum_variants: Vec<(String, String)>,
+
+    pub(crate) triage: Option<std::sync::Arc<TriageReport>>,
+    pub(crate) triage_export: Option<std::sync::mpsc::Receiver<std::io::Result<()>>>,
+    pub(crate) pending_triage_finding: Option<usize>,
+    pub(crate) hex_evidence: Option<std::ops::Range<u64>>,
+    pub(crate) scroll_to_evidence: bool,
 
     // Hex view editing
     pub(crate) hex_selected_addr: Option<u64>,
@@ -403,6 +410,7 @@ pub(crate) enum Tab {
     Bytecode,
     Debugger,
     InferenceEvidence,
+    Triage,
 }
 
 impl std::fmt::Display for Tab {
@@ -418,6 +426,7 @@ impl std::fmt::Display for Tab {
             Tab::Structures => write!(f, "Structures"),
             Tab::CallGraph => write!(f, "Call Graph"),
             Tab::Xrefs => write!(f, "Cross References"),
+            Tab::Triage => write!(f, "Triage"),
             Tab::Entropy => write!(f, "Entropy"),
             Tab::Signatures => write!(f, "Signatures"),
             Tab::Diff => write!(f, "Binary Diff"),
@@ -506,7 +515,12 @@ pub(crate) enum CommandAction {
 
 pub(crate) enum LoadProgress {
     Stage(String),
-    Done(std::result::Result<Box<re_core::analysis::pipeline::AnalysisResult>, String>),
+    Done(
+        std::result::Result<
+            Box<(re_core::analysis::pipeline::AnalysisResult, TriageReport)>,
+            String,
+        >,
+    ),
 }
 
 pub(crate) enum ReanalysisProgress {
@@ -608,6 +622,11 @@ impl Default for SleuthreApp {
             create_enum_active: false,
             new_enum_name: String::new(),
             new_enum_variants: Vec::new(),
+            triage: None,
+            triage_export: None,
+            pending_triage_finding: None,
+            hex_evidence: None,
+            scroll_to_evidence: false,
             hex_selected_addr: None,
             hex_edit_buffer: String::new(),
             toasts: Vec::new(),
@@ -773,7 +792,7 @@ impl SleuthreApp {
 
     pub(crate) fn open_binary(&mut self, ctx: &eframe::egui::Context) {
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("Executables", &["elf", "exe", "dll", "so", "bin"])
+            .add_filter("Executables", &["elf", "exe", "dll", "so", "bin", "pe"])
             .pick_file()
         else {
             return;
@@ -781,7 +800,7 @@ impl SleuthreApp {
 
         let (tx, rx) = std::sync::mpsc::channel();
         let ctx_clone = ctx.clone();
-        let config = re_core::analysis::pipeline::AnalysisConfig::for_mode(self.analysis_mode);
+        let mode = self.analysis_mode;
         let cancellation = AnalysisCancellation::new();
         let worker_cancellation = cancellation.clone();
 
@@ -790,9 +809,9 @@ impl SleuthreApp {
             // must not unwind past this thread without a Done message, or
             // the UI stays wedged in the loading state.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                re_core::analysis::pipeline::analyze_binary_with_config(
+                re_core::analysis::pipeline::analyze_binary_with_triage(
                     &path,
-                    &config,
+                    mode,
                     Some(&worker_cancellation),
                     |stage| {
                         let _ = tx.send(LoadProgress::Stage(stage.to_string()));
@@ -838,6 +857,7 @@ impl SleuthreApp {
                     self.load_stage = Some(s);
                 }
                 LoadProgress::Done(Ok(result)) => {
+                    let (result, report) = *result;
                     // Create a fresh Disassembler on the main thread
                     // (Capstone is !Send so it cannot come from the worker)
                     self.disasm = Disassembler::new(result.project.arch).ok();
@@ -857,6 +877,7 @@ impl SleuthreApp {
                     self.output.push_str(&result.summary);
                     self.output.push('\n');
                     self.set_project(result.project);
+                    self.triage = Some(std::sync::Arc::new(report));
                     self.plugin_findings = result.findings;
                     // Compute entropy map
                     if let Some(ref project) = self.project {
@@ -1076,6 +1097,9 @@ impl SleuthreApp {
             project.navigate_to(self.current_address);
         }
         self.project = Some(project);
+        self.triage = None;
+        self.pending_triage_finding = None;
+        self.hex_selected_addr = None;
         self.plugin_findings.clear();
         self.cached_func_list_dirty = true;
         self.rename_address = None;
@@ -1088,6 +1112,8 @@ impl SleuthreApp {
     }
 
     pub(crate) fn update_cfg(&mut self) {
+        self.hex_evidence = None;
+        self.scroll_to_evidence = false;
         self.focused_address = None;
         if let (Some(project), Some(disasm)) = (&self.project, &self.disasm) {
             let mut cfg = ControlFlowGraph::new();

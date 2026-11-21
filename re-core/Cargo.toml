@@ -8,6 +8,8 @@ license.workspace = true
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { version = "0.11", default-features = false }
+hex = "0.4"
 log = { workspace = true }
 goblin = { workspace = true }
 bitflags = { workspace = true }

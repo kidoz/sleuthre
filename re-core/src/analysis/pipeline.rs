@@ -258,6 +258,35 @@ pub fn analyze_binary_with_config(
     cancellation: Option<&AnalysisCancellation>,
     mut on_progress: impl FnMut(AnalysisStage),
 ) -> Result<AnalysisResult> {
+    analyze_file(path, config, cancellation, &mut on_progress).map(|(analysis, _)| analysis)
+}
+
+/// Analyze a binary and capture its immutable triage report from the same file read.
+/// Every built-in preset includes the string and constant scans used by the report.
+pub fn analyze_binary_with_triage(
+    path: &Path,
+    mode: AnalysisMode,
+    cancellation: Option<&AnalysisCancellation>,
+    on_progress: impl FnMut(AnalysisStage),
+) -> Result<(AnalysisResult, super::triage::TriageReport)> {
+    let (analysis, bytes) = analyze_file(
+        path,
+        &AnalysisConfig::for_mode(mode),
+        cancellation,
+        on_progress,
+    )?;
+    check_cancelled(cancellation)?;
+    let report = super::triage::TriageReport::from_analysis(&bytes, &analysis);
+    check_cancelled(cancellation)?;
+    Ok((analysis, report))
+}
+
+fn analyze_file(
+    path: &Path,
+    config: &AnalysisConfig,
+    cancellation: Option<&AnalysisCancellation>,
+    mut on_progress: impl FnMut(AnalysisStage),
+) -> Result<(AnalysisResult, Vec<u8>)> {
     // --- Load (read file once, reuse bytes for debug info later) ---
     check_cancelled(cancellation)?;
     on_progress(AnalysisStage::LoadingBinary);
@@ -265,7 +294,9 @@ pub fn analyze_binary_with_config(
     check_cancelled(cancellation)?;
     let loaded = loader::load_binary_from_bytes(&raw_bytes)?;
 
-    analyze_loaded_with_bytes(path, loaded, &raw_bytes, config, cancellation, on_progress)
+    let result =
+        analyze_loaded_with_bytes(path, loaded, &raw_bytes, config, cancellation, on_progress)?;
+    Ok((result, raw_bytes))
 }
 
 /// Run the full analysis pipeline on an already-loaded binary.

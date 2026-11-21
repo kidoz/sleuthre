@@ -44,6 +44,7 @@ impl TabViewer for SleuthreTabViewer<'_> {
             Tab::Graph => self.app.show_graph(ui),
             Tab::Decompiler => self.app.show_decompiler(ui),
             Tab::HexView => self.app.show_hex_view(ui),
+            Tab::Triage => self.app.show_triage(ui),
             Tab::Strings => self.app.show_strings(ui),
             Tab::Imports => self.app.show_imports(ui),
             Tab::Exports => self.app.show_exports(ui),
@@ -82,9 +83,21 @@ impl eframe::App for SleuthreApp {
 
         // Poll background loader
         self.poll_load();
+        self.poll_triage_export();
         self.poll_reanalysis();
 
         if self.trigger_decompile {
+            if let Some(address) = self.selected_address()
+                && let Some(project) = &self.project
+            {
+                let entry = project
+                    .functions
+                    .find_function_containing(address)
+                    .unwrap_or(address);
+                if entry != self.current_address {
+                    self.follow_reference(address, entry);
+                }
+            }
             self.focus_or_open_tab(Tab::Decompiler);
             self.decompile_current_function();
             self.trigger_decompile = false;
@@ -831,6 +844,7 @@ impl SleuthreApp {
             Tab::Graph,
             Tab::Decompiler,
             Tab::HexView,
+            Tab::Triage,
             Tab::Strings,
             Tab::Imports,
             Tab::Exports,
@@ -1096,6 +1110,7 @@ impl SleuthreApp {
                     ("Graph", Tab::Graph),
                     ("Pseudocode", Tab::Decompiler),
                     ("Hex View", Tab::HexView),
+                    ("Triage", Tab::Triage),
                     ("Strings", Tab::Strings),
                     ("Imports", Tab::Imports),
                     ("Exports", Tab::Exports),
@@ -2105,6 +2120,10 @@ impl SleuthreApp {
             .show_inside(ui, &mut viewer);
 
         self.dock_state = dock_state;
+        if let Some(index) = self.pending_triage_finding.take() {
+            self.open_triage_finding(index);
+            ui.ctx().request_repaint();
+        }
     }
 }
 

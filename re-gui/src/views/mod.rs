@@ -19,4 +19,5 @@ mod source_compare;
 mod strings;
 mod structures;
 mod tabular;
+mod triage;
 mod xrefs;

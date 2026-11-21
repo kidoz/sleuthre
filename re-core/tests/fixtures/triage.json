@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "sha256": "de9aebe81736dd7d3126e3cf189d0db51ca048609ba0d30908474da681678626",
+  "format": "Pe",
+  "architecture": "x86_64",
+  "entry_point": "0x140001000",
+  "entropy": 1.106195,
+  "segments": [
+    {
+      "name": ".text",
+      "start": "0x140001000",
+      "size": 512,
+      "permissions": "READ | EXECUTE"
+    },
+    {
+      "name": ".rdata",
+      "start": "0x140002000",
+      "size": 512,
+      "permissions": "READ"
+    },
+    {
+      "name": ".idata",
+      "start": "0x140003000",
+      "size": 512,
+      "permissions": "READ"
+    }
+  ],
+  "imports": [
+    {
+      "name": "OutputDebugStringA",
+      "library": "KERNEL32.dll",
+      "address": "0x140003038"
+    }
+  ],
+  "findings": [
+    {
+      "address": "0x140002000",
+      "kind": "string",
+      "encoding": "Ascii",
+      "value": "sleuthre triage fixture"
+    },
+    {
+      "address": "0x140002018",
+      "kind": "constant",
+      "description": "CRC32 lookup table (polynomial 0xEDB88320)",
+      "value": "00000000"
+    },
+    {
+      "address": "0x14000304a",
+      "kind": "string",
+      "encoding": "Ascii",
+      "value": "OutputDebugStringA"
+    },
+    {
+      "address": "0x140003064",
+      "kind": "string",
+      "encoding": "Ascii",
+      "value": "KERNEL32.dll"
+    }
+  ]
+}

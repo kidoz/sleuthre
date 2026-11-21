@@ -20,6 +20,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Export a reproducible triage report as JSON or Markdown
+    Triage {
+        /// Path to the binary file
+        binary: PathBuf,
+        /// Report format (json or markdown)
+        #[arg(long, default_value = "json")]
+        format: re_core::analysis::triage::ReportFormat,
+    },
     /// Load a binary, run full analysis, and print a summary
     Analyze {
         /// Path to the binary file
@@ -142,6 +150,15 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Triage { binary, format } => {
+            let bytes = std::fs::read(&binary)
+                .with_context(|| format!("Failed to read {}", binary.display()))?;
+            let report = re_core::analysis::triage::TriageReport::from_bytes(&bytes)
+                .with_context(|| format!("Failed to triage {}", binary.display()))?;
+            report
+                .write(format, std::io::stdout().lock())
+                .context("Failed to write triage report")
+        }
         Commands::Analyze { binary, json } => cmd_analyze(&binary, json),
         Commands::Disasm {
             binary,

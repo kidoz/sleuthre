@@ -11,6 +11,7 @@ pub mod recompile_diff;
 pub mod stack;
 pub mod strings;
 pub mod struct_inference;
+pub mod triage;
 pub mod type_propagation;
 pub mod vtable;
 pub mod xrefs;

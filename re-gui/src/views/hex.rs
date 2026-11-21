@@ -112,7 +112,17 @@ impl SleuthreApp {
             })
             .unwrap_or(0);
 
-        egui::ScrollArea::vertical().show_rows(ui, 18.0, total_rows, |ui, range| {
+        let mut scroll = egui::ScrollArea::vertical();
+        if std::mem::take(&mut self.scroll_to_evidence) {
+            let row = self.current_address.saturating_sub(start_addr) / bytes_per_row as u64;
+            scroll =
+                scroll.vertical_scroll_offset(row as f32 * (18.0 + ui.spacing().item_spacing.y));
+        }
+        let evidence = self
+            .hex_evidence
+            .as_ref()
+            .filter(|r| r.start == self.current_address);
+        scroll.show_rows(ui, 18.0, total_rows, |ui, range| {
             let seg_data = self
                 .project
                 .as_ref()
@@ -170,7 +180,10 @@ impl SleuthreApp {
                             } else {
                                 self.syntax.text
                             };
-                            let rich = egui::RichText::new(text).monospace().color(color);
+                            let mut rich = egui::RichText::new(text).monospace().color(color);
+                            if evidence.is_some_and(|r| r.contains(&byte_addr)) {
+                                rich = rich.background_color(ui.visuals().selection.bg_fill);
+                            }
                             // Wrap in a colored frame when inside an overlay field.
                             let response = if let Some(ov) = overlay {
                                 egui::Frame::new()

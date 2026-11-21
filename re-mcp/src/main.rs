@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 use re_core::analysis::cfg::ControlFlowGraph;
+use re_core::analysis::pipeline::{AnalysisMode, analyze_binary_with_triage};
+use re_core::analysis::triage::{ReportFormat, TriageReport};
 use re_core::debuginfo;
 use re_core::disasm::Disassembler;
 use re_core::project::{ActionKind, PendingAction, Project};
@@ -11,10 +13,31 @@ use uuid::Uuid;
 
 const MAX_SEARCH_RESULTS: u64 = 1000;
 const MAX_DISASM_COUNT: usize = 1_000;
+const MAX_TRIAGE_BYTES: usize = 8 * 1024 * 1024;
 
 struct McpServer {
     project: Option<Project>,
+    triage: Option<TriageReport>,
     disasm: Option<Disassembler>,
+}
+
+/// Bound the serialized tool text while writing, including JSON escaping.
+struct ReportBuffer(Vec<u8>);
+
+impl io::Write for ReportBuffer {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > MAX_TRIAGE_BYTES - self.0.len() {
+            return Err(io::Error::other(
+                "Report exceeds 8 MiB. Export it with re-cli triage.",
+            ));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn propose(project: &mut Project, kind: ActionKind, rationale: String, id: &Value) -> Value {
@@ -239,6 +262,7 @@ impl McpServer {
     fn new() -> Self {
         Self {
             project: None,
+            triage: None,
             disasm: None,
         }
     }
@@ -275,6 +299,16 @@ impl McpServer {
                                 "type": "object",
                                 "properties": { "path": { "type": "string" } },
                                 "required": ["path"]
+                            }
+                        },
+                        {
+                            "name": "get_triage_report",
+                            "description": "Return the opened sample's original triage report as UTF-8 text (up to 8 MiB).",
+                            "annotations": { "readOnlyHint": true },
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": { "format": { "type": "string", "enum": ["json", "markdown"], "default": "json" } },
+                                "additionalProperties": false
                             }
                         },
                         {
@@ -590,14 +624,43 @@ impl McpServer {
                     return missing_param_error(&id, "path");
                 };
                 let path = PathBuf::from(path);
-                match re_core::analysis::pipeline::analyze_binary(&path, |_| {}) {
-                    Ok(result) => {
+                match analyze_binary_with_triage(&path, AnalysisMode::Normal, None, |_| {}) {
+                    Ok((result, report)) => {
                         self.disasm = Disassembler::new(result.project.arch).ok();
                         self.project = Some(result.project);
+                        self.triage = Some(report);
                         tool_text_result(&id, "Binary loaded successfully")
                     }
                     Err(e) => {
                         json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32001, "message": e.to_string() } })
+                    }
+                }
+            }
+            "get_triage_report" => {
+                let Some(params) = args.as_object().filter(|p| p.keys().all(|k| k == "format"))
+                else {
+                    return json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":"Only the optional format parameter is supported"}});
+                };
+                let format = match params.get("format") {
+                    None => ReportFormat::Json,
+                    Some(value) => match value.as_str().and_then(|s| s.parse().ok()) {
+                        Some(format) => format,
+                        None => {
+                            return json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":"Expected json or markdown"}});
+                        }
+                    },
+                };
+                let Some(report) = &self.triage else {
+                    return json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":"Open a binary to get its triage report"}});
+                };
+                let mut buffer = ReportBuffer(Vec::new());
+                match report.write(format, &mut buffer) {
+                    Ok(()) => tool_text_result(
+                        &id,
+                        std::str::from_utf8(&buffer.0).expect("report writers emit UTF-8"),
+                    ),
+                    Err(e) => {
+                        json!({"jsonrpc":"2.0","id":id,"error":{"code":-32002,"message":e.to_string()}})
                     }
                 }
             }
@@ -1407,8 +1470,67 @@ mod tests {
         assert!(!tools.is_empty());
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(names.contains(&"open_binary"));
+        assert!(names.contains(&"get_triage_report"));
         assert!(names.contains(&"get_disasm"));
         assert!(names.contains(&"get_xrefs"));
+    }
+
+    #[test]
+    fn triage_tool_exports_the_open_sample_and_rejects_invalid_requests() {
+        let mut server = McpServer::new();
+        let mut call = |name, args| {
+            server.handle_request(json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": name, "arguments": args }
+            }))
+        };
+        assert_eq!(
+            call("get_triage_report", json!({}))["error"]["code"],
+            -32000
+        );
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../re-core/tests/fixtures/triage.pe");
+        assert!(
+            call("open_binary", json!({"path": fixture}))
+                .get("result")
+                .is_some()
+        );
+        for (args, extension) in [(json!({}), "json"), (json!({"format": "markdown"}), "md")] {
+            let response = call("get_triage_report", args);
+            assert_eq!(
+                response["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .as_bytes(),
+                std::fs::read(fixture.with_extension(extension)).unwrap()
+            );
+        }
+        for args in [
+            json!({"format": 1}),
+            json!({"format": "xml"}),
+            json!({"path": "other"}),
+        ] {
+            assert_eq!(call("get_triage_report", args)["error"]["code"], -32602);
+        }
+    }
+
+    #[test]
+    fn oversized_triage_tool_result_returns_an_error_without_partial_content() {
+        let mut server = McpServer::new();
+        let mut report =
+            TriageReport::from_bytes(include_bytes!("../../re-core/tests/fixtures/triage.pe"))
+                .unwrap();
+        report.imports[0].name = "a".repeat(MAX_TRIAGE_BYTES);
+        server.triage = Some(report);
+        let response = server.call_tool("get_triage_report", json!({}), json!(1));
+        assert_eq!(response["error"]["code"], -32002);
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("8 MiB")
+        );
+        assert!(response.get("result").is_none());
     }
 
     #[test]
