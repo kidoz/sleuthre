@@ -298,15 +298,26 @@ pub fn infer_struct_candidates(
     functions: &FunctionManager,
     arch: Architecture,
 ) -> Vec<StructCandidate> {
-    let mut candidates = Vec::new();
     let Ok(disasm) = Disassembler::new(arch) else {
-        return candidates;
+        return Vec::new();
     };
+    infer_with_decoder(memory, functions, &disasm)
+}
+
+pub(super) fn infer_with_decoder(
+    memory: &MemoryMap,
+    functions: &FunctionManager,
+    disasm: &Disassembler,
+) -> Vec<StructCandidate> {
+    let arch = disasm.arch;
+    let mut candidates = Vec::new();
 
     for func in functions.functions.values() {
         // Only a bounded window per function to avoid stalling on huge or
         // mis-bounded functions.
-        let end_addr = func.end_address.unwrap_or(func.start_address + 0x100);
+        let end_addr = func
+            .end_address
+            .unwrap_or(func.start_address.saturating_add(0x100));
         let size = (end_addr.saturating_sub(func.start_address)) as usize;
 
         let Ok(insns) = disasm.disassemble_range_fast(memory, func.start_address, size.min(0x1000))

@@ -258,7 +258,14 @@ pub fn analyze_binary_with_config(
     cancellation: Option<&AnalysisCancellation>,
     mut on_progress: impl FnMut(AnalysisStage),
 ) -> Result<AnalysisResult> {
-    analyze_file(path, config, cancellation, &mut on_progress).map(|(analysis, _)| analysis)
+    analyze_file(
+        path,
+        config,
+        cancellation,
+        &mut on_progress,
+        loader::load_binary_from_bytes,
+    )
+    .map(|(analysis, _)| analysis)
 }
 
 /// Analyze a binary and capture its immutable triage report from the same file read.
@@ -269,11 +276,29 @@ pub fn analyze_binary_with_triage(
     cancellation: Option<&AnalysisCancellation>,
     on_progress: impl FnMut(AnalysisStage),
 ) -> Result<(AnalysisResult, super::triage::TriageReport)> {
+    analyze_file_with_triage(
+        path,
+        mode,
+        cancellation,
+        on_progress,
+        loader::load_binary_from_bytes,
+    )
+}
+
+/// Analyze and report on one file snapshot using the supplied image loader.
+pub fn analyze_file_with_triage(
+    path: &Path,
+    mode: AnalysisMode,
+    cancellation: Option<&AnalysisCancellation>,
+    on_progress: impl FnMut(AnalysisStage),
+    load: impl FnOnce(&[u8]) -> Result<LoadedBinary>,
+) -> Result<(AnalysisResult, super::triage::TriageReport)> {
     let (analysis, bytes) = analyze_file(
         path,
         &AnalysisConfig::for_mode(mode),
         cancellation,
         on_progress,
+        load,
     )?;
     check_cancelled(cancellation)?;
     let report = super::triage::TriageReport::from_analysis(&bytes, &analysis);
@@ -286,13 +311,14 @@ fn analyze_file(
     config: &AnalysisConfig,
     cancellation: Option<&AnalysisCancellation>,
     mut on_progress: impl FnMut(AnalysisStage),
+    load: impl FnOnce(&[u8]) -> Result<LoadedBinary>,
 ) -> Result<(AnalysisResult, Vec<u8>)> {
     // --- Load (read file once, reuse bytes for debug info later) ---
     check_cancelled(cancellation)?;
     on_progress(AnalysisStage::LoadingBinary);
     let raw_bytes = std::fs::read(path).map_err(crate::error::Error::Io)?;
     check_cancelled(cancellation)?;
-    let loaded = loader::load_binary_from_bytes(&raw_bytes)?;
+    let loaded = load(&raw_bytes)?;
 
     let result =
         analyze_loaded_with_bytes(path, loaded, &raw_bytes, config, cancellation, on_progress)?;
@@ -352,7 +378,7 @@ fn analyze_loaded_with_bytes(
         .then_some(loaded.entry_point);
 
     // --- Disassembler (created and dropped in this scope) ---
-    let disasm = Disassembler::new(loaded.arch).ok();
+    let disasm = project.disassembler().ok();
 
     // --- Function discovery ---
     if config.discover_functions {
@@ -514,7 +540,8 @@ fn analyze_loaded_with_bytes(
         // contiguous chunk; concatenating the chunk results in order reproduces
         // the sequential fact order exactly.
         let mut call_flow_facts = Vec::new();
-        if disasm.is_some() {
+        if let Some(ref decoder) = disasm {
+            let order = decoder.endianness;
             let funcs: Vec<&crate::analysis::functions::Function> =
                 project.functions.functions.values().collect();
             let workers = std::thread::available_parallelism()
@@ -532,7 +559,7 @@ fn analyze_loaded_with_bytes(
                         .map(|chunk| {
                             scope.spawn(move || {
                                 let mut out = Vec::new();
-                                let Ok(d) = Disassembler::new(arch) else {
+                                let Ok(d) = Disassembler::with_endianness(arch, order) else {
                                     return out;
                                 };
                                 for func in chunk {
@@ -615,11 +642,13 @@ fn analyze_loaded_with_bytes(
         // Struct-pointer inference runs outside the plugin manager so its full
         // per-access evidence lands on the project (reviewable in the UI), not
         // just prose findings. Prior review statuses are carried over.
-        let mut candidates = crate::analysis::struct_inference::infer_struct_candidates(
-            &project.memory_map,
-            &project.functions,
-            project.arch,
-        );
+        let mut candidates = disasm.as_ref().map_or_else(Vec::new, |decoder| {
+            crate::analysis::struct_inference::infer_with_decoder(
+                &project.memory_map,
+                &project.functions,
+                decoder,
+            )
+        });
         crate::analysis::struct_inference::merge_candidate_statuses(
             &mut candidates,
             &project.struct_candidates,
@@ -736,7 +765,7 @@ pub fn reanalyze_with_cancellation(
     mut on_progress: impl FnMut(AnalysisStage),
 ) -> Result<Vec<AnalysisFinding>> {
     check_cancelled(cancellation)?;
-    let disasm = crate::disasm::Disassembler::new(project.arch).ok();
+    let disasm = project.disassembler().ok();
 
     if config.discover_functions {
         check_cancelled(cancellation)?;
@@ -853,11 +882,13 @@ pub fn reanalyze_with_cancellation(
 
         // Re-run struct-pointer inference with evidence, preserving the
         // analyst's accept/reject decisions from the previous run.
-        let mut candidates = crate::analysis::struct_inference::infer_struct_candidates(
-            &project.memory_map,
-            &project.functions,
-            project.arch,
-        );
+        let mut candidates = disasm.as_ref().map_or_else(Vec::new, |decoder| {
+            crate::analysis::struct_inference::infer_with_decoder(
+                &project.memory_map,
+                &project.functions,
+                decoder,
+            )
+        });
         crate::analysis::struct_inference::merge_candidate_statuses(
             &mut candidates,
             &project.struct_candidates,

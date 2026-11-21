@@ -83,7 +83,7 @@ impl XrefManager {
                 let end_boundary = func_starts
                     .get(idx + 1)
                     .copied()
-                    .unwrap_or(start_addr + 0x10000);
+                    .unwrap_or(start_addr.saturating_add(0x10000));
                 (start_addr, end_boundary)
             })
             .collect();
@@ -98,7 +98,7 @@ impl XrefManager {
             .min(ranges.len())
             .max(1);
         let chunk_len = ranges.len().div_ceil(workers).max(1);
-        let arch = disasm.arch;
+        let (arch, order) = (disasm.arch, disasm.endianness);
         let string_addrs = &string_addrs;
         let per_chunk: Vec<Vec<Xref>> = std::thread::scope(|scope| {
             let handles: Vec<_> = ranges
@@ -106,7 +106,7 @@ impl XrefManager {
                 .map(|chunk| {
                     scope.spawn(move || {
                         let mut out = Vec::new();
-                        let Ok(d) = Disassembler::new(arch) else {
+                        let Ok(d) = Disassembler::with_endianness(arch, order) else {
                             return out;
                         };
                         for &(start, end) in chunk {
@@ -148,7 +148,7 @@ impl XrefManager {
             let end_boundary = func_starts
                 .get(idx + 1)
                 .copied()
-                .unwrap_or(start_addr + 0x10000);
+                .unwrap_or(start_addr.saturating_add(0x10000));
             let mut addr = start_addr;
             while addr < end_boundary {
                 let insn = match disasm.disassemble_one_fast(memory, addr) {

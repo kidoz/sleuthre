@@ -335,6 +335,15 @@ pub struct DebugProfile {
 }
 
 impl Project {
+    /// Create an instruction decoder using the byte order recorded for a raw image.
+    pub fn disassembler(&self) -> Result<crate::disasm::Disassembler> {
+        let order = self
+            .raw_mapping
+            .as_ref()
+            .map_or(Endianness::Little, |m| m.endianness);
+        crate::disasm::Disassembler::with_endianness(self.arch, order)
+    }
+
     pub fn new(name: String, path: PathBuf) -> Self {
         Self {
             name,

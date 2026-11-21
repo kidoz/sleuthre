@@ -49,6 +49,7 @@ pub struct Disassembler {
     /// get instructions with an empty `groups`.
     cs_no_detail: Capstone,
     pub arch: Architecture,
+    pub(crate) endianness: Endianness,
 }
 
 impl Disassembler {
@@ -80,6 +81,7 @@ impl Disassembler {
             cs: Self::build_capstone(arch, endian, true)?,
             cs_no_detail: Self::build_capstone(arch, endian, false)?,
             arch,
+            endianness: order,
         })
     }
 
