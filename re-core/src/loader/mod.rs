@@ -606,6 +606,16 @@ fn load_macho_single(macho: mach::MachO, bytes: &[u8]) -> Result<LoadedBinary> {
     })
 }
 
+/// A file-backed region of a raw image. Both file offsets and lengths are in bytes.
+#[derive(Debug, Clone)]
+pub struct RawRegion {
+    pub name: String,
+    pub file_offset: usize,
+    pub length: usize,
+    /// Virtual address of the byte at `file_offset`.
+    pub start: u64,
+}
+
 /// Load a raw binary file with user-specified parameters.
 ///
 /// This creates a single memory segment containing the entire file contents,
@@ -616,24 +626,74 @@ pub fn load_raw_binary(
     arch: Architecture,
     entry_point: Option<u64>,
 ) -> Result<LoadedBinary> {
+    load_raw_regions(
+        data,
+        &[RawRegion {
+            name: "raw".into(),
+            file_offset: 0,
+            length: data.len(),
+            start: base_address,
+        }],
+        arch,
+        arch.default_endianness(),
+        entry_point,
+    )
+}
+
+/// Map nonempty slices of a raw image as separate RWX segments.
+/// Virtual ranges may touch but must not overlap. Gaps remain unmapped.
+/// The entry point defaults to the start of the first region supplied.
+pub fn load_raw_regions(
+    data: &[u8],
+    regions: &[RawRegion],
+    arch: Architecture,
+    endianness: Endianness,
+    entry_point: Option<u64>,
+) -> Result<LoadedBinary> {
     if data.is_empty() {
         return Err(Error::Loader("Empty input".to_string()));
     }
+    let first = regions
+        .first()
+        .ok_or_else(|| Error::Loader("Raw image has no mapped regions".into()))?;
 
     let mut memory_map = MemoryMap::default();
-    memory_map.add_segment(MemorySegment {
-        name: "raw".to_string(),
-        start: base_address,
-        size: data.len() as u64,
-        data: data.to_vec(),
-        permissions: Permissions::READ | Permissions::WRITE | Permissions::EXECUTE,
-    })?;
+    // File ranges may be mapped more than once. Bound that amplification while
+    // allowing the original single-region loader to map its entire input.
+    let mut remaining = MAX_TOTAL_SEGMENT_SIZE.max(data.len() as u64);
+    for region in regions {
+        if region.length == 0 {
+            return Err(Error::Loader(format!(
+                "Raw region '{}' has zero length",
+                region.name
+            )));
+        }
+        let bytes = data.get(region.file_offset..).and_then(|tail| tail.get(..region.length))
+            .ok_or_else(|| Error::Loader(format!(
+                "Raw region '{}' at file offset {:#x} with length {:#x} exceeds input size {:#x}",
+                region.name, region.file_offset, region.length, data.len()
+            )))?;
+        let size = bytes.len() as u64;
+        remaining = remaining.checked_sub(size).ok_or_else(|| {
+            Error::Loader(format!(
+                "Raw region '{}' exceeds the total mapping size limit",
+                region.name
+            ))
+        })?;
+        memory_map.add_segment(MemorySegment {
+            name: region.name.clone(),
+            start: region.start,
+            size,
+            data: bytes.to_vec(),
+            permissions: Permissions::READ | Permissions::WRITE | Permissions::EXECUTE,
+        })?;
+    }
 
     Ok(LoadedBinary {
         memory_map,
-        entry_point: entry_point.unwrap_or(base_address),
+        entry_point: entry_point.unwrap_or(first.start),
         arch,
-        endianness: arch.default_endianness(),
+        endianness,
         symbols: Vec::new(),
         imports: Vec::new(),
         exports: Vec::new(),
@@ -717,6 +777,120 @@ mod tests {
         let loaded = load_raw_binary(&data, 0x2000, Architecture::Arm, None).unwrap();
         let read_back = loaded.memory_map.get_data(0x2000, 4).unwrap();
         assert_eq!(read_back, &[0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn raw_regions_map_file_slices_and_identify_overlaps() {
+        let mut regions = [
+            RawRegion {
+                name: "low".into(),
+                file_offset: 0,
+                length: 4,
+                start: 0x1000,
+            },
+            RawRegion {
+                name: "high".into(),
+                file_offset: 4,
+                length: 4,
+                start: 0x8000,
+            },
+        ];
+        let load = |regions: &[RawRegion]| {
+            load_raw_regions(
+                b"ABCDEFGH",
+                regions,
+                Architecture::Mips,
+                Endianness::Little,
+                Some(0x8001),
+            )
+        };
+
+        let image = load(&regions).unwrap();
+        assert_eq!(image.entry_point, 0x8001);
+        assert_eq!(image.memory_map.get_data(0x1001, 1), Some(&b"B"[..]));
+        assert_eq!(image.memory_map.get_data(0x8001, 1), Some(&b"F"[..]));
+        assert_eq!(image.memory_map.get_data(0x1004, 1), None);
+        assert_eq!(
+            image.memory_map.read_u16(0x8000, image.endianness),
+            Some(0x4645)
+        );
+
+        regions[1].start = 0x1002;
+        let message = load(&regions).unwrap_err().to_string();
+        for expected in [
+            "overlap",
+            "'low' [0x1000..0x1004)",
+            "'high' [0x1002..0x1006)",
+        ] {
+            assert!(message.contains(expected), "{message}");
+        }
+    }
+
+    #[test]
+    fn raw_regions_reject_invalid_ranges() {
+        let load = |regions: &[RawRegion]| {
+            load_raw_regions(
+                b"ABCDEFGH",
+                regions,
+                Architecture::Arm,
+                Endianness::Little,
+                None,
+            )
+        };
+        assert!(
+            load(&[])
+                .unwrap_err()
+                .to_string()
+                .contains("no mapped regions")
+        );
+        for (file_offset, length, start, reason) in [
+            (0, 0, 0, "zero length"),
+            (7, 2, 0, "exceeds input size"),
+            (usize::MAX, 2, 0, "exceeds input size"),
+            (1, usize::MAX, 0, "exceeds input size"),
+            (0, 2, u64::MAX, "overflows address space"),
+        ] {
+            let region = RawRegion {
+                name: "bank".into(),
+                file_offset,
+                length,
+                start,
+            };
+            let message = load(&[region]).unwrap_err().to_string();
+            assert!(
+                message.contains("bank") && message.contains(reason),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn adjacent_raw_regions_preserve_the_first_supplied_entry() {
+        let regions = [
+            RawRegion {
+                name: "upper".into(),
+                file_offset: 0,
+                length: 4,
+                start: 0x1004,
+            },
+            RawRegion {
+                name: "lower".into(),
+                file_offset: 4,
+                length: 4,
+                start: 0x1000,
+            },
+        ];
+        let image = load_raw_regions(
+            b"ABCDEFGH",
+            &regions,
+            Architecture::Arm,
+            Endianness::Little,
+            None,
+        )
+        .unwrap();
+        assert_eq!(image.entry_point, 0x1004);
+        assert_eq!(image.memory_map.get_data(0x1000, 4), Some(&b"EFGH"[..]));
+        assert_eq!(image.memory_map.get_data(0x1004, 4), Some(&b"ABCD"[..]));
     }
 
     /// Build a minimal 64-bit ELF header (no program/section headers) for the
