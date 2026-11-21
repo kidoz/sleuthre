@@ -15,7 +15,7 @@ use crate::debuginfo;
 use crate::disasm::Disassembler;
 use crate::loader::{self, BinaryFormat, LoadedBinary};
 use crate::plugin::{AnalysisFinding, PluginManager};
-use crate::project::Project;
+use crate::project::{Project, RawImageMapping};
 use crate::signatures::SignatureDatabase;
 
 /// Configuration for which analysis stages to run.
@@ -340,6 +340,11 @@ fn analyze_loaded_with_bytes(
     project.libraries = loaded.libraries;
     project.arch = loaded.arch;
     project.binary_format = loaded.format;
+    project.raw_mapping = loaded.raw_source.map(|source| RawImageMapping {
+        source,
+        endianness: loaded.endianness,
+        entry_point: loaded.entry_point,
+    });
     project.image_base = loaded.image_base;
     project.view_address = project
         .memory_map

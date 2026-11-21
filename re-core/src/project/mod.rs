@@ -6,10 +6,10 @@ use crate::analysis::functions::FunctionManager;
 use crate::analysis::strings::StringsManager;
 use crate::analysis::struct_inference::{EvidenceStatus, StructCandidate};
 use crate::analysis::xrefs::XrefManager;
-use crate::arch::Architecture;
+use crate::arch::{Architecture, Endianness};
 use crate::db::Database;
 use crate::error::Error;
-use crate::loader::{BinaryFormat, Export, Import, Symbol};
+use crate::loader::{BinaryFormat, Export, Import, RawFileMapping, Symbol};
 use crate::memory::MemoryMap;
 use crate::typelib::TypeLibraryManager;
 use crate::types::TypeManager;
@@ -108,6 +108,52 @@ pub enum UndoCommand {
     },
 }
 
+/// Raw loader settings attached to the saved segment data. Older projects
+/// have no record of their source offsets or original entry point.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RawImageMapping {
+    pub source: RawFileMapping,
+    pub entry_point: u64,
+    pub endianness: Endianness,
+}
+
+impl RawImageMapping {
+    fn validate(&self, project: &Project) -> Result<()> {
+        let segments = &project.memory_map.segments;
+        if project.binary_format != BinaryFormat::Raw
+            || segments.is_empty()
+            || self.source.file_offsets.len() != segments.len()
+        {
+            return Err(Error::Database(
+                "Raw mapping does not match the project's segments".into(),
+            ));
+        }
+        for segment in segments {
+            let offset = self
+                .source
+                .file_offsets
+                .get(&segment.start)
+                .ok_or_else(|| {
+                    Error::Database(format!(
+                        "Missing raw file offset for segment '{}' at {:#x}",
+                        segment.name, segment.start
+                    ))
+                })?;
+            if segment.size == 0
+                || offset
+                    .checked_add(segment.size)
+                    .is_none_or(|end| end > self.source.file_size)
+            {
+                return Err(Error::Database(format!(
+                    "Invalid raw file range for segment '{}' at offset {offset:#x} with length {:#x} in a {:#x}-byte file",
+                    segment.name, segment.size, self.source.file_size
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 pub struct Project {
     pub name: String,
     pub path: PathBuf,
@@ -137,6 +183,7 @@ pub struct Project {
     pub type_libs: TypeLibraryManager,
     pub arch: Architecture,
     pub binary_format: BinaryFormat,
+    pub raw_mapping: Option<RawImageMapping>,
     /// PE load/image base (0 for non-PE); used to relate PDB/external symbol
     /// offsets to the loaded segment addresses.
     pub image_base: u64,
@@ -317,6 +364,7 @@ impl Project {
             type_libs: TypeLibraryManager::default(),
             arch: Architecture::X86_64,
             binary_format: BinaryFormat::Raw,
+            raw_mapping: None,
             image_base: 0,
             view_address: None,
             struct_overlays: Vec::new(),
@@ -919,6 +967,9 @@ impl Project {
     }
 
     pub fn save(&mut self, db_path: &std::path::Path) -> Result<()> {
+        if let Some(mapping) = &self.raw_mapping {
+            mapping.validate(self)?;
+        }
         let existing = self.db.as_ref().filter(|db| db.path() == db_path);
         let new_db = if existing.is_none() {
             Some(Database::open(db_path)?)
@@ -1071,6 +1122,11 @@ impl Project {
                     .map_err(|e| Error::Database(e.to_string()))?,
             )?;
             db.set_metadata("image_base", &self.image_base.to_string())?;
+            db.set_metadata(
+                "raw_mapping",
+                &serde_json::to_string(&self.raw_mapping)
+                    .map_err(|e| Error::Database(e.to_string()))?,
+            )?;
             db.set_metadata("schema_version", &Database::SCHEMA_VERSION.to_string())?;
 
             Ok(())
@@ -1206,6 +1262,14 @@ impl Project {
             && let Ok(format) = serde_json::from_str(&v)
         {
             project.binary_format = format;
+        }
+        if let Some(value) = db.get_metadata("raw_mapping")? {
+            let mapping: Option<RawImageMapping> = serde_json::from_str(&value)
+                .map_err(|e| Error::Database(format!("Invalid raw mapping: {e}")))?;
+            if let Some(mapping) = mapping {
+                mapping.validate(&project)?;
+                project.raw_mapping = Some(mapping);
+            }
         }
         if let Some(v) = db.get_metadata("image_base")?
             && let Ok(base) = v.parse::<u64>()

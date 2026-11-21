@@ -4,6 +4,7 @@ use crate::error::Error;
 use crate::memory::{MemoryMap, MemorySegment, Permissions};
 use goblin::{Object, elf, mach, pe};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// The format of a loaded binary.
@@ -46,6 +47,8 @@ pub struct Export {
 #[derive(Debug)]
 pub struct LoadedBinary {
     pub memory_map: MemoryMap,
+    /// File offsets for a caller-supplied raw mapping, when known.
+    pub raw_source: Option<RawFileMapping>,
     pub entry_point: u64,
     pub arch: Architecture,
     pub endianness: Endianness,
@@ -311,6 +314,7 @@ fn load_elf(elf: elf::Elf, bytes: &[u8]) -> Result<LoadedBinary> {
         exports,
         libraries,
         format: BinaryFormat::Elf,
+        raw_source: None,
         debug_info_path: None,
         image_base: 0,
     })
@@ -428,6 +432,7 @@ fn load_pe(pe: pe::PE, bytes: &[u8]) -> Result<LoadedBinary> {
         exports,
         libraries,
         format: BinaryFormat::Pe,
+        raw_source: None,
         debug_info_path: pdb_path,
         image_base,
     })
@@ -601,6 +606,7 @@ fn load_macho_single(macho: mach::MachO, bytes: &[u8]) -> Result<LoadedBinary> {
         exports,
         libraries,
         format: BinaryFormat::MachO,
+        raw_source: None,
         debug_info_path: None,
         image_base: 0,
     })
@@ -614,6 +620,14 @@ pub struct RawRegion {
     pub length: usize,
     /// Virtual address of the byte at `file_offset`.
     pub start: u64,
+}
+
+/// Source extents missing from the virtual memory map. Names and lengths
+/// belong to the segments, whose virtual starts identify them uniquely.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RawFileMapping {
+    pub file_size: u64,
+    pub file_offsets: BTreeMap<u64, u64>,
 }
 
 /// Load a raw binary file with user-specified parameters.
@@ -699,6 +713,13 @@ pub fn load_raw_regions(
         exports: Vec::new(),
         libraries: Vec::new(),
         format: BinaryFormat::Raw,
+        raw_source: Some(RawFileMapping {
+            file_size: data.len() as u64,
+            file_offsets: regions
+                .iter()
+                .map(|r| (r.start, r.file_offset as u64))
+                .collect(),
+        }),
         debug_info_path: None,
         image_base: 0,
     })

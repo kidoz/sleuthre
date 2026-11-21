@@ -383,6 +383,7 @@ mod tests {
                 exports: Vec::new(),
                 libraries: Vec::new(),
                 format: crate::loader::BinaryFormat::Raw,
+                raw_source: None,
                 debug_info_path: None,
                 image_base: 0,
             })
