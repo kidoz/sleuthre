@@ -83,69 +83,61 @@ impl SleuthreApp {
                     self.syntax.mnemonic
                 };
 
-                let is_focused = self.focused_address == Some(insn.address);
-
-                let response = ui
-                    .horizontal(|ui| {
-                        let rect = ui.max_rect();
-                        if is_focused {
-                            ui.painter()
-                                .rect_filled(rect, 0.0, self.syntax.selection_bg);
-                        }
-
-                        if ui
-                            .selectable_label(
-                                is_focused,
-                                egui::RichText::new(format!("{:08X}", insn.address))
-                                    .monospace()
-                                    .color(self.syntax.address),
-                            )
-                            .clicked()
-                        {
-                            self.focused_address = Some(insn.address);
-                        }
-                        ui.add_space(8.0);
-                        let bytes_str = insn
-                            .bytes
-                            .iter()
-                            .take(6)
-                            .map(|b| format!("{:02X}", b))
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        ui.monospace(
-                            egui::RichText::new(format!("{:<17}", bytes_str))
-                                .color(self.syntax.bytes),
-                        );
-
-                        ui.monospace(
-                            egui::RichText::new(&insn.mnemonic)
-                                .color(mnemonic_color)
-                                .strong(),
-                        );
-
-                        let op_color = if insn.op_str.starts_with("0x")
-                            || insn
-                                .op_str
-                                .chars()
-                                .next()
-                                .is_some_and(|c| c.is_ascii_digit())
-                        {
-                            self.syntax.number
-                        } else {
-                            self.syntax.text
-                        };
-                        ui.monospace(egui::RichText::new(&insn.op_str).color(op_color));
-
-                        if let Some(c) = project.comments.get(&insn.address) {
-                            ui.label(
-                                egui::RichText::new(format!("; {}", c)).color(self.syntax.comment),
-                            );
-                        }
-                    })
-                    .response;
-
                 let addr = insn.address;
+                let selected = self.focused_address.unwrap_or(self.current_address) == addr;
+                let full_bytes = insn
+                    .bytes
+                    .iter()
+                    .map(|byte| format!("{byte:02X}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let preview = if insn.bytes.len() > 6 {
+                    format!("{}…", &full_bytes[..17])
+                } else {
+                    full_bytes.clone()
+                };
+                let op_color = if insn.op_str.starts_with("0x")
+                    || insn.op_str.starts_with(|c: char| c.is_ascii_digit())
+                {
+                    self.syntax.number
+                } else {
+                    self.syntax.text
+                };
+                let mut row = egui::text::LayoutJob::default();
+                let font = egui::TextStyle::Monospace.resolve(ui.style());
+                let mut append = |text: &str, color| {
+                    row.append(text, 0.0, egui::TextFormat::simple(font.clone(), color));
+                };
+                append(&format!("{addr:08X}  "), self.syntax.address);
+                append(&format!("{preview:<18} "), self.syntax.bytes);
+                append(&insn.mnemonic, mnemonic_color);
+                append(&format!(" {}", insn.op_str), op_color);
+                if let Some(comment) = project.comments.get(&addr) {
+                    append(&format!("  ; {comment}"), self.syntax.comment);
+                }
+                let mut button = egui::Button::selectable(selected, (row, egui::Atom::grow()))
+                    .min_size(egui::vec2(ui.available_width(), 18.0))
+                    .truncate();
+                if selected {
+                    button = button
+                        .fill(self.syntax.selection_bg)
+                        .stroke(egui::Stroke::new(1.0, self.syntax.link));
+                }
+                let response = ui.add(button);
+                if response.clicked() || response.secondary_clicked() {
+                    self.focused_address = Some(addr);
+                }
+                let response = if insn.bytes.len() > 6 {
+                    response.on_hover_text(&full_bytes)
+                } else {
+                    response
+                };
+
                 response.context_menu(|ui| {
+                    if ui.button("Copy instruction bytes").clicked() {
+                        ui.ctx().copy_text(full_bytes.clone());
+                        ui.close();
+                    }
                     if ui.button("Rename (N)").clicked() {
                         self.rename_address = Some(addr);
                         self.rename_input.clear();
@@ -162,6 +154,7 @@ impl SleuthreApp {
                         ui.close();
                     }
                     if ui.button("Decompile (F5)").clicked() {
+                        self.focused_address = Some(addr);
                         self.trigger_decompile = true;
                         ui.close();
                     }
