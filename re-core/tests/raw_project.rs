@@ -91,6 +91,7 @@ fn project_written_by_v0_7_1_opens_and_resaves() {
         assert_eq!(project.binary_format, BinaryFormat::Raw);
         assert_eq!(project.arch, Architecture::Mips);
         assert!(project.raw_mapping.is_none());
+        assert!(project.triage_report.is_none());
         assert_eq!(project.memory_map.get_data(0x1000, 4), Some(&b"ABCD"[..]));
         assert_eq!(project.comments[&0x1001], "legacy annotation");
         if pass == 0 {
@@ -120,6 +121,88 @@ fn reopen_rejects_inconsistent_raw_mapping() {
         let err = Project::load(&path)
             .err()
             .expect("invalid provenance should fail to load");
+        assert!(err.to_string().contains(reason), "{err}");
+    }
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn original_report_survives_a_partial_mapping_and_later_edits() {
+    use re_core::analysis::pipeline::{AnalysisMode, analyze_file_with_triage};
+
+    let path = project_path();
+    let bytes = include_bytes!("fixtures/two-regions.raw");
+    let load = |data: &[u8]| {
+        load_raw_regions(
+            data,
+            &[RawRegion {
+                name: "high".into(),
+                file_offset: 4,
+                length: 4,
+                start: 0x8000,
+            }],
+            Architecture::Mips,
+            Endianness::Little,
+            None,
+        )
+    };
+    let source = path.with_extension("raw");
+    std::fs::write(&source, bytes).unwrap();
+    let (result, report) =
+        analyze_file_with_triage(&source, AnalysisMode::Normal, None, |_| {}, load).unwrap();
+    let mut project = result.project;
+    project.triage_report = Some(report.into());
+    project.save_new(&path).unwrap();
+    std::fs::remove_file(source).unwrap();
+    drop(project);
+
+    let mut reopened = Project::load(&path).unwrap();
+    reopened.memory_map.write_data(0x8000, b"aaaa").unwrap();
+    reopened.autosave().unwrap();
+    drop(reopened);
+    let reopened = Project::load(&path).unwrap();
+    let report = reopened.triage_report.as_ref().unwrap();
+    assert_eq!(reopened.memory_map.get_data(0x8000, 4), Some(&b"aaaa"[..]));
+    assert_eq!(
+        report.sha256,
+        "9ac2197d9258257b1ae8463e4214e4cd0a578bc1517f2415928b91be4283fc48"
+    );
+    assert_eq!(report.entropy, 3.0);
+    assert_eq!(report.segments[0].file_offset, Some(4));
+    drop(reopened);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn invalid_saved_report_returns_a_project_error() {
+    let path = copy_legacy_project();
+    for (field, value, reason) in [
+        (
+            "entry_point",
+            serde_json::json!("0x10000000000000000"),
+            "Invalid triage report",
+        ),
+        (
+            "schema_version",
+            serde_json::json!(2),
+            "Unsupported triage report version",
+        ),
+        (
+            "entropy",
+            serde_json::json!(9.0),
+            "Invalid triage report header",
+        ),
+    ] {
+        let mut report: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/two-regions.json")).unwrap();
+        report[field] = value;
+        re_core::db::Database::open(&path)
+            .unwrap()
+            .set_metadata("triage_report", &report.to_string())
+            .unwrap();
+        let err = Project::load(&path)
+            .err()
+            .expect("invalid report should fail to load");
         assert!(err.to_string().contains(reason), "{err}");
     }
     std::fs::remove_file(path).unwrap();

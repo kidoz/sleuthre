@@ -5,6 +5,7 @@ use crate::analysis::constants::ConstantScanner;
 use crate::analysis::functions::FunctionManager;
 use crate::analysis::strings::StringsManager;
 use crate::analysis::struct_inference::{EvidenceStatus, StructCandidate};
+use crate::analysis::triage::TriageReport;
 use crate::analysis::xrefs::XrefManager;
 use crate::arch::{Architecture, Endianness};
 use crate::db::Database;
@@ -16,6 +17,7 @@ use crate::types::TypeManager;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 const DECOMPILER_CACHE_VERSION: &str = "3";
 
@@ -184,6 +186,8 @@ pub struct Project {
     pub arch: Architecture,
     pub binary_format: BinaryFormat,
     pub raw_mapping: Option<RawImageMapping>,
+    /// Immutable evidence captured from the original file, including unmapped bytes.
+    pub triage_report: Option<Arc<TriageReport>>,
     /// PE load/image base (0 for non-PE); used to relate PDB/external symbol
     /// offsets to the loaded segment addresses.
     pub image_base: u64,
@@ -374,6 +378,7 @@ impl Project {
             arch: Architecture::X86_64,
             binary_format: BinaryFormat::Raw,
             raw_mapping: None,
+            triage_report: None,
             image_base: 0,
             view_address: None,
             struct_overlays: Vec::new(),
@@ -975,10 +980,32 @@ impl Project {
         self.save(path)
     }
 
+    fn validate_triage_report(&self) -> Result<()> {
+        let Some(report) = &self.triage_report else {
+            return Ok(());
+        };
+        if report.schema_version != TriageReport::SCHEMA_VERSION {
+            return Err(Error::Database(format!(
+                "Unsupported triage report version {}",
+                report.schema_version
+            )));
+        }
+        if report.format != self.binary_format
+            || report.architecture != self.arch.display_name()
+            || report.sha256.len() != 64
+            || !report.sha256.bytes().all(|b| b.is_ascii_hexdigit())
+            || !(0.0..=8.0).contains(&report.entropy)
+        {
+            return Err(Error::Database("Invalid triage report header".into()));
+        }
+        Ok(())
+    }
+
     pub fn save(&mut self, db_path: &std::path::Path) -> Result<()> {
         if let Some(mapping) = &self.raw_mapping {
             mapping.validate(self)?;
         }
+        self.validate_triage_report()?;
         let existing = self.db.as_ref().filter(|db| db.path() == db_path);
         let new_db = if existing.is_none() {
             Some(Database::open(db_path)?)
@@ -1136,6 +1163,11 @@ impl Project {
                 &serde_json::to_string(&self.raw_mapping)
                     .map_err(|e| Error::Database(e.to_string()))?,
             )?;
+            db.set_metadata(
+                "triage_report",
+                &serde_json::to_string(&self.triage_report.as_deref())
+                    .map_err(|e| Error::Database(format!("Cannot save triage report: {e}")))?,
+            )?;
             db.set_metadata("schema_version", &Database::SCHEMA_VERSION.to_string())?;
 
             Ok(())
@@ -1279,6 +1311,12 @@ impl Project {
                 mapping.validate(&project)?;
                 project.raw_mapping = Some(mapping);
             }
+        }
+        if let Some(value) = db.get_metadata("triage_report")? {
+            let report: Option<TriageReport> = serde_json::from_str(&value)
+                .map_err(|e| Error::Database(format!("Invalid triage report: {e}")))?;
+            project.triage_report = report.map(Arc::new);
+            project.validate_triage_report()?;
         }
         if let Some(v) = db.get_metadata("image_base")?
             && let Ok(base) = v.parse::<u64>()

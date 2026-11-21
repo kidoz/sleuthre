@@ -2,7 +2,7 @@
 
 use std::io::Write;
 
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use sha2::{Digest, Sha256};
 
 use super::pipeline::AnalysisResult;
@@ -24,7 +24,19 @@ impl Serialize for ReportAddress {
     }
 }
 
-#[derive(Debug, Serialize)]
+impl<'de> Deserialize<'de> for ReportAddress {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        let digits = value
+            .strip_prefix("0x")
+            .ok_or_else(|| de::Error::custom("expected a 0x-prefixed report address"))?;
+        u64::from_str_radix(digits, 16)
+            .map(Self)
+            .map_err(de::Error::custom)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ReportSegment {
     pub name: String,
     pub start: ReportAddress,
@@ -34,14 +46,14 @@ pub struct ReportSegment {
     pub permissions: Permissions,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ReportImport {
     pub name: String,
     pub library: String,
     pub address: Option<ReportAddress>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Evidence {
     String {
@@ -54,7 +66,7 @@ pub enum Evidence {
     },
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ReportFinding {
     pub address: ReportAddress,
     #[serde(flatten)]
@@ -79,12 +91,12 @@ impl std::str::FromStr for ReportFormat {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct TriageReport {
     pub schema_version: u32,
     pub sha256: String,
     pub format: BinaryFormat,
-    pub architecture: &'static str,
+    pub architecture: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub byte_order: Option<Endianness>,
     pub entry_point: ReportAddress,
@@ -96,6 +108,8 @@ pub struct TriageReport {
 }
 
 impl TriageReport {
+    pub(crate) const SCHEMA_VERSION: u32 = 1;
+
     /// Hash, load, and scan one snapshot, so a concurrent file edit cannot mix inputs.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         Ok(Self::from_loaded(bytes, load_binary_from_bytes(bytes)?))
@@ -132,10 +146,10 @@ impl TriageReport {
 
     fn header(bytes: &[u8], format: BinaryFormat, arch: Architecture, entry: u64) -> Self {
         Self {
-            schema_version: 1,
+            schema_version: Self::SCHEMA_VERSION,
             sha256: hex::encode(Sha256::digest(bytes)),
             format,
-            architecture: arch.display_name(),
+            architecture: arch.display_name().into(),
             byte_order: None,
             entry_point: ReportAddress(entry),
             entropy: (shannon_entropy(bytes) * 1_000_000.0).round() / 1_000_000.0,
