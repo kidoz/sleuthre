@@ -850,7 +850,6 @@ impl SleuthreApp {
                             format!("Analysis found {} items", result.findings.len()),
                         );
                     }
-                    self.plugin_findings = result.findings;
                     self.add_toast(
                         ToastKind::Success,
                         format!("Loaded '{}'", result.project.name),
@@ -858,6 +857,7 @@ impl SleuthreApp {
                     self.output.push_str(&result.summary);
                     self.output.push('\n');
                     self.set_project(result.project);
+                    self.plugin_findings = result.findings;
                     // Compute entropy map
                     if let Some(ref project) = self.project {
                         self.entropy_map = Some(re_core::analysis::entropy::compute_entropy_map(
@@ -981,9 +981,7 @@ impl SleuthreApp {
                         .and_then(|project| Disassembler::new(project.arch).ok());
                     match findings {
                         Ok(findings) => {
-                            if !findings.is_empty() {
-                                self.plugin_findings = findings;
-                            }
+                            self.plugin_findings = findings;
                             self.add_toast(ToastKind::Success, "Re-analysis complete.".into());
                         }
                         Err(e) if e.contains("Analysis cancelled") => {
@@ -1078,6 +1076,7 @@ impl SleuthreApp {
             project.navigate_to(self.current_address);
         }
         self.project = Some(project);
+        self.plugin_findings.clear();
         self.cached_func_list_dirty = true;
         self.rename_address = None;
         self.comment_address = None;

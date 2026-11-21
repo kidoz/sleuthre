@@ -976,6 +976,7 @@ impl SleuthreApp {
                 if self.plugin_findings.is_empty() {
                     ui.label("No findings to display.");
                 } else {
+                    ui.label("Results from the last completed analysis run");
                     let mut jump_to = None;
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         for finding in &self.plugin_findings {
