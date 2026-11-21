@@ -29,6 +29,7 @@ An open-source reverse engineering desktop application built in Rust.
 ### Collaboration & automation
 - **Live broadcast collab** — TCP listener publishes every `UndoCommand` as line-delimited JSON; viewers can also send events back (bidirectional). Tools menu exposes start/stop.
 - **Git-friendly project format** — `Project::export_jsonl` emits deterministic JSON-Lines for renames/comments/bookmarks/tags/overlays/types; `merge_jsonl_3way` performs a semantic 3-way merge with conflict markers for async PR-based RE.
+- **Three-way JSONL merge** — open **File → Review JSONL merge…** and select the common ancestor and incoming exports. The open project is the current branch. Inspect automatic changes, choose a branch for each conflict, then apply or cancel. Save the project to keep the merged edits.
 - **MCP server** — first-party Model Context Protocol implementation with 26 typed tools (triage reports, disasm, decomp, MLIL/SSA dumps, IL rewrite, recompile-diff, JSONL merge, signature scans, …) and 7 resources for AI agent integration.
 - **Plugins** — Rhai scripts hot-reloaded from `~/.sleuthre/plugins/`; async worker thread runs scripts without blocking the UI; FLIRT PAT importer for community signature corpora.
 - **GDB Remote Serial Protocol debugger** — connects to gdbserver / QEMU-gdbstub / LLDB platform via `GdbRemoteDebugger`; attach / step / continue / read registers + memory.

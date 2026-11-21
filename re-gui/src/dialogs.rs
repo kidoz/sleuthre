@@ -1,3 +1,4 @@
+pub(crate) mod merge;
 pub(crate) mod raw_image;
 
 use eframe::egui;
@@ -137,6 +138,7 @@ fn apply_symbol_renames(project: &mut Project, symbols: &[ImportedSymbol]) -> us
 
 impl SleuthreApp {
     pub(crate) fn show_modals(&mut self, ctx: &egui::Context) {
+        self.show_merge_dialog(ctx);
         self.show_raw_image_dialog(ctx);
         self.show_rename_dialog(ctx);
         self.show_comment_dialog(ctx);

@@ -159,6 +159,7 @@ pub(crate) struct SleuthreApp {
     pub(crate) command_bar_selected: usize,
     pub(crate) command_bar_active: bool,
 
+    pub(crate) merge_dialog: Option<crate::dialogs::merge::MergeDialog>,
     pub(crate) raw_dialog: Option<crate::dialogs::raw_image::RawImageDialog>,
 
     // Background analysis work
@@ -661,6 +662,7 @@ impl Default for SleuthreApp {
             command_bar_results: Vec::new(),
             command_bar_selected: 0,
             command_bar_active: false,
+            merge_dialog: None,
             raw_dialog: None,
             load_receiver: None,
             load_stage: None,
@@ -1122,6 +1124,7 @@ impl SleuthreApp {
         }
         self.triage.clone_from(&project.triage_report);
         self.project = Some(project);
+        self.merge_dialog = None;
         self.raw_dialog = None;
         self.pending_triage_finding = None;
         self.hex_selected_addr = None;
@@ -1278,7 +1281,8 @@ impl SleuthreApp {
     }
 
     pub(crate) fn any_modal_active(&self) -> bool {
-        self.raw_dialog.is_some()
+        self.merge_dialog.is_some()
+            || self.raw_dialog.is_some()
             || self.rename_address.is_some()
             || self.comment_address.is_some()
             || self.xref_address.is_some()

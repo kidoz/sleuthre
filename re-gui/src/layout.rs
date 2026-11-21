@@ -898,6 +898,16 @@ impl SleuthreApp {
                     self.load_project();
                     ui.close();
                 }
+                if ui
+                    .add_enabled(
+                        self.project.is_some() && !self.is_loading(),
+                        egui::Button::new("Review JSONL merge…"),
+                    )
+                    .clicked()
+                {
+                    self.merge_dialog = Some(Default::default());
+                    ui.close();
+                }
                 if ui.button("Review changes…").clicked() {
                     self.approval_queue_open = true;
                     ui.close();
