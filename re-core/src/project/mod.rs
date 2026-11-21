@@ -44,7 +44,34 @@ pub struct PendingAction {
     pub id: uuid::Uuid,
     pub kind: ActionKind,
     pub rationale: String,
-    pub confidence: f32,
+    pub confidence: Option<f32>,
+    #[serde(default)]
+    pub origin: ProposalOrigin,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProposalOrigin {
+    #[default]
+    Unknown,
+    Analysis,
+    Mcp,
+    Peer(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReviewDecision {
+    Accepted,
+    Rejected,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReviewedAction {
+    pub proposal: PendingAction,
+    pub decision: ReviewDecision,
+    /// The local value immediately before the analyst decided.
+    pub before: Option<String>,
+    /// Value actually applied on acceptance (also absent for a comment removal).
+    pub applied_value: Option<String>,
 }
 
 /// A reversible command for the undo/redo system.
@@ -166,6 +193,7 @@ pub struct Project {
     pub constants: ConstantScanner,
     pub comments: HashMap<u64, String>,
     pub pending_actions: Vec<PendingAction>,
+    pub review_history: Vec<ReviewedAction>,
     pub db: Option<Database>,
     saved_revision: Option<String>,
     pub imports: Vec<Import>,
@@ -359,6 +387,7 @@ impl Project {
             constants: ConstantScanner::default(),
             comments: HashMap::new(),
             pending_actions: Vec::new(),
+            review_history: Vec::new(),
             db: None,
             saved_revision: None,
             imports: Vec::new(),
@@ -388,14 +417,64 @@ impl Project {
         }
     }
 
-    /// Apply a reviewed proposal using current values for undo.
+    pub const MAX_PENDING_ACTIONS: usize = 1024;
+
+    /// Read the current local value targeted by a proposal.
+    pub fn proposal_current_value(&self, kind: &ActionKind) -> Option<String> {
+        match kind {
+            ActionKind::Rename { address, .. } => self
+                .functions
+                .get_function(*address)
+                .map(|f| f.name.clone()),
+            ActionKind::Comment { address, .. } => self.comments.get(address).cloned(),
+            ActionKind::SetLocalType {
+                function, variable, ..
+            } => self
+                .types
+                .local_variables
+                .get(function)?
+                .iter()
+                .find(|v| v.name == *variable)
+                .map(|v| v.type_ref.display_name()),
+        }
+    }
+
     pub fn approve_action(&mut self, id: uuid::Uuid) -> Result<String> {
+        self.review_action(id, ReviewDecision::Accepted)
+    }
+
+    /// Resolve a pending proposal exactly once. A failed approval leaves it pending.
+    pub fn review_action(&mut self, id: uuid::Uuid, decision: ReviewDecision) -> Result<String> {
         let index = self
             .pending_actions
             .iter()
             .position(|action| action.id == id)
             .ok_or_else(|| Error::Analysis("Unknown proposal".into()))?;
-        let cmd = match &self.pending_actions[index].kind {
+        let kind = &self.pending_actions[index].kind;
+        let before = self.proposal_current_value(kind);
+        let (message, applied_value) = match decision {
+            ReviewDecision::Accepted => {
+                let command = self.proposal_command(kind)?;
+                let message = self.execute(command);
+                (
+                    message,
+                    self.proposal_current_value(&self.pending_actions[index].kind),
+                )
+            }
+            ReviewDecision::Rejected => ("Proposal rejected".into(), None),
+        };
+        let proposal = self.pending_actions.remove(index);
+        self.review_history.push(ReviewedAction {
+            proposal,
+            decision,
+            before,
+            applied_value,
+        });
+        Ok(message)
+    }
+
+    fn proposal_command(&self, kind: &ActionKind) -> Result<UndoCommand> {
+        Ok(match kind {
             ActionKind::Rename {
                 address, new_name, ..
             } => {
@@ -451,9 +530,7 @@ impl Project {
                     new,
                 }
             }
-        };
-        self.pending_actions.remove(index);
-        Ok(self.execute(cmd))
+        })
     }
 
     /// Execute a command and push it onto the undo stack, clearing redo.
@@ -1033,6 +1110,11 @@ impl Project {
                 &serde_json::to_string(&self.pending_actions)
                     .map_err(|e| Error::Database(e.to_string()))?,
             )?;
+            db.set_metadata(
+                "review_history",
+                &serde_json::to_string(&self.review_history)
+                    .map_err(|e| Error::Database(format!("Cannot save review history: {e}")))?,
+            )?;
             db.set_metadata("decompiler_version", DECOMPILER_CACHE_VERSION)?;
             if let Some(address) = self.view_address {
                 db.set_metadata("view_address", &address.to_string())?;
@@ -1335,6 +1417,10 @@ impl Project {
         if let Some(actions) = db.get_metadata("pending_actions")? {
             project.pending_actions = serde_json::from_str(&actions)
                 .map_err(|e| Error::Database(format!("Invalid pending actions: {e}")))?;
+        }
+        if let Some(history) = db.get_metadata("review_history")? {
+            project.review_history = serde_json::from_str(&history)
+                .map_err(|e| Error::Database(format!("Invalid review history: {e}")))?;
         }
         db.commit_transaction()?;
         project.db = Some(db);
@@ -1773,6 +1859,42 @@ mod tests {
             stack_frame_size: 0,
         });
         p
+    }
+
+    #[test]
+    fn failed_approval_stays_pending_and_retries_do_not_duplicate_history() {
+        let mut project = test_project();
+        let id = uuid::Uuid::new_v4();
+        project.pending_actions.push(PendingAction {
+            id,
+            kind: ActionKind::Rename {
+                address: 0x2000,
+                old_name: "original".into(),
+                new_name: "chosen".into(),
+            },
+            origin: ProposalOrigin::Mcp,
+            confidence: None,
+            rationale: String::new(),
+        });
+        assert!(project.approve_action(id).is_err());
+        assert_eq!(project.pending_actions.len(), 1);
+        assert!(project.review_history.is_empty());
+        assert!(project.undo_stack.is_empty());
+        project.functions.add_function(Function {
+            start_address: 0x2000,
+            end_address: None,
+            name: "current".into(),
+            calling_convention: CallingConvention::default(),
+            stack_frame_size: 0,
+        });
+        project.approve_action(id).unwrap();
+        assert!(project.review_action(id, ReviewDecision::Rejected).is_err());
+        project.undo();
+        assert_eq!(project.functions.functions[&0x2000].name, "current");
+        assert_eq!(project.review_history.len(), 1);
+        let record = &project.review_history[0];
+        assert_eq!(record.before.as_deref(), Some("current"));
+        assert_eq!(record.applied_value.as_deref(), Some("chosen"));
     }
 
     #[test]

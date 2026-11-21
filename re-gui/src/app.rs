@@ -1255,13 +1255,18 @@ impl SleuthreApp {
                     kind: ActionKind::Rename {
                         address: current_addr,
                         new_name: "decode_bink_frame".to_string(),
-                        old_name: "sub_401000".to_string(),
+                        old_name: project
+                            .functions
+                            .get_function(current_addr)
+                            .map(|f| f.name.clone())
+                            .unwrap_or_default(),
                     },
                     rationale: format!(
                         "Function at {:X} references string '{}'",
                         current_addr, s.value
                     ),
-                    confidence: 0.9,
+                    confidence: Some(0.9),
+                    origin: re_core::project::ProposalOrigin::Analysis,
                 });
                 self.approval_queue_open = true;
             }

@@ -102,6 +102,38 @@ fn project_written_by_v0_7_1_opens_and_resaves() {
 }
 
 #[test]
+fn legacy_project_preserves_annotation_and_originless_pending_proposal() {
+    // v0.7.1 saved annotations but did not yet write the proposal queue.
+    let path = copy_legacy_project();
+    let id = uuid::Uuid::new_v4();
+    let pending = serde_json::json!([{
+        "id": id, "kind": {"Comment": {"address": 4097, "new_comment": "replacement"}},
+        "rationale": "peer note", "confidence": 0.9
+    }]);
+    re_core::db::Database::open(&path)
+        .unwrap()
+        .set_metadata("pending_actions", &pending.to_string())
+        .unwrap();
+    for pass in 0..2 {
+        let mut project = Project::load(&path).unwrap();
+        assert_eq!(project.comments[&0x1001], "legacy annotation");
+        assert_eq!(project.pending_actions.len(), 1);
+        let proposal = &project.pending_actions[0];
+        assert_eq!(proposal.id, id);
+        assert_eq!(proposal.origin, re_core::project::ProposalOrigin::Unknown);
+        assert_eq!(proposal.confidence, Some(0.9));
+        assert!(project.review_history.is_empty());
+        assert_eq!(proposal.rationale, "peer note");
+        assert!(matches!(&proposal.kind,
+            re_core::project::ActionKind::Comment { address: 0x1001, new_comment } if new_comment == "replacement"));
+        if pass == 0 {
+            project.save(&path).unwrap();
+        }
+    }
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn reopen_rejects_inconsistent_raw_mapping() {
     let path = copy_legacy_project();
     for (start, offset, reason) in [

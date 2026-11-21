@@ -112,14 +112,15 @@ impl io::Write for ReportBuffer {
 }
 
 fn propose(project: &mut Project, kind: ActionKind, rationale: String, id: &Value) -> Value {
-    if project.pending_actions.len() >= 1024 {
+    if project.pending_actions.len() >= Project::MAX_PENDING_ACTIONS {
         return json!({"jsonrpc":"2.0", "id":id, "error":{"code":-32003,"message":"Proposal queue is full"}});
     }
     project.pending_actions.push(PendingAction {
         id: Uuid::new_v4(),
         kind,
         rationale,
-        confidence: 0.9,
+        confidence: Some(0.9),
+        origin: re_core::project::ProposalOrigin::Mcp,
     });
     tool_text_result(
         id,
@@ -1787,7 +1788,12 @@ mod tests {
                     .approve_action(reviewer.pending_actions[0].id)
                     .unwrap();
             }
-            reviewer.pending_actions.clear(); // reject remaining proposal
+            reviewer
+                .review_action(
+                    reviewer.pending_actions[0].id,
+                    re_core::project::ReviewDecision::Rejected,
+                )
+                .unwrap();
             assert_eq!(
                 reviewer.types.local_variables[&16][0]
                     .type_ref
@@ -1798,6 +1804,15 @@ mod tests {
             assert!(server.call_tool("save_project", save, json!(2))["error"].is_object());
             let saved = Project::load(&path).unwrap();
             assert!(saved.pending_actions.is_empty());
+            assert_eq!(saved.review_history.len(), 4);
+            assert_eq!(
+                saved.review_history[2].applied_value.as_deref(),
+                Some("int32_t")
+            );
+            assert_eq!(
+                saved.review_history[0].proposal.origin,
+                re_core::project::ProposalOrigin::Mcp
+            );
             assert_eq!(saved.functions.functions[&16].name, "main");
             assert_eq!(saved.comments[&16], "reviewed");
             assert!(!saved.comments.contains_key(&17));
