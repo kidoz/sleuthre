@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 use serde::Serialize;
 
 use re_core::analysis::pipeline;
-use re_core::arch::Architecture;
+use re_core::arch::{Architecture, Endianness};
 use re_core::disasm::Disassembler;
 use re_core::loader;
 
@@ -99,25 +99,7 @@ enum Commands {
         json: bool,
     },
     /// Load a raw binary file (firmware, shellcode, etc.) and disassemble it
-    Raw {
-        /// Path to the raw binary file
-        binary: PathBuf,
-        /// Architecture: x86, x86_64, arm, arm64, mips, mips64
-        #[arg(long)]
-        arch: String,
-        /// Base address to map the binary at (hex, e.g. 0x1000)
-        #[arg(long, value_parser = parse_hex_address, default_value = "0x0")]
-        base: u64,
-        /// Entry point address (hex); defaults to base address
-        #[arg(long, value_parser = parse_hex_address)]
-        entry: Option<u64>,
-        /// Number of instructions to disassemble
-        #[arg(long, default_value_t = 32)]
-        count: usize,
-        /// Output results as JSON
-        #[arg(long)]
-        json: bool,
-    },
+    Raw(RawArgs),
     /// Run analysis plugins
     Plugins {
         /// Path to the binary file
@@ -126,6 +108,63 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(clap::Args)]
+struct RawArgs {
+    /// Path to the raw binary file
+    binary: PathBuf,
+    /// Architecture (x86, x86_64, arm, arm64, mips, mips64, riscv32, riscv64)
+    #[arg(long)]
+    arch: String,
+    /// Map the whole file at this address
+    #[arg(long, value_parser = parse_hex_address, default_value = "0x0", conflicts_with = "regions")]
+    base: u64,
+    /// Map a named file slice. Repeat for each region. Numbers accept decimal or 0x hex.
+    #[arg(long = "region", value_name = "NAME:FILE_OFFSET:LENGTH:START", value_parser = parse_raw_region)]
+    regions: Vec<loader::RawRegion>,
+    /// Byte order (little or big). Regions default to the architecture's order.
+    /// Whole-file disassembly defaults to little-endian for compatibility.
+    #[arg(long, visible_alias = "endian", value_parser = parse_byte_order)]
+    byte_order: Option<Endianness>,
+    /// Entry address. Defaults to the base or the start of the first supplied region.
+    #[arg(long, value_parser = parse_hex_address)]
+    entry: Option<u64>,
+    /// Number of instructions to disassemble
+    #[arg(long, default_value_t = 32)]
+    count: usize,
+    /// Output the instructions as JSON
+    #[arg(long)]
+    json: bool,
+}
+
+fn parse_byte_order(value: &str) -> Result<Endianness, String> {
+    match value {
+        "little" => Ok(Endianness::Little),
+        "big" => Ok(Endianness::Big),
+        _ => Err("expected little or big".into()),
+    }
+}
+
+fn parse_raw_region(spec: &str) -> Result<loader::RawRegion, String> {
+    let fields: Vec<_> = spec.splitn(5, ':').map(str::trim).collect();
+    let [name, offset, length, start] = fields[..] else {
+        return Err("expected NAME:FILE_OFFSET:LENGTH:START".into());
+    };
+    if name.is_empty() {
+        return Err("region name is empty".into());
+    }
+    let number = |text, field| parse_hex_address(text).map_err(|e| format!("invalid {field}: {e}"));
+    let file_offset =
+        usize::try_from(number(offset, "file offset")?).map_err(|_| "file offset is too large")?;
+    let length =
+        usize::try_from(number(length, "length")?).map_err(|_| "region length is too large")?;
+    Ok(loader::RawRegion {
+        name: name.into(),
+        file_offset,
+        length,
+        start: number(start, "virtual start")?,
+    })
 }
 
 fn parse_hex_address(s: &str) -> Result<u64, String> {
@@ -172,14 +211,7 @@ fn main() -> Result<()> {
         Commands::Exports { binary, json } => cmd_exports(&binary, json),
         Commands::Imports { binary, json } => cmd_imports(&binary, json),
         Commands::Info { binary, json } => cmd_info(&binary, json),
-        Commands::Raw {
-            binary,
-            arch,
-            base,
-            entry,
-            count,
-            json,
-        } => cmd_raw(&binary, &arch, base, entry, count, json),
+        Commands::Raw(args) => cmd_raw(args),
         Commands::Plugins { binary, json } => cmd_plugins(&binary, json),
     }
 }
@@ -310,10 +342,20 @@ fn cmd_disasm(path: &Path, address: u64, count: usize, json: bool) -> Result<()>
     let disasm = Disassembler::new(binary.arch)
         .with_context(|| format!("Failed to create disassembler for {}", binary.arch))?;
 
+    print_disassembly(&disasm, &binary.memory_map, address, count, json)
+}
+
+fn print_disassembly(
+    disasm: &Disassembler,
+    memory: &re_core::memory::MemoryMap,
+    address: u64,
+    count: usize,
+    json: bool,
+) -> Result<()> {
     let mut entries = Vec::new();
     let mut addr = address;
     for _ in 0..count {
-        match disasm.disassemble_one(&binary.memory_map, addr) {
+        match disasm.disassemble_one(memory, addr) {
             Ok(insn) => {
                 let next = insn.address + insn.bytes.len() as u64;
                 entries.push(DisasmEntry {
@@ -628,66 +670,55 @@ fn parse_arch(s: &str) -> Result<Architecture> {
     }
 }
 
-fn cmd_raw(
-    path: &Path,
-    arch_str: &str,
-    base: u64,
-    entry: Option<u64>,
-    count: usize,
-    json: bool,
-) -> Result<()> {
-    let arch = parse_arch(arch_str)?;
-    let data =
-        std::fs::read(path).with_context(|| format!("Failed to read file: {}", path.display()))?;
+fn cmd_raw(args: RawArgs) -> Result<()> {
+    use std::io::Write;
 
-    let binary = loader::load_raw_binary(&data, base, arch, entry)
-        .with_context(|| "Failed to create raw binary mapping")?;
-
-    let disasm = Disassembler::new(binary.arch)
+    let arch = parse_arch(&args.arch)?;
+    let data = std::fs::read(&args.binary)
+        .with_context(|| format!("Failed to read file: {}", args.binary.display()))?;
+    let whole_file = args.regions.is_empty();
+    let order = args.byte_order.unwrap_or(if whole_file {
+        Endianness::Little
+    } else {
+        arch.default_endianness()
+    });
+    let regions = if whole_file {
+        vec![loader::RawRegion {
+            name: "raw".into(),
+            file_offset: 0,
+            length: data.len(),
+            start: args.base,
+        }]
+    } else {
+        args.regions
+    };
+    let binary = loader::load_raw_regions(&data, &regions, arch, order, args.entry)
+        .context("Failed to create raw binary mapping")?;
+    let disasm = Disassembler::with_endianness(binary.arch, binary.endianness)
         .with_context(|| format!("Failed to create disassembler for {}", binary.arch))?;
 
     let ep = binary.entry_point;
-    println!(
-        "Raw binary: {} bytes, {}, base=0x{:x}, entry=0x{:x}",
-        data.len(),
-        arch,
-        base,
-        ep,
-    );
-
-    let mut entries = Vec::new();
-    let mut addr = ep;
-    for _ in 0..count {
-        match disasm.disassemble_one(&binary.memory_map, addr) {
-            Ok(insn) => {
-                let next = insn.address + insn.bytes.len() as u64;
-                entries.push(DisasmEntry {
-                    address: format!("0x{:x}", insn.address),
-                    bytes: insn
-                        .bytes
-                        .iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                    mnemonic: insn.mnemonic,
-                    operands: insn.op_str,
-                });
-                addr = next;
+    {
+        let mut output: Box<dyn Write> = if args.json {
+            Box::new(std::io::stderr().lock())
+        } else {
+            Box::new(std::io::stdout().lock())
+        };
+        write!(output, "Raw binary: {} bytes, {arch}, ", data.len())?;
+        if whole_file {
+            write!(output, "base={:#x}, ", args.base)?;
+        }
+        writeln!(output, "entry={ep:#x}, byte order={order:?}")?;
+        if !whole_file {
+            for region in &regions {
+                writeln!(
+                    output,
+                    "  {}: file offset {:#x}, length {:#x}, start {:#x}",
+                    region.name, region.file_offset, region.length, region.start
+                )?;
             }
-            Err(_) => break,
         }
     }
 
-    if json {
-        println!("{}", serde_json::to_string_pretty(&entries)?);
-    } else {
-        for e in &entries {
-            println!(
-                "{:<14} {:<24} {} {}",
-                e.address, e.bytes, e.mnemonic, e.operands
-            );
-        }
-    }
-
-    Ok(())
+    print_disassembly(&disasm, &binary.memory_map, ep, args.count, args.json)
 }

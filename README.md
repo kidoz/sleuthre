@@ -69,6 +69,10 @@ cargo run -p re-cli -- --help
 # Export a repeatable JSON report for an executable
 cargo run -p re-cli -- triage path/to/binary > report.json
 cargo run -p re-cli -- triage path/to/binary --format markdown > report.md
+
+# Map two file slices and inspect the layout without decoding instructions
+cargo run -p re-cli -- raw re-core/tests/fixtures/two-regions.raw --arch mips \
+  --region low:0:4:0x1000 --region high:4:4:0x8000 --byte-order little --entry 0x8001 --count 0
 ```
 
 ## Testing

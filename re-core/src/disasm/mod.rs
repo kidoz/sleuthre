@@ -1,5 +1,5 @@
 use crate::Result;
-use crate::arch::Architecture;
+use crate::arch::{Architecture, Endianness};
 use crate::error::Error;
 use crate::memory::MemoryMap;
 use capstone::prelude::*;
@@ -53,14 +53,41 @@ pub struct Disassembler {
 
 impl Disassembler {
     pub fn new(arch: Architecture) -> Result<Self> {
+        // Existing callers use Capstone's default little-endian instruction encoding.
+        Self::with_endianness(arch, Endianness::Little)
+    }
+
+    /// Create both decoding handles for the requested instruction byte order.
+    pub fn with_endianness(arch: Architecture, order: Endianness) -> Result<Self> {
+        if order == Endianness::Big
+            && matches!(
+                arch,
+                Architecture::X86
+                    | Architecture::X86_64
+                    | Architecture::RiscV32
+                    | Architecture::RiscV64
+            )
+        {
+            return Err(Error::Analysis(format!(
+                "{arch} supports only little-endian instruction decoding"
+            )));
+        }
+        let endian = match order {
+            Endianness::Little => capstone::Endian::Little,
+            Endianness::Big => capstone::Endian::Big,
+        };
         Ok(Self {
-            cs: Self::build_capstone(arch, true)?,
-            cs_no_detail: Self::build_capstone(arch, false)?,
+            cs: Self::build_capstone(arch, endian, true)?,
+            cs_no_detail: Self::build_capstone(arch, endian, false)?,
             arch,
         })
     }
 
-    fn build_capstone(arch: Architecture, detail: bool) -> Result<Capstone> {
+    fn build_capstone(
+        arch: Architecture,
+        endian: capstone::Endian,
+        detail: bool,
+    ) -> Result<Capstone> {
         let cs = match arch {
             Architecture::X86 => Capstone::new()
                 .x86()
@@ -78,24 +105,28 @@ impl Disassembler {
                 .map_err(|e: capstone::Error| Error::Analysis(e.to_string()))?,
             Architecture::Arm => Capstone::new()
                 .arm()
+                .endian(endian)
                 .mode(capstone::arch::arm::ArchMode::Arm)
                 .detail(detail)
                 .build()
                 .map_err(|e: capstone::Error| Error::Analysis(e.to_string()))?,
             Architecture::Arm64 => Capstone::new()
                 .arm64()
+                .endian(endian)
                 .mode(capstone::arch::arm64::ArchMode::Arm)
                 .detail(detail)
                 .build()
                 .map_err(|e: capstone::Error| Error::Analysis(e.to_string()))?,
             Architecture::Mips => Capstone::new()
                 .mips()
+                .endian(endian)
                 .mode(capstone::arch::mips::ArchMode::Mips32)
                 .detail(detail)
                 .build()
                 .map_err(|e: capstone::Error| Error::Analysis(e.to_string()))?,
             Architecture::Mips64 => Capstone::new()
                 .mips()
+                .endian(endian)
                 .mode(capstone::arch::mips::ArchMode::Mips64)
                 .detail(detail)
                 .build()
@@ -129,7 +160,15 @@ impl Disassembler {
 
     pub fn disassemble_one(&self, memory: &MemoryMap, address: u64) -> Result<Instruction> {
         let data = memory
-            .get_data(address, 15)
+            .segment_at(address)
+            .and_then(|segment| {
+                let offset = address - segment.start;
+                let len = (segment.size - offset).min(15) as usize;
+                segment
+                    .data
+                    .get(usize::try_from(offset).ok()?..)?
+                    .get(..len)
+            })
             .ok_or_else(|| Error::Analysis(format!("Failed to read memory at 0x{:x}", address)))?;
 
         let insns = self
