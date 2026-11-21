@@ -181,7 +181,7 @@ impl SyntaxColors {
             edge_fallthrough: base01,
             edge_back: magenta,
 
-            link: blue,
+            link: egui::Color32::from_rgb(103, 183, 239),
             block_bg: base03,
             block_border: base01,
             nav_band_bg: base02,

@@ -889,7 +889,7 @@ impl SleuthreApp {
                                     .horizontal(|ui| {
                                         ui.monospace(
                                             egui::RichText::new(format!("{:08X}", addr))
-                                                .color(egui::Color32::from_rgb(0, 0, 200)),
+                                                .color(self.syntax.link),
                                         );
                                         ui.label(desc);
                                     })
