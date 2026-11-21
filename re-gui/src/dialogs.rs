@@ -17,6 +17,29 @@ fn parse_hex_u64(s: &str) -> Option<u64> {
     }
 }
 
+fn parse_hex_pattern(input: &str) -> Result<Vec<Option<u8>>, String> {
+    if input.trim().is_empty() {
+        return Err("Enter a hex byte or ?? to search.".into());
+    }
+    input
+        .split_whitespace()
+        .map(|token| {
+            if token == "??" {
+                return Ok(None);
+            }
+            if token.len() == 2
+                && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && let Ok(byte) = u8::from_str_radix(token, 16)
+            {
+                return Ok(Some(byte));
+            }
+            Err(format!(
+                "Invalid token ‘{token}’. Use two hex digits per byte or ?? for a wildcard."
+            ))
+        })
+        .collect()
+}
+
 fn apply_symbol_renames(project: &mut Project, symbols: &[ImportedSymbol]) -> usize {
     let mut applied = 0usize;
     for sym in symbols {
@@ -792,7 +815,13 @@ impl SleuthreApp {
                     self.search_performed = false;
                     self.search_results.clear();
                 }
-                if ui.button("Search").clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                let pattern = (self.search_mode == SearchMode::HexPattern)
+                    .then(|| parse_hex_pattern(&self.search_input));
+                let valid = !matches!(pattern, Some(Err(_)));
+                if (ui.add_enabled(valid, egui::Button::new("Search")).clicked()
+                    || ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                    && valid
+                {
                     self.search_performed = true;
                     self.search_results.clear();
                     if let Some(ref project) = self.project {
@@ -819,19 +848,8 @@ impl SleuthreApp {
                                 }
                             }
                             SearchMode::HexPattern => {
-                                let pattern: Vec<Option<u8>> = self
-                                    .search_input
-                                    .split_whitespace()
-                                    .filter_map(|tok| {
-                                        if tok == "??" {
-                                            Some(None)
-                                        } else {
-                                            u8::from_str_radix(tok, 16).ok().map(Some)
-                                        }
-                                    })
-                                    .collect();
-                                if !pattern.is_empty() {
-                                    for addr in project.memory_map.search_bytes(&pattern) {
+                                if let Some(Ok(bytes)) = &pattern {
+                                    for addr in project.memory_map.search_bytes(bytes) {
                                         self.search_results
                                             .push((addr, format!("Match at {:08X}", addr)));
                                     }
@@ -851,7 +869,9 @@ impl SleuthreApp {
                         }
                     }
                 }
-                if self.search_performed && self.search_results.is_empty() {
+                if let Some(Err(message)) = pattern {
+                    ui.colored_label(ui.visuals().error_fg_color, message);
+                } else if self.search_performed && self.search_results.is_empty() {
                     ui.label(if self.project.is_some() {
                         "No matches found."
                     } else {
@@ -1023,5 +1043,26 @@ impl SleuthreApp {
                     self.show_findings_window = false;
                 }
             });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_hex_pattern;
+
+    #[test]
+    fn hex_search_rejects_the_entire_malformed_pattern() {
+        for bad in ["GG", "0", "100", "+A", "?0", "é"] {
+            assert!(
+                parse_hex_pattern(&format!("48 {bad} 89"))
+                    .unwrap_err()
+                    .contains(bad)
+            );
+        }
+        assert!(parse_hex_pattern("   ").is_err());
+        assert_eq!(
+            parse_hex_pattern(" 48  ??  fe ").unwrap(),
+            [Some(0x48), None, Some(0xfe)]
+        );
     }
 }
