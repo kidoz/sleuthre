@@ -32,7 +32,7 @@ An open-source reverse engineering desktop application built in Rust.
 - **MCP server** — first-party Model Context Protocol implementation with 26 typed tools (triage reports, disasm, decomp, MLIL/SSA dumps, IL rewrite, recompile-diff, JSONL merge, signature scans, …) and 7 resources for AI agent integration.
 - **Plugins** — Rhai scripts hot-reloaded from `~/.sleuthre/plugins/`; async worker thread runs scripts without blocking the UI; FLIRT PAT importer for community signature corpora.
 - **GDB Remote Serial Protocol debugger** — connects to gdbserver / QEMU-gdbstub / LLDB platform via `GdbRemoteDebugger`; attach / step / continue / read registers + memory.
-- **AI approval queue** — review and approve AI-suggested renames and comments before they apply.
+- **Review changes** — review incoming peer renames, comments, and local type suggestions alongside proposals from MCP and local analysis. The project retains accepted and rejected decisions.
 
 ### Project persistence
 - SQLite-backed (`*.slre`) with full round-trip for functions, comments, xrefs, strings, types, classes, struct overlays, bookmarks, tags, and decompilation cache.
@@ -149,7 +149,7 @@ For a raw image, pass `open_binary` arguments like the following. Offsets and le
 }
 ```
 
-To review MCP proposals, call `save_project` with a new `.slre` filename and open that file in the GUI. Approve or reject each edit in the review window, then save the project. The File menu can reopen the review window.
+To review MCP proposals, call `save_project` with a new `.slre` filename and open that file in the GUI. Approve or reject each edit in the review window, then save the project. Use **File → Review changes…** to see pending proposals and the saved decision history.
 
 Resources are available at `sleuthre://project/{functions,strings,xrefs,comments,imports,exports,bookmarks}`.
 

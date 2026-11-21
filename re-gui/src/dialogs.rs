@@ -3,9 +3,62 @@ pub(crate) mod raw_image;
 use eframe::egui;
 use re_core::analysis::xrefs::XrefType;
 use re_core::import::symbols::ImportedSymbol;
-use re_core::project::{ActionKind, Project, UndoCommand};
+use re_core::project::{
+    ActionKind, PendingAction, Project, ProposalOrigin, ReviewDecision, UndoCommand,
+};
 
 use crate::app::{SearchMode, SleuthreApp};
+
+fn show_proposal(
+    ui: &mut egui::Ui,
+    action: &PendingAction,
+    before: Option<&str>,
+    accepted: Option<&re_core::project::ReviewedAction>,
+) {
+    let (target, proposed) = match &action.kind {
+        ActionKind::Rename {
+            address, new_name, ..
+        } => (
+            format!("Function name at {address:#x}"),
+            Some(new_name.as_str()),
+        ),
+        ActionKind::Comment {
+            address,
+            new_comment,
+        } => (
+            format!("Comment at {address:#x}"),
+            (!new_comment.is_empty()).then_some(new_comment.as_str()),
+        ),
+        ActionKind::SetLocalType {
+            function,
+            variable,
+            type_name,
+        } => (
+            format!("Type of {variable} in {function:#x}"),
+            Some(type_name.as_str()),
+        ),
+    };
+    ui.strong(target);
+    let origin = match &action.origin {
+        ProposalOrigin::Unknown => "Unknown origin".into(),
+        ProposalOrigin::Analysis => "Local analysis".into(),
+        ProposalOrigin::Mcp => "MCP".into(),
+        ProposalOrigin::Peer(name) => format!("Peer · {name}"),
+    };
+    ui.label(origin);
+    ui.label(format!("Before   {}", before.unwrap_or("—")));
+    if let Some(record) = accepted {
+        ui.label(format!(
+            "Applied   {}",
+            record.applied_value.as_deref().unwrap_or("—")
+        ));
+    } else {
+        ui.label(format!("Proposed   {}", proposed.unwrap_or("—")));
+    }
+    if !action.rationale.is_empty() {
+        ui.label(&action.rationale);
+    }
+}
 
 fn parse_hex_u64(s: &str) -> Option<u64> {
     let t = s.trim();
@@ -575,69 +628,87 @@ impl SleuthreApp {
         });
     }
 
-    fn show_approval_queue(&mut self, ctx: &egui::Context) {
+    pub(crate) fn show_approval_queue(&mut self, ctx: &egui::Context) {
         if !self.approval_queue_open {
             return;
         }
-        egui::Window::new("AI Approval Queue").show(ctx, |ui| {
-            let mut decision = None;
-            if let Some(project) = &self.project {
-                if project.pending_actions.is_empty() {
-                    ui.label("No pending actions.");
-                }
-                for action in &project.pending_actions {
-                    ui.push_id(action.id, |ui| {
-                        ui.group(|ui| {
-                            let change = match &action.kind {
-                                ActionKind::Rename {
-                                    address, new_name, ..
-                                } => format!("Rename {address:#x} to {new_name}"),
-                                ActionKind::Comment {
-                                    address,
-                                    new_comment,
-                                } if new_comment.is_empty() => {
-                                    format!("Remove comment at {address:#x}")
-                                }
-                                ActionKind::Comment {
-                                    address,
-                                    new_comment,
-                                } => format!("Comment at {address:#x}: {new_comment}"),
-                                ActionKind::SetLocalType {
-                                    function,
-                                    variable,
-                                    type_name,
-                                } => format!("Set {variable} in {function:#x} to {type_name}"),
-                            };
-                            ui.label(change);
-                            ui.label(&action.rationale);
-                            if ui.button("Approve").clicked() {
-                                decision = Some((action.id, true));
-                            }
-                            if ui.button("Reject").clicked() {
-                                decision = Some((action.id, false));
-                            }
-                        })
-                    });
-                }
-            }
-            if let (Some(project), Some((id, approve))) = (&mut self.project, decision) {
-                if approve {
-                    match project.approve_action(id) {
-                        Ok(change) => {
-                            self.cached_func_list_dirty = true;
-                            self.output.push_str(&format!("{change}\n"));
-                            self.decompile_current_function();
-                        }
-                        Err(e) => self.add_toast(crate::app::ToastKind::Error, e.to_string()),
+        egui::Window::new("Review changes")
+            .vscroll(true)
+            .show(ctx, |ui| {
+                let mut choice = None;
+                if let Some(project) = &self.project {
+                    ui.heading("Pending changes");
+                    if project.pending_actions.is_empty() {
+                        ui.label("No pending changes.");
                     }
-                } else {
-                    project.pending_actions.retain(|action| action.id != id);
+                    for action in &project.pending_actions {
+                        ui.push_id(action.id, |ui| {
+                            ui.group(|ui| {
+                                show_proposal(
+                                    ui,
+                                    action,
+                                    project.proposal_current_value(&action.kind).as_deref(),
+                                    None,
+                                );
+                                ui.horizontal(|ui| {
+                                    if ui.button("Approve").clicked() {
+                                        choice = Some((action.id, ReviewDecision::Accepted));
+                                    }
+                                    if ui.button("Reject").clicked() {
+                                        choice = Some((action.id, ReviewDecision::Rejected));
+                                    }
+                                });
+                            })
+                        });
+                    }
+                    if !project.review_history.is_empty() {
+                        ui.heading("Review history");
+                        for record in project.review_history.iter().rev() {
+                            ui.group(|ui| {
+                                ui.strong(match record.decision {
+                                    ReviewDecision::Accepted => "Accepted",
+                                    ReviewDecision::Rejected => "Rejected",
+                                });
+                                show_proposal(
+                                    ui,
+                                    &record.proposal,
+                                    record.before.as_deref(),
+                                    (record.decision == ReviewDecision::Accepted).then_some(record),
+                                );
+                            });
+                        }
+                    }
+                }
+                if let Some((id, decision)) = choice {
+                    self.review_proposal(id, decision);
+                }
+                if ui.button("Close").clicked() {
+                    self.approval_queue_open = false;
+                }
+            });
+    }
+
+    fn review_proposal(&mut self, id: uuid::Uuid, decision: ReviewDecision) {
+        // Publish earlier local edits before excluding an approved inbound edit from rebroadcast.
+        self.broadcast_pending_undo_events();
+        let Some(project) = &mut self.project else {
+            return;
+        };
+        match project.review_action(id, decision) {
+            Ok(change) => {
+                self.output.push_str(&format!("{change}\n"));
+                if decision == ReviewDecision::Accepted {
+                    if project.review_history.last().is_some_and(|record| {
+                        matches!(record.proposal.origin, ProposalOrigin::Peer(_))
+                    }) {
+                        self.last_published_undo_idx = project.undo_stack.len();
+                    }
+                    self.cached_func_list_dirty = true;
+                    self.decompile_current_function();
                 }
             }
-            if ui.button("Close").clicked() {
-                self.approval_queue_open = false;
-            }
-        });
+            Err(e) => self.add_toast(crate::app::ToastKind::Error, e.to_string()),
+        }
     }
 
     fn show_goto_dialog(&mut self, ctx: &egui::Context) {

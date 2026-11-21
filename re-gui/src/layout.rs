@@ -228,10 +228,8 @@ impl eframe::App for SleuthreApp {
         self.poll_plugin_results();
         self.apply_inbound_collab_events();
         self.poll_debugger_op();
-        // A blocking debugger op completes on a worker thread; with egui's
-        // reactive repainting the stop reply would sit unread in the channel
-        // until the next input event. Poll at a coarse interval instead.
-        if self.debugger_pending.is_some() {
+        // Worker channels can receive peer suggestions or a debugger reply while the UI is idle.
+        if self.debugger_pending.is_some() || self.collab_broadcaster.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
@@ -900,7 +898,7 @@ impl SleuthreApp {
                     self.load_project();
                     ui.close();
                 }
-                if ui.button("Review pending changes…").clicked() {
+                if ui.button("Review changes…").clicked() {
                     self.approval_queue_open = true;
                     ui.close();
                 }
@@ -2296,30 +2294,53 @@ impl SleuthreApp {
         }
     }
 
-    /// Drain inbound collab events from the broadcaster and apply them as
-    /// local `UndoCommand`s. The high-water mark is bumped past the resulting
-    /// undo entries so we don't immediately re-publish events we just applied.
+    /// Stage peer edits for review and apply the other supported sync events.
     pub(crate) fn apply_inbound_collab_events(&mut self) {
-        let Some(ref bcast) = self.collab_broadcaster else {
-            return;
-        };
-        let events = bcast.drain_inbound();
-        if events.is_empty() {
+        // Reanalysis temporarily owns the current project. Leave its events in the channel.
+        if self.reanalysis_receiver.is_some() {
             return;
         }
-        let Some(ref mut project) = self.project else {
+        let Some(ref broadcaster) = self.collab_broadcaster else {
             return;
         };
-        for ev in events {
-            if let Some(cmd) = collab_event_to_undo(&ev, project) {
-                project.execute(cmd);
-                self.output
-                    .push_str(&format!("[collab:{}] applied {}\n", ev.author, ev.kind));
+        for event in broadcaster.drain_inbound() {
+            self.receive_collab_event(&event);
+        }
+    }
+
+    fn receive_collab_event(&mut self, event: &re_core::collab::CollabEvent) {
+        use re_core::project::{PendingAction, Project, ProposalOrigin};
+        let Some(project) = &mut self.project else {
+            return;
+        };
+        match incoming_edit(event, project) {
+            Some(IncomingEdit::Proposal(kind)) => {
+                if project.pending_actions.len() >= Project::MAX_PENDING_ACTIONS {
+                    self.add_toast(
+                        crate::app::ToastKind::Warning,
+                        "Peer proposal queue is full.".into(),
+                    );
+                    return;
+                }
+                project.pending_actions.push(PendingAction {
+                    id: uuid::Uuid::new_v4(),
+                    kind,
+                    origin: ProposalOrigin::Peer(event.author.clone()),
+                    rationale: String::new(),
+                    confidence: None,
+                });
+                self.approval_queue_open = true;
             }
+            Some(IncomingEdit::Sync(command)) => {
+                project.execute(command);
+                self.output.push_str(&format!(
+                    "[collab:{}] applied {}\n",
+                    event.author, event.kind
+                ));
+                self.last_published_undo_idx = project.undo_stack.len();
+            }
+            None => {}
         }
-        // Mark all newly-applied commands as already-published so the
-        // outbound hook doesn't fan them back out.
-        self.last_published_undo_idx = project.undo_stack.len();
     }
 
     /// Drain any newly-executed `UndoCommand`s from the project's undo stack
@@ -2347,73 +2368,80 @@ impl SleuthreApp {
     }
 }
 
-/// Translate an inbound `CollabEvent` into a local `UndoCommand`. Returns
-/// `None` for kinds we don't yet apply (e.g. `patch`, which would need bytes
-/// rather than a length).
-fn collab_event_to_undo(
+enum IncomingEdit {
+    Proposal(re_core::project::ActionKind),
+    Sync(re_core::project::UndoCommand),
+}
+
+fn incoming_edit(
     event: &re_core::collab::CollabEvent,
     project: &re_core::project::Project,
-) -> Option<re_core::project::UndoCommand> {
+) -> Option<IncomingEdit> {
+    use re_core::project::{ActionKind, UndoCommand};
     let payload = &event.payload;
     let parse_addr = |key: &str| -> Option<u64> {
-        let s = payload.get(key)?.as_str()?;
+        let value = payload.get(key)?;
+        if let Some(address) = value.as_u64() {
+            return Some(address);
+        }
+        let s = value.as_str()?;
         if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
             u64::from_str_radix(rest, 16).ok()
         } else {
             s.parse().ok()
         }
     };
-    match event.kind.as_str() {
+    let command = match event.kind.as_str() {
         "rename" => {
             let address = parse_addr("address")?;
-            let new_name = payload
-                .get("new_name")
-                .and_then(|v| v.as_str())?
-                .to_string();
-            let old_name = project
-                .functions
-                .functions
-                .get(&address)
-                .map(|f| f.name.clone())
-                .unwrap_or_default();
-            Some(re_core::project::UndoCommand::Rename {
+            let new_name = payload.get("new_name")?.as_str()?.to_owned();
+            let old_name = project.functions.get_function(address)?.name.clone();
+            return Some(IncomingEdit::Proposal(ActionKind::Rename {
                 address,
                 old_name,
                 new_name,
-            })
+            }));
         }
         "comment" => {
             let address = parse_addr("address")?;
-            let new_comment = payload
-                .get("text")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let old_comment = project.comments.get(&address).cloned();
-            Some(re_core::project::UndoCommand::Comment {
+            let new_comment = match payload.get("text")? {
+                serde_json::Value::Null => String::new(),
+                text => text.as_str()?.to_owned(),
+            };
+            return Some(IncomingEdit::Proposal(ActionKind::Comment {
                 address,
-                old_comment,
                 new_comment,
-            })
+            }));
+        }
+        "set_local_type" => {
+            let function = parse_addr("function")?;
+            let variable = payload.get("variable")?.as_str()?.to_owned();
+            let type_name = payload.get("type")?.as_str()?.to_owned();
+            return Some(IncomingEdit::Proposal(ActionKind::SetLocalType {
+                function,
+                variable,
+                type_name,
+            }));
         }
         "add_bookmark" => {
             let address = parse_addr("address")?;
             let note = payload.get("note").and_then(|v| v.as_str())?.to_string();
-            Some(re_core::project::UndoCommand::AddBookmark { address, note })
+            UndoCommand::AddBookmark { address, note }
         }
         "remove_bookmark" => {
             let address = parse_addr("address")?;
             let note = payload.get("note").and_then(|v| v.as_str())?.to_string();
-            Some(re_core::project::UndoCommand::RemoveBookmark { address, note })
+            UndoCommand::RemoveBookmark { address, note }
         }
         "add_tag" => {
             let address = parse_addr("address")?;
             let tag = payload.get("tag").and_then(|v| v.as_str())?.to_string();
-            Some(re_core::project::UndoCommand::AddTag { address, tag })
+            UndoCommand::AddTag { address, tag }
         }
         "remove_tag" => {
             let address = parse_addr("address")?;
             let tag = payload.get("tag").and_then(|v| v.as_str())?.to_string();
-            Some(re_core::project::UndoCommand::RemoveTag { address, tag })
+            UndoCommand::RemoveTag { address, tag }
         }
         "accept_struct_candidate" => {
             let function = parse_addr("function")?;
@@ -2421,16 +2449,17 @@ fn collab_event_to_undo(
             let type_name = payload.get("type_name").and_then(|v| v.as_str())?;
             // Rebuilt from this peer's own candidate evidence so both sides
             // materialize the same state.
-            project.build_accept_struct_candidate(function, base, type_name)
+            project.build_accept_struct_candidate(function, base, type_name)?
         }
         "set_candidate_status" => {
             let function = parse_addr("function")?;
             let base = payload.get("base").and_then(|v| v.as_str())?;
             let status = evidence_status_from_str(payload.get("status").and_then(|v| v.as_str())?)?;
-            project.build_set_candidate_status(function, base, status)
+            project.build_set_candidate_status(function, base, status)?
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    Some(IncomingEdit::Sync(command))
 }
 
 fn evidence_status_str(
@@ -2601,4 +2630,141 @@ pub(crate) fn import_symbols_from_path(
         }
     }
     Ok(applied)
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+    use re_core::analysis::functions::{CallingConvention, Function};
+    use re_core::collab::CollabEvent;
+    use re_core::project::{Project, ProposalOrigin, ReviewDecision};
+
+    fn draw_review(
+        app: &mut SleuthreApp,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 800.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |_| app.show_approval_queue(ctx));
+        output.textures_delta.clear();
+        output
+    }
+
+    fn click_review_button(app: &mut SleuthreApp, ctx: &egui::Context, button: &str) {
+        draw_review(app, ctx, vec![]);
+        let frame = draw_review(app, ctx, vec![]);
+        let pos = frame
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.text() == button => {
+                    Some(t.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .expect("review button is visible");
+        for pressed in [true, false] {
+            draw_review(
+                app,
+                ctx,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        pressed,
+                        button: egui::PointerButton::Primary,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn peer_renames_are_reviewed_and_both_decisions_reopen_in_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("review.slre");
+        let mut app = SleuthreApp::default();
+        let mut project = Project::new("sample".into(), dir.path().join("sample.bin"));
+        for (addr, name) in [(16, "first"), (32, "second")] {
+            project.functions.add_function(Function {
+                start_address: addr,
+                end_address: None,
+                name: name.into(),
+                calling_convention: CallingConvention::default(),
+                stack_frame_size: 0,
+            });
+        }
+        app.project = Some(project);
+        for (author, address, new_name) in [("Jo", "0x10", "parse"), ("Lee", "0x20", "decode")] {
+            app.receive_collab_event(&CollabEvent {
+                kind: "rename".into(),
+                author: author.into(),
+                seq: 0,
+                payload: serde_json::json!({"address":address, "new_name":new_name}),
+            });
+        }
+        let project = app.project.as_ref().unwrap();
+        assert_eq!(project.pending_actions.len(), 2);
+        assert!(project.review_history.is_empty());
+        assert_eq!(project.functions.functions[&16].name, "first");
+        let ctx = egui::Context::default();
+        click_review_button(&mut app, &ctx, "Approve");
+        click_review_button(&mut app, &ctx, "Reject");
+        let project = app.project.as_mut().unwrap();
+        assert_eq!(project.undo_stack.len(), 1);
+        assert!(project.pending_actions.is_empty());
+        project.save_new(&path).unwrap();
+        drop(app);
+
+        let mut app = SleuthreApp::default();
+        app.load_project_from_path(&path);
+        let project = app.project.as_ref().unwrap();
+        assert!(project.pending_actions.is_empty());
+        assert_eq!(project.functions.functions[&16].name, "parse");
+        assert_eq!(project.functions.functions[&32].name, "second");
+        let history = &project.review_history;
+        assert_eq!(history.len(), 2);
+        for (record, (outcome, author, before)) in history.iter().zip([
+            (ReviewDecision::Accepted, "Jo", "first"),
+            (ReviewDecision::Rejected, "Lee", "second"),
+        ]) {
+            assert_eq!(record.decision, outcome);
+            assert_eq!(record.proposal.origin, ProposalOrigin::Peer(author.into()));
+            assert_eq!(record.before.as_deref(), Some(before));
+        }
+        app.approval_queue_open = true;
+        let ctx = egui::Context::default();
+        draw_review(&mut app, &ctx, vec![]);
+        let frame = draw_review(&mut app, &ctx, vec![]);
+        let labels: Vec<_> = frame
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Text(t) => Some(t.galley.text()),
+                _ => None,
+            })
+            .collect();
+        for text in [
+            "Accepted",
+            "Rejected",
+            "Peer · Jo",
+            "Peer · Lee",
+            "Function name at 0x10",
+            "Function name at 0x20",
+            "Before   first",
+            "Before   second",
+            "Applied   parse",
+            "Proposed   decode",
+        ] {
+            assert!(labels.contains(&text), "missing {text} in {labels:?}");
+        }
+    }
 }
