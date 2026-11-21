@@ -24,6 +24,11 @@ enum Commands {
     Triage {
         /// Path to the binary file
         binary: PathBuf,
+        /// Interpret the input as a raw image for this architecture
+        #[arg(long, value_parser = parse_arch)]
+        arch: Option<Architecture>,
+        #[command(flatten)]
+        mapping: RawMappingArgs,
         /// Report format (json or markdown)
         #[arg(long, default_value = "json")]
         format: re_core::analysis::triage::ReportFormat,
@@ -115,27 +120,33 @@ struct RawArgs {
     /// Path to the raw binary file
     binary: PathBuf,
     /// Architecture (x86, x86_64, arm, arm64, mips, mips64, riscv32, riscv64)
-    #[arg(long)]
-    arch: String,
-    /// Map the whole file at this address
-    #[arg(long, value_parser = parse_hex_address, default_value = "0x0", conflicts_with = "regions")]
-    base: u64,
-    /// Map a named file slice. Repeat for each region. Numbers accept decimal or 0x hex.
-    #[arg(long = "region", value_name = "NAME:FILE_OFFSET:LENGTH:START", value_parser = parse_raw_region)]
-    regions: Vec<loader::RawRegion>,
-    /// Byte order (little or big). Regions default to the architecture's order.
-    /// Whole-file disassembly defaults to little-endian for compatibility.
-    #[arg(long, visible_alias = "endian", value_parser = parse_byte_order)]
-    byte_order: Option<Endianness>,
-    /// Entry address. Defaults to the base or the start of the first supplied region.
-    #[arg(long, value_parser = parse_hex_address)]
-    entry: Option<u64>,
+    #[arg(long, value_parser = parse_arch)]
+    arch: Architecture,
+    #[command(flatten)]
+    mapping: RawMappingArgs,
     /// Number of instructions to disassemble
     #[arg(long, default_value_t = 32)]
     count: usize,
     /// Output the instructions as JSON
     #[arg(long)]
     json: bool,
+}
+
+#[derive(clap::Args)]
+struct RawMappingArgs {
+    /// Map the whole raw file at this address (default 0)
+    #[arg(long, value_parser = parse_hex_address, requires = "arch", conflicts_with = "regions")]
+    base: Option<u64>,
+    /// Map a named file slice. Repeat for each region. Numbers accept decimal or 0x hex.
+    #[arg(long = "region", value_name = "NAME:FILE_OFFSET:LENGTH:START", value_parser = parse_raw_region, requires = "arch")]
+    regions: Vec<loader::RawRegion>,
+    /// Byte order (little or big). Regions default to the architecture's order.
+    /// Whole-file disassembly defaults to little-endian for compatibility.
+    #[arg(long, visible_alias = "endian", value_parser = parse_byte_order, requires = "arch")]
+    byte_order: Option<Endianness>,
+    /// Entry address. Defaults to the base or the start of the first supplied region.
+    #[arg(long, value_parser = parse_hex_address, requires = "arch")]
+    entry: Option<u64>,
 }
 
 fn parse_byte_order(value: &str) -> Result<Endianness, String> {
@@ -189,11 +200,20 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Triage { binary, format } => {
+        Commands::Triage {
+            binary,
+            arch,
+            mapping,
+            format,
+        } => {
             let bytes = std::fs::read(&binary)
                 .with_context(|| format!("Failed to read {}", binary.display()))?;
-            let report = re_core::analysis::triage::TriageReport::from_bytes(&bytes)
-                .with_context(|| format!("Failed to triage {}", binary.display()))?;
+            use re_core::analysis::triage::TriageReport;
+            let report = match arch {
+                Some(arch) => TriageReport::from_loaded(&bytes, mapping.load(&bytes, arch)?),
+                None => TriageReport::from_bytes(&bytes)
+                    .with_context(|| format!("Failed to triage {}", binary.display()))?,
+            };
             report
                 .write(format, std::io::stdout().lock())
                 .context("Failed to write triage report")
@@ -670,30 +690,39 @@ fn parse_arch(s: &str) -> Result<Architecture> {
     }
 }
 
+impl RawMappingArgs {
+    fn load(&self, bytes: &[u8], arch: Architecture) -> Result<loader::LoadedBinary> {
+        let whole_file;
+        let (regions, default_order) = if self.regions.is_empty() {
+            whole_file = [loader::RawRegion {
+                name: "raw".into(),
+                file_offset: 0,
+                length: bytes.len(),
+                start: self.base.unwrap_or(0),
+            }];
+            (whole_file.as_slice(), Endianness::Little)
+        } else {
+            (self.regions.as_slice(), arch.default_endianness())
+        };
+        loader::load_raw_regions(
+            bytes,
+            regions,
+            arch,
+            self.byte_order.unwrap_or(default_order),
+            self.entry,
+        )
+        .context("Failed to create raw binary mapping")
+    }
+}
+
 fn cmd_raw(args: RawArgs) -> Result<()> {
     use std::io::Write;
 
-    let arch = parse_arch(&args.arch)?;
+    let arch = args.arch;
     let data = std::fs::read(&args.binary)
         .with_context(|| format!("Failed to read file: {}", args.binary.display()))?;
-    let whole_file = args.regions.is_empty();
-    let order = args.byte_order.unwrap_or(if whole_file {
-        Endianness::Little
-    } else {
-        arch.default_endianness()
-    });
-    let regions = if whole_file {
-        vec![loader::RawRegion {
-            name: "raw".into(),
-            file_offset: 0,
-            length: data.len(),
-            start: args.base,
-        }]
-    } else {
-        args.regions
-    };
-    let binary = loader::load_raw_regions(&data, &regions, arch, order, args.entry)
-        .context("Failed to create raw binary mapping")?;
+    let binary = args.mapping.load(&data, arch)?;
+    let order = binary.endianness;
     let disasm = Disassembler::with_endianness(binary.arch, binary.endianness)
         .with_context(|| format!("Failed to create disassembler for {}", binary.arch))?;
 
@@ -705,18 +734,16 @@ fn cmd_raw(args: RawArgs) -> Result<()> {
             Box::new(std::io::stdout().lock())
         };
         write!(output, "Raw binary: {} bytes, {arch}, ", data.len())?;
-        if whole_file {
-            write!(output, "base={:#x}, ", args.base)?;
+        if args.mapping.regions.is_empty() {
+            write!(output, "base={:#x}, ", args.mapping.base.unwrap_or(0))?;
         }
         writeln!(output, "entry={ep:#x}, byte order={order:?}")?;
-        if !whole_file {
-            for region in &regions {
-                writeln!(
-                    output,
-                    "  {}: file offset {:#x}, length {:#x}, start {:#x}",
-                    region.name, region.file_offset, region.length, region.start
-                )?;
-            }
+        for region in &args.mapping.regions {
+            writeln!(
+                output,
+                "  {}: file offset {:#x}, length {:#x}, start {:#x}",
+                region.name, region.file_offset, region.length, region.start
+            )?;
         }
     }
 

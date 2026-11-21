@@ -10,8 +10,8 @@ use crate::Result;
 use crate::analysis::constants::{ConstantScanner, DiscoveredConstant};
 use crate::analysis::entropy::shannon_entropy;
 use crate::analysis::strings::{DiscoveredString, StringEncoding, StringsManager};
-use crate::arch::Architecture;
-use crate::loader::{BinaryFormat, Import, load_binary_from_bytes};
+use crate::arch::{Architecture, Endianness};
+use crate::loader::{BinaryFormat, Import, LoadedBinary, RawFileMapping, load_binary_from_bytes};
 use crate::memory::{MemoryMap, Permissions};
 
 /// A virtual address, encoded losslessly in JSON even for JavaScript consumers.
@@ -29,6 +29,8 @@ pub struct ReportSegment {
     pub name: String,
     pub start: ReportAddress,
     pub size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_offset: Option<u64>,
     pub permissions: Permissions,
 }
 
@@ -83,6 +85,8 @@ pub struct TriageReport {
     pub sha256: String,
     pub format: BinaryFormat,
     pub architecture: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub byte_order: Option<Endianness>,
     pub entry_point: ReportAddress,
     /// Shannon entropy of the entire file, in bits per byte, rounded to six decimals.
     pub entropy: f64,
@@ -94,19 +98,23 @@ pub struct TriageReport {
 impl TriageReport {
     /// Hash, load, and scan one snapshot, so a concurrent file edit cannot mix inputs.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let binary = load_binary_from_bytes(bytes)?;
+        Ok(Self::from_loaded(bytes, load_binary_from_bytes(bytes)?))
+    }
+
+    /// Scan the supplied mapping. Pass the complete file bytes used to load
+    /// it so the digest and entropy also cover any unmapped parts of the file.
+    pub fn from_loaded(bytes: &[u8], binary: LoadedBinary) -> Self {
         let mut strings = StringsManager::default();
         strings.scan_memory(&binary.memory_map);
         let mut constants = ConstantScanner::default();
         constants.scan(&binary.memory_map);
 
-        Ok(
-            Self::header(bytes, binary.format, binary.arch, binary.entry_point).with_evidence(
-                &binary.memory_map,
-                binary.imports.into_iter(),
-                strings.strings.into_iter(),
-                constants.constants.into_iter(),
-            ),
+        Self::header(bytes, binary.format, binary.arch, binary.entry_point).with_evidence(
+            &binary.memory_map,
+            binary.raw_source.as_ref().map(|s| (s, binary.endianness)),
+            binary.imports.into_iter(),
+            strings.strings.into_iter(),
+            constants.constants.into_iter(),
         )
     }
 
@@ -115,6 +123,7 @@ impl TriageReport {
         let p = &analysis.project;
         Self::header(bytes, p.binary_format, p.arch, analysis.entry_point).with_evidence(
             &p.memory_map,
+            p.raw_mapping.as_ref().map(|m| (&m.source, m.endianness)),
             p.imports.iter().cloned(),
             p.strings.strings.iter().cloned(),
             p.constants.constants.iter().cloned(),
@@ -127,6 +136,7 @@ impl TriageReport {
             sha256: hex::encode(Sha256::digest(bytes)),
             format,
             architecture: arch.display_name(),
+            byte_order: None,
             entry_point: ReportAddress(entry),
             entropy: (shannon_entropy(bytes) * 1_000_000.0).round() / 1_000_000.0,
             segments: Vec::new(),
@@ -138,6 +148,7 @@ impl TriageReport {
     fn with_evidence(
         mut self,
         memory: &MemoryMap,
+        raw_mapping: Option<(&RawFileMapping, Endianness)>,
         imports: impl Iterator<Item = Import>,
         strings: impl Iterator<Item = DiscoveredString>,
         constants: impl Iterator<Item = DiscoveredConstant>,
@@ -165,11 +176,14 @@ impl TriageReport {
         self.imports.sort_by(|a, b| {
             (a.address, &a.library, &a.name).cmp(&(b.address, &b.library, &b.name))
         });
+        self.byte_order = raw_mapping.map(|(_, order)| order);
         self.segments
             .extend(memory.segments.iter().map(|s| ReportSegment {
                 name: s.name.clone(),
                 start: ReportAddress(s.start),
                 size: s.size,
+                file_offset:
+                    raw_mapping.and_then(|(source, _)| source.file_offsets.get(&s.start).copied()),
                 permissions: s.permissions,
             }));
         self
@@ -193,13 +207,16 @@ impl TriageReport {
         writeln!(out, "- Report version: {}", self.schema_version)?;
         writeln!(out, "- SHA-256: `{}`", self.sha256)?;
         writeln!(out, "- Format: {:?} ({})", self.format, self.architecture)?;
+        if let Some(order) = self.byte_order {
+            writeln!(out, "- Byte order: {order:?}")?;
+        }
         writeln!(out, "- Entry point: `{:#x}`", self.entry_point.0)?;
         writeln!(out, "- Entropy: {:.6} bits per byte", self.entropy)?;
         // Indented code blocks keep sample text literal. Debug-quoting each
         // string escapes embedded newlines so samples cannot start a new block.
         writeln!(out, "\n## Segments ({})\n", self.segments.len())?;
         for s in &self.segments {
-            writeln!(
+            write!(
                 out,
                 "    {:#x}  {:?}  {} bytes  {}",
                 s.start.0,
@@ -211,6 +228,10 @@ impl TriageReport {
                     .collect::<Vec<_>>()
                     .join(" | ")
             )?;
+            if let Some(offset) = s.file_offset {
+                write!(out, "  file offset {offset:#x}")?;
+            }
+            writeln!(out)?;
         }
         writeln!(out, "\n## Imports ({})\n", self.imports.len())?;
         for i in &self.imports {
