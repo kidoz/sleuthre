@@ -4,6 +4,7 @@
 
 ### Added
 
+- User documentation under `docs/` organized into tutorials, how-to guides, reference, and explanation sections, covering the GUI, CLI, MCP server, project formats, and analysis design
 - Exact function ranges recovered from PE x64 `.pdata` exception tables, so functions are bounded precisely even without prologue patterns
 - Jump-table dispatches recover `Switch` case targets instead of dropping computed jumps
 

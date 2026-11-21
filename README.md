@@ -38,6 +38,15 @@ An open-source reverse engineering desktop application built in Rust.
 ### Project persistence
 - SQLite-backed (`*.slre`) with full round-trip for functions, comments, xrefs, strings, types, classes, struct overlays, bookmarks, tags, and decompilation cache.
 
+## Documentation
+
+The user documentation is in [`docs/`](docs/README.md) and is organized by what you need:
+
+- **Tutorials** — guided lessons, starting with [Your first analysis](docs/tutorials/first-analysis.md)
+- **How-to guides** — task recipes for analysis, collaboration, plugins, and debugging
+- **Reference** — CLI commands, MCP tools, GUI shortcuts, project formats, and supported architectures
+- **Explanation** — architecture, the analysis pipeline, the decompiler, and the review model
+
 ## Architecture
 
 The project is a Cargo workspace with four crates:
