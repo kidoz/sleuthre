@@ -613,7 +613,8 @@ fn load_macho_single(macho: mach::MachO, bytes: &[u8]) -> Result<LoadedBinary> {
 }
 
 /// A file-backed region of a raw image. Both file offsets and lengths are in bytes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RawRegion {
     pub name: String,
     pub file_offset: usize,

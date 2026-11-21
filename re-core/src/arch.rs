@@ -3,20 +3,30 @@ use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum Architecture {
+    #[serde(alias = "x86")]
     X86,
     #[default]
+    #[serde(alias = "x86_64")]
     X86_64,
+    #[serde(alias = "arm")]
     Arm,
+    #[serde(alias = "arm64")]
     Arm64,
+    #[serde(alias = "mips")]
     Mips,
+    #[serde(alias = "mips64")]
     Mips64,
+    #[serde(alias = "riscv32")]
     RiscV32,
+    #[serde(alias = "riscv64")]
     RiscV64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Endianness {
+    #[serde(alias = "little")]
     Little,
+    #[serde(alias = "big")]
     Big,
 }
 

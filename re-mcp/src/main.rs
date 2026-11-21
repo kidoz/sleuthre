@@ -1,11 +1,14 @@
 use anyhow::{Context, Result};
 use re_core::analysis::cfg::ControlFlowGraph;
-use re_core::analysis::pipeline::{AnalysisMode, analyze_binary_with_triage};
-use re_core::analysis::triage::{ReportFormat, TriageReport};
+use re_core::analysis::pipeline::{AnalysisMode, analyze_file_with_triage};
+use re_core::analysis::triage::ReportFormat;
+use re_core::arch::{Architecture, Endianness};
 use re_core::debuginfo;
 use re_core::disasm::Disassembler;
+use re_core::loader::{self, RawRegion};
 use re_core::project::{ActionKind, PendingAction, Project};
 use re_core::signatures::SignatureDatabase;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::io::{self, BufRead};
 use std::path::PathBuf;
@@ -17,8 +20,76 @@ const MAX_TRIAGE_BYTES: usize = 8 * 1024 * 1024;
 
 struct McpServer {
     project: Option<Project>,
-    triage: Option<TriageReport>,
     disasm: Option<Disassembler>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMapping {
+    arch: Architecture,
+    byte_order: Option<Endianness>,
+    entry_point: Option<u64>,
+    regions: Vec<RawRegion>,
+}
+
+impl RawMapping {
+    fn schema() -> Value {
+        json!({
+            "type": "object",
+            "description": "Map named file regions of a raw image. Offsets and lengths are in bytes.",
+            "properties": {
+                "arch": { "type": "string", "enum": ["x86", "x86_64", "arm", "arm64", "mips", "mips64", "riscv32", "riscv64"] },
+                "byte_order": { "enum": ["little", "big", null], "description": "Defaults to the architecture's byte order." },
+                "entry_point": { "type": ["integer", "null"], "minimum": 0, "description": "Defaults to the virtual start of the first region supplied." },
+                "regions": {
+                    "type": "array", "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string", "pattern": r"\S" },
+                            "file_offset": { "type": "integer", "minimum": 0 },
+                            "length": { "type": "integer", "minimum": 1 },
+                            "start": { "type": "integer", "minimum": 0, "description": "Virtual start address." }
+                        },
+                        "required": ["name", "file_offset", "length", "start"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["arch", "regions"],
+            "additionalProperties": false
+        })
+    }
+
+    fn parse(value: &Value) -> Result<Self> {
+        anyhow::ensure!(value.is_object(), "raw must be an object");
+        anyhow::ensure!(
+            value["arch"].is_string(),
+            "raw.arch requires an architecture name"
+        );
+        anyhow::ensure!(
+            value["byte_order"].is_null() || value["byte_order"].is_string(),
+            "raw.byte_order must be little or big"
+        );
+        if let Some(regions) = value["regions"].as_array() {
+            anyhow::ensure!(
+                !regions.is_empty(),
+                "raw.regions must contain at least one region"
+            );
+            anyhow::ensure!(
+                regions.iter().all(Value::is_object),
+                "each raw region must be an object"
+            );
+        }
+        let mapping = Self::deserialize(value)?;
+        for (index, region) in mapping.regions.iter().enumerate() {
+            anyhow::ensure!(
+                !region.name.trim().is_empty(),
+                "raw.regions[{index}] requires a name"
+            );
+        }
+        Ok(mapping)
+    }
 }
 
 /// Bound the serialized tool text while writing, including JSON escaping.
@@ -262,7 +333,6 @@ impl McpServer {
     fn new() -> Self {
         Self {
             project: None,
-            triage: None,
             disasm: None,
         }
     }
@@ -297,7 +367,7 @@ impl McpServer {
                             "description": "Load a binary file (ELF/PE/Mach-O/raw) for analysis",
                             "inputSchema": {
                                 "type": "object",
-                                "properties": { "path": { "type": "string" } },
+                                "properties": { "path": { "type": "string" }, "raw": RawMapping::schema() },
                                 "required": ["path"]
                             }
                         },
@@ -624,15 +694,45 @@ impl McpServer {
                     return missing_param_error(&id, "path");
                 };
                 let path = PathBuf::from(path);
-                match analyze_binary_with_triage(&path, AnalysisMode::Normal, None, |_| {}) {
-                    Ok((result, report)) => {
-                        self.disasm = Disassembler::new(result.project.arch).ok();
+                let raw = match args.get("raw").map(RawMapping::parse).transpose() {
+                    Ok(mapping) => mapping,
+                    Err(e) => {
+                        return json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":format!("Invalid raw mapping: {e}")}});
+                    }
+                };
+                let analysis = analyze_file_with_triage(
+                    &path,
+                    AnalysisMode::Normal,
+                    None,
+                    |_| {},
+                    |bytes| match &raw {
+                        Some(mapping) => loader::load_raw_regions(
+                            bytes,
+                            &mapping.regions,
+                            mapping.arch,
+                            mapping
+                                .byte_order
+                                .unwrap_or_else(|| mapping.arch.default_endianness()),
+                            mapping.entry_point,
+                        ),
+                        None => loader::load_binary_from_bytes(bytes),
+                    },
+                );
+                match analysis {
+                    Ok((mut result, report)) => {
+                        result.project.triage_report = Some(report.into());
+                        self.disasm = result.project.disassembler().ok();
                         self.project = Some(result.project);
-                        self.triage = Some(report);
                         tool_text_result(&id, "Binary loaded successfully")
                     }
                     Err(e) => {
-                        json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32001, "message": e.to_string() } })
+                        let code = if raw.is_some() && matches!(e, re_core::error::Error::Loader(_))
+                        {
+                            -32602
+                        } else {
+                            -32001
+                        };
+                        json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": e.to_string() } })
                     }
                 }
             }
@@ -650,7 +750,11 @@ impl McpServer {
                         }
                     },
                 };
-                let Some(report) = &self.triage else {
+                let Some(report) = self
+                    .project
+                    .as_ref()
+                    .and_then(|p| p.triage_report.as_deref())
+                else {
                     return json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":"Open a binary to get its triage report"}});
                 };
                 let mut buffer = ReportBuffer(Vec::new());
@@ -687,7 +791,14 @@ impl McpServer {
                     });
                 };
                 if let (Some(project), Some(disasm)) = (&self.project, &self.disasm) {
-                    match disasm.disassemble_range(&project.memory_map, addr, byte_limit) {
+                    let size = project
+                        .memory_map
+                        .segment_at(addr)
+                        .map_or(byte_limit, |segment| {
+                            let remaining = segment.size - (addr - segment.start);
+                            remaining.min(byte_limit as u64) as usize
+                        });
+                    match disasm.disassemble_range(&project.memory_map, addr, size) {
                         Ok(insns) => {
                             let result: Vec<_> = insns.into_iter().take(count).collect();
                             tool_result(&id, &result)
@@ -1450,6 +1561,7 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use re_core::analysis::triage::TriageReport;
 
     #[test]
     fn initialize_returns_protocol_version() {
@@ -1515,13 +1627,114 @@ mod tests {
     }
 
     #[test]
+    fn raw_open_matches_the_shared_report_and_preserves_it_on_overlap() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../re-core/tests/fixtures/two-regions.raw");
+        let mut server = McpServer::new();
+        let mut call = |name, args| {
+            server.handle_request(json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": name, "arguments": args }
+            }))
+        };
+        let mut args = json!({
+            "path": fixture,
+            "raw": {
+                "arch": "mips", "byte_order": "little", "entry_point": 32769,
+                "regions": [
+                    {"name": "high", "file_offset": 4, "length": 4, "start": 32768},
+                    {"name": "low", "file_offset": 0, "length": 4, "start": 4096}
+                ]
+            }
+        });
+        assert!(call("open_binary", args.clone())["result"].is_object());
+        let before = call("get_triage_report", json!({}));
+        assert_eq!(
+            before["result"]["content"][0]["text"].as_str().unwrap(),
+            include_str!("../../re-core/tests/fixtures/two-regions.json")
+        );
+
+        args["raw"]["regions"][0]["start"] = json!(4098);
+        let error = call("open_binary", args);
+        assert_eq!(error["error"]["code"], -32602);
+        let message = error["error"]["message"].as_str().unwrap();
+        assert!(
+            ["high", "low", "overlaps"]
+                .iter()
+                .all(|word| message.contains(word)),
+            "{message}"
+        );
+        assert_eq!(call("get_triage_report", json!({})), before);
+        for (pattern, addresses) in [
+            ("42", "[\"0x1001\"]"),
+            ("46", "[\"0x8001\"]"),
+            ("44 45", "[]"),
+        ] {
+            let result = call("search_memory", json!({"pattern":pattern}));
+            assert_eq!(result["result"]["content"][0]["text"], addresses);
+        }
+    }
+
+    #[test]
+    fn raw_open_uses_architecture_and_first_region_defaults() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../re-core/tests/fixtures/mips-addiu.raw");
+        let mut server = McpServer::new();
+        let opened = server.call_tool(
+            "open_binary",
+            json!({
+                "path": fixture, "raw": { "arch": "mips", "regions": [
+                    {"name": "code", "file_offset": 4, "length": 4, "start": 32768},
+                    {"name": "low", "file_offset": 0, "length": 4, "start": 4096}
+                ]}
+            }),
+            json!(1),
+        );
+        assert!(opened["result"].is_object(), "{opened}");
+        let project = server.project.as_ref().unwrap();
+        let report = project.triage_report.as_ref().unwrap();
+        assert_eq!(report.byte_order, Some(Endianness::Big));
+        assert_eq!(report.entry_point.0, 0x8000);
+        let response = server.call_tool("get_disasm", json!({"address":32768,"count":1}), json!(2));
+        let listing: Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(listing[0]["mnemonic"], "addiu");
+    }
+
+    #[test]
+    fn malformed_raw_options_fail_before_file_io() {
+        let mut server = McpServer::new();
+        let region = json!({"name":"low","file_offset":0,"length":4,"start":4096});
+        for raw in [
+            Value::Null,
+            json!({"arch":"mips", "regions":[]}),
+            json!({"arch":"unknown", "regions":[region]}),
+            json!({"arch":"mips", "byte_order":"middle", "regions":[region]}),
+            json!({"arch":"mips", "regions":[region], "typo":1}),
+            json!({"arch":"mips", "regions":[{"name":" ","length":4,"file_offset":0,"start":0}]}),
+            json!({"arch":"mips", "regions":[{"name":"low","length":4,"file_offset":-1,"start":0}]}),
+            json!({"arch":"mips", "regions":[["low", 0, 4, 4096]]}),
+        ] {
+            let response = server.call_tool(
+                "open_binary",
+                json!({"path":"missing-image","raw":raw}),
+                json!(1),
+            );
+            assert_eq!(response["error"]["code"], -32602, "{raw}: {response}");
+        }
+    }
+
+    #[test]
     fn oversized_triage_tool_result_returns_an_error_without_partial_content() {
         let mut server = McpServer::new();
         let mut report =
             TriageReport::from_bytes(include_bytes!("../../re-core/tests/fixtures/triage.pe"))
                 .unwrap();
         report.imports[0].name = "a".repeat(MAX_TRIAGE_BYTES);
-        server.triage = Some(report);
+        let mut project = Project::new("fixture".into(), PathBuf::new());
+        project.triage_report = Some(report.into());
+        server.project = Some(project);
         let response = server.call_tool("get_triage_report", json!({}), json!(1));
         assert_eq!(response["error"]["code"], -32002);
         assert!(

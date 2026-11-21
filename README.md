@@ -121,7 +121,7 @@ The MCP server exposes tools for AI agents to interact with a loaded binary:
 
 | Tool | Description |
 |------|-------------|
-| `open_binary` | Load a binary file (ELF/PE/Mach-O/raw) for analysis |
+| `open_binary` | Open an ELF, PE, or Mach-O file by path. Supply `raw` to map a raw image. |
 | `get_triage_report` | Return the opened binary’s report as text. The optional `format` accepts `json` (default) or `markdown`. The MCP response supports reports up to 8 MiB. |
 | `get_disasm` | Get disassembly listing at an address |
 | `get_xrefs` | Get cross-references (to/from/both) |
@@ -131,6 +131,23 @@ The MCP server exposes tools for AI agents to interact with a loaded binary:
 | `add_comment` | Propose adding or removing a comment |
 | `rewrite_il` | Propose a local variable type |
 | `save_project` | Save the analysis and pending proposals to a project file |
+
+For a raw image, pass `open_binary` arguments like the following. Offsets and lengths are in bytes. Omitting `byte_order` uses the architecture’s default. Omitting `entry_point` uses the first supplied region’s virtual start.
+
+```json
+{
+  "path": "re-core/tests/fixtures/two-regions.raw",
+  "raw": {
+    "arch": "mips",
+    "byte_order": "little",
+    "entry_point": 32769,
+    "regions": [
+      {"name": "low", "file_offset": 0, "length": 4, "start": 4096},
+      {"name": "high", "file_offset": 4, "length": 4, "start": 32768}
+    ]
+  }
+}
+```
 
 To review MCP proposals, call `save_project` with a new `.slre` filename and open that file in the GUI. Approve or reject each edit in the review window, then save the project. The File menu can reopen the review window.
 
