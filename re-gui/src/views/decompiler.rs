@@ -28,7 +28,18 @@ impl SleuthreApp {
                 self.trigger_decompile = true;
             }
             ui.add_space(8.0);
-            ui.label(format!("Function: 0x{:X}", self.current_address));
+            if let Some(function) = self
+                .project
+                .as_ref()
+                .and_then(|p| p.functions.functions.get(&self.current_address))
+            {
+                ui.label(format!(
+                    "Function: {} (0x{:X})",
+                    function.name, self.current_address
+                ));
+            } else {
+                ui.label(format!("Address: 0x{:X}", self.current_address));
+            }
             if signature_inferred {
                 ui.add_space(8.0);
                 let badge = ui
@@ -115,26 +126,9 @@ impl SleuthreApp {
             });
 
             if response.clicked()
-                && let Some(pos) = response.interact_pointer_pos()
+                && let Some(destination) = hover_addr
             {
-                let relative_pos = pos - response.rect.min;
-                let cursor = galley.cursor_from_pos(relative_pos);
-                let char_idx = cursor.index.0;
-
-                // Find annotation at this index
-                for ann in &self.decompiled_code.annotations {
-                    if char_idx >= ann.start && char_idx < ann.end {
-                        match &ann.kind {
-                            re_core::il::hlil::AnnotationKind::Function(addr)
-                            | re_core::il::hlil::AnnotationKind::Global(addr) => {
-                                self.current_address = *addr;
-                                self.update_cfg();
-                            }
-                            _ => {}
-                        }
-                        break;
-                    }
-                }
+                self.follow_reference(self.current_address, destination);
             }
 
             response.context_menu(|ui| {

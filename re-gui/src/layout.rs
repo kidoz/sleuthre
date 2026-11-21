@@ -342,9 +342,9 @@ impl SleuthreApp {
                         );
                         ui.separator();
 
-                        // Cursor address (colored)
+                        let cursor = self.focused_address.unwrap_or(self.current_address);
                         ui.label(
-                            egui::RichText::new(format!("Cursor: {:08X}", self.current_address))
+                            egui::RichText::new(format!("Cursor: {cursor:08X}"))
                                 .size(11.0)
                                 .monospace()
                                 .color(self.syntax.link),
@@ -363,10 +363,8 @@ impl SleuthreApp {
                         // Current function name
                         if let Some(func) = project
                             .functions
-                            .functions
-                            .range(..=self.current_address)
-                            .next_back()
-                            .map(|(_, f)| f)
+                            .find_function_containing(cursor)
+                            .and_then(|start| project.functions.functions.get(&start))
                         {
                             ui.separator();
                             ui.label(
@@ -493,11 +491,14 @@ impl SleuthreApp {
     }
 
     fn open_bookmark(&mut self) {
-        self.bookmark_active = true;
+        let Some(address) = self.selected_address() else {
+            return;
+        };
+        self.bookmark_address = Some(address);
         self.bookmark_input = self
             .project
             .as_ref()
-            .and_then(|project| project.bookmarks.get(&self.current_address))
+            .and_then(|project| project.bookmarks.get(&address))
             .cloned()
             .unwrap_or_default();
     }
@@ -928,7 +929,8 @@ impl SleuthreApp {
                 }
                 ui.separator();
                 if ui
-                    .add(
+                    .add_enabled(
+                        self.selected_address().is_some(),
                         egui::Button::new("Bookmark")
                             .shortcut_text(ctx.format_shortcut(&BOOKMARK_SHORTCUT)),
                     )

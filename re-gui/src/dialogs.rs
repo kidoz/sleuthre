@@ -503,27 +503,45 @@ impl SleuthreApp {
             return;
         };
         egui::Window::new(format!("Xrefs to {:08X}", addr)).show(ctx, |ui| {
-            if let Some(project) = &self.project {
-                if let Some(xrefs) = project.xrefs.to_address_xrefs.get(&addr) {
-                    for xref in xrefs {
-                        let type_str = match xref.xref_type {
-                            XrefType::Call => "Call",
-                            XrefType::Jump => "Jump",
-                            XrefType::DataRead => "DataRead",
-                            XrefType::DataWrite => "DataWrite",
-                            XrefType::StringRef => "StringRef",
-                        };
-                        ui.horizontal(|ui| {
-                            ui.monospace(format!("{:08X}", xref.from_address));
-                            ui.label(type_str);
-                        });
+            let mut destination = None;
+            egui::ScrollArea::vertical()
+                .max_height(320.0)
+                .show(ui, |ui| {
+                    if let Some(project) = &self.project {
+                        if let Some(xrefs) = project.xrefs.to_address_xrefs.get(&addr) {
+                            for xref in xrefs {
+                                let type_str = match xref.xref_type {
+                                    XrefType::Call => "Call",
+                                    XrefType::Jump => "Jump",
+                                    XrefType::DataRead => "DataRead",
+                                    XrefType::DataWrite => "DataWrite",
+                                    XrefType::StringRef => "StringRef",
+                                };
+                                if ui
+                                    .link(
+                                        egui::RichText::new(format!(
+                                            "{:08X}  {type_str}",
+                                            xref.from_address
+                                        ))
+                                        .monospace(),
+                                    )
+                                    .clicked()
+                                {
+                                    destination = Some(xref.from_address);
+                                }
+                            }
+                            if xrefs.is_empty() {
+                                ui.label("No xrefs found.");
+                            }
+                        } else {
+                            ui.label("No xrefs found.");
+                        }
                     }
-                    if xrefs.is_empty() {
-                        ui.label("No xrefs found.");
-                    }
-                } else {
-                    ui.label("No xrefs found.");
-                }
+                });
+            if let Some(destination) = destination {
+                self.focus_or_open_tab(crate::app::Tab::Disassembly);
+                self.follow_reference(addr, destination);
+                self.xref_address = None;
             }
             if ui.button("Close").clicked() {
                 self.xref_address = None;
@@ -634,13 +652,13 @@ impl SleuthreApp {
     }
 
     fn show_bookmark_dialog(&mut self, ctx: &egui::Context) {
-        if !self.bookmark_active {
+        let Some(address) = self.bookmark_address else {
             return;
-        }
+        };
         egui::Window::new("Bookmark")
             .collapsible(false)
             .show(ctx, |ui| {
-                ui.label(format!("Address: {:08X}", self.current_address));
+                ui.label(format!("Address: {:08X}", address));
                 ui.label("Note:");
                 ui.text_edit_singleline(&mut self.bookmark_input);
                 ui.horizontal(|ui| {
@@ -648,28 +666,21 @@ impl SleuthreApp {
                     {
                         if let Some(ref mut project) = self.project {
                             project.execute(UndoCommand::AddBookmark {
-                                address: self.current_address,
+                                address,
                                 note: self.bookmark_input.clone(),
                             });
                         }
-                        self.bookmark_active = false;
+                        self.bookmark_address = None;
                     }
                     if ui.button("Remove").clicked() {
                         if let Some(ref mut project) = self.project {
-                            let note = project
-                                .bookmarks
-                                .get(&self.current_address)
-                                .cloned()
-                                .unwrap_or_default();
-                            project.execute(UndoCommand::RemoveBookmark {
-                                address: self.current_address,
-                                note,
-                            });
+                            let note = project.bookmarks.get(&address).cloned().unwrap_or_default();
+                            project.execute(UndoCommand::RemoveBookmark { address, note });
                         }
-                        self.bookmark_active = false;
+                        self.bookmark_address = None;
                     }
                     if ui.button("Cancel").clicked() {
-                        self.bookmark_active = false;
+                        self.bookmark_address = None;
                     }
                 });
             });

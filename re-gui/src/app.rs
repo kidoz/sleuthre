@@ -44,7 +44,7 @@ pub(crate) struct SleuthreApp {
     pub(crate) goto_active: bool,
     pub(crate) goto_input: String,
 
-    pub(crate) bookmark_active: bool,
+    pub(crate) bookmark_address: Option<u64>,
     pub(crate) bookmark_input: String,
 
     pub(crate) search_active: bool,
@@ -563,7 +563,7 @@ impl Default for SleuthreApp {
             export_filter: String::new(),
             goto_active: false,
             goto_input: String::new(),
-            bookmark_active: false,
+            bookmark_address: None,
             bookmark_input: String::new(),
             search_active: false,
             search_input: String::new(),
@@ -1081,6 +1081,7 @@ impl SleuthreApp {
         self.cached_func_list_dirty = true;
         self.rename_address = None;
         self.comment_address = None;
+        self.bookmark_address = None;
         self.xref_address = None;
         self.search_results.clear();
         self.search_performed = false;
@@ -1108,6 +1109,24 @@ impl SleuthreApp {
             .memory_map
             .contains_address(address)
             .then_some(address)
+    }
+
+    pub(crate) fn follow_reference(&mut self, origin: u64, destination: u64) {
+        let Some(project) = &mut self.project else {
+            return;
+        };
+        let current = project
+            .nav_history
+            .get(..project.nav_position)
+            .and_then(|history| history.last());
+        if current != Some(&origin) {
+            project.navigate_to(origin);
+        }
+        if destination != origin {
+            project.navigate_to(destination);
+        }
+        self.current_address = destination;
+        self.update_cfg();
     }
 
     pub(crate) fn open_rename(&mut self, address: u64) {
@@ -1209,7 +1228,7 @@ impl SleuthreApp {
             || self.xref_address.is_some()
             || self.approval_queue_open
             || self.goto_active
-            || self.bookmark_active
+            || self.bookmark_address.is_some()
             || self.search_active
             || self.tag_active
     }
@@ -1253,4 +1272,23 @@ fn project_start_address(project: &Project) -> Option<u64> {
                 .or_else(|| segments.first())
                 .map(|segment| segment.start)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reference_history_returns_to_the_selected_instruction() {
+        let mut project = Project::new("sample".into(), "sample.exe".into());
+        project.navigate_to(0x1000);
+        let mut app = SleuthreApp::default();
+        app.set_project(project);
+        app.follow_reference(0x1004, 0x2000);
+        app.follow_reference(0x2000, 0x3000);
+        let project = app.project.as_mut().unwrap();
+        assert_eq!(project.navigate_back(), Some(0x2000));
+        assert_eq!(project.navigate_back(), Some(0x1004));
+        assert_eq!(project.navigate_forward(), Some(0x2000));
+    }
 }

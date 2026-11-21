@@ -267,11 +267,7 @@ impl SleuthreApp {
         });
 
         if let Some(addr) = jump_to {
-            if let Some(ref mut project) = self.project {
-                project.navigate_to(addr);
-            }
-            self.current_address = addr;
-            self.update_cfg();
+            self.follow_reference(current_addr, addr);
         }
     }
 }
