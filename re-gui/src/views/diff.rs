@@ -290,8 +290,8 @@ impl SleuthreApp {
             return;
         };
 
-        let disasm_a = re_core::disasm::Disassembler::new(project_a.arch).ok();
-        let disasm_b = re_core::disasm::Disassembler::new(project_b.arch).ok();
+        let disasm_a = project_a.disassembler().ok();
+        let disasm_b = project_b.disassembler().ok();
 
         let (Some(ref da), Some(ref db)) = (disasm_a, disasm_b) else {
             return;

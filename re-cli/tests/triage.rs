@@ -75,6 +75,10 @@ fn raw_triage_exports_the_same_mapped_regions_in_json_and_markdown() {
     };
     let first = run(&mut command);
     assert_eq!(first, run(&mut command));
+    assert_eq!(
+        first,
+        include_str!("../../re-core/tests/fixtures/two-regions.json")
+    );
     let report: serde_json::Value = serde_json::from_str(&first).unwrap();
     assert_eq!(report["sha256"], EIGHT_BYTE_SHA256);
     assert_eq!(report["format"], "Raw");

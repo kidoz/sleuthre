@@ -78,19 +78,14 @@ impl SleuthreApp {
                 .project
                 .as_ref()
                 .expect("project presence checked at the top of show_hex_view");
-            let segment = project
-                .memory_map
-                .segments
-                .iter()
-                .find(|s| {
-                    self.current_address >= s.start && self.current_address < s.start + s.size
-                })
-                .or_else(|| project.memory_map.segments.first());
-
-            let segment = match segment {
-                Some(s) => s,
-                None => {
+            let segment = match project.memory_map.segment_at(self.current_address) {
+                Some(segment) => segment,
+                None if project.memory_map.segments.is_empty() => {
                     ui.label("No memory segments loaded");
+                    return;
+                }
+                None => {
+                    ui.label(format!("Address {:#x} is unmapped.", self.current_address));
                     return;
                 }
             };

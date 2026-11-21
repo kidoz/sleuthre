@@ -158,6 +158,8 @@ pub(crate) struct SleuthreApp {
     pub(crate) command_bar_selected: usize,
     pub(crate) command_bar_active: bool,
 
+    pub(crate) raw_dialog: Option<crate::dialogs::raw_image::RawImageDialog>,
+
     // Background analysis work
     pub(crate) load_receiver: Option<std::sync::mpsc::Receiver<LoadProgress>>,
     pub(crate) load_stage: Option<String>,
@@ -505,6 +507,7 @@ pub(crate) enum CommandBarResultKind {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CommandAction {
     OpenBinary,
+    OpenRawImage,
     SaveProject,
     Search,
     Reanalyze,
@@ -657,6 +660,7 @@ impl Default for SleuthreApp {
             command_bar_results: Vec::new(),
             command_bar_selected: 0,
             command_bar_active: false,
+            raw_dialog: None,
             load_receiver: None,
             load_stage: None,
             load_cancel: None,
@@ -798,6 +802,15 @@ impl SleuthreApp {
             return;
         };
 
+        self.start_file_load(ctx, path, re_core::loader::load_binary_from_bytes);
+    }
+
+    pub(crate) fn start_file_load(
+        &mut self,
+        ctx: &egui::Context,
+        path: std::path::PathBuf,
+        load: impl FnOnce(&[u8]) -> re_core::Result<re_core::loader::LoadedBinary> + Send + 'static,
+    ) {
         let (tx, rx) = std::sync::mpsc::channel();
         let ctx_clone = ctx.clone();
         let mode = self.analysis_mode;
@@ -809,7 +822,7 @@ impl SleuthreApp {
             // must not unwind past this thread without a Done message, or
             // the UI stays wedged in the loading state.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                re_core::analysis::pipeline::analyze_binary_with_triage(
+                re_core::analysis::pipeline::analyze_file_with_triage(
                     &path,
                     mode,
                     Some(&worker_cancellation),
@@ -817,6 +830,7 @@ impl SleuthreApp {
                         let _ = tx.send(LoadProgress::Stage(stage.to_string()));
                         ctx_clone.request_repaint();
                     },
+                    load,
                 )
             }));
             let payload = match result {
@@ -860,7 +874,7 @@ impl SleuthreApp {
                     let (result, report) = *result;
                     // Create a fresh Disassembler on the main thread
                     // (Capstone is !Send so it cannot come from the worker)
-                    self.disasm = Disassembler::new(result.project.arch).ok();
+                    self.disasm = result.project.disassembler().ok();
                     self.current_address =
                         project_start_address(&result.project).unwrap_or(result.entry_point);
                     self.func_xref_counts = result.func_xref_counts;
@@ -891,7 +905,9 @@ impl SleuthreApp {
                     // debugger panel can walk frames without requiring frame
                     // pointers. Best-effort: a binary without `.eh_frame`
                     // simply leaves the option as `None`.
+                    self.debugger_unwinder = None;
                     if let Some(ref project) = self.project
+                        && project.raw_mapping.is_none()
                         && let Ok(bytes) = std::fs::read(&project.path)
                     {
                         self.debugger_unwinder =
@@ -903,6 +919,9 @@ impl SleuthreApp {
                     return;
                 }
                 LoadProgress::Done(Err(e)) => {
+                    if let Some(dialog) = &mut self.raw_dialog {
+                        dialog.error = Some(e.clone());
+                    }
                     if e.contains("Analysis cancelled") {
                         self.add_toast(ToastKind::Warning, "Analysis cancelled.".into());
                         self.output.push_str("Analysis cancelled.\n");
@@ -999,7 +1018,7 @@ impl SleuthreApp {
                     self.disasm = self
                         .project
                         .as_ref()
-                        .and_then(|project| Disassembler::new(project.arch).ok());
+                        .and_then(|project| project.disassembler().ok());
                     match findings {
                         Ok(findings) => {
                             self.plugin_findings = findings;
@@ -1079,7 +1098,7 @@ impl SleuthreApp {
                     );
                     self.output
                         .push_str(&format!("Project loaded from '{}'.\n", path.display()));
-                    self.disasm = Disassembler::new(project.arch).ok();
+                    self.disasm = project.disassembler().ok();
                     self.approval_queue_open = !project.pending_actions.is_empty();
                     self.current_address = project_start_address(&project).unwrap_or_default();
                     self.set_project(project);
@@ -1097,6 +1116,7 @@ impl SleuthreApp {
             project.navigate_to(self.current_address);
         }
         self.project = Some(project);
+        self.raw_dialog = None;
         self.triage = None;
         self.pending_triage_finding = None;
         self.hex_selected_addr = None;
@@ -1248,7 +1268,8 @@ impl SleuthreApp {
     }
 
     pub(crate) fn any_modal_active(&self) -> bool {
-        self.rename_address.is_some()
+        self.raw_dialog.is_some()
+            || self.rename_address.is_some()
             || self.comment_address.is_some()
             || self.xref_address.is_some()
             || self.approval_queue_open

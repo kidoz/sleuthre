@@ -1,3 +1,5 @@
+pub(crate) mod raw_image;
+
 use eframe::egui;
 use re_core::analysis::xrefs::XrefType;
 use re_core::import::symbols::ImportedSymbol;
@@ -82,6 +84,7 @@ fn apply_symbol_renames(project: &mut Project, symbols: &[ImportedSymbol]) -> us
 
 impl SleuthreApp {
     pub(crate) fn show_modals(&mut self, ctx: &egui::Context) {
+        self.show_raw_image_dialog(ctx);
         self.show_rename_dialog(ctx);
         self.show_comment_dialog(ctx);
         self.show_xref_dialog(ctx);

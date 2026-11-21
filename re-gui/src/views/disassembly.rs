@@ -38,6 +38,7 @@ impl SleuthreApp {
                 {
                     self.open_binary(ui.ctx());
                 }
+                self.raw_image_button(ui);
                 if ui
                     .add_enabled(can_open, egui::Button::new("Load Project…"))
                     .clicked()

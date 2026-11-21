@@ -27,13 +27,14 @@ pub(crate) fn save_report(
 impl SleuthreApp {
     pub(crate) fn show_triage(&mut self, ui: &mut egui::Ui) {
         let Some(report) = &self.triage else {
-            ui.label("Open the original executable to view its triage report.");
+            ui.label("Open the original file to view its triage report.");
             if ui
                 .add_enabled(!self.is_loading(), egui::Button::new("Open Binary…"))
                 .clicked()
             {
                 self.open_binary(ui.ctx());
             }
+            self.raw_image_button(ui);
             return;
         };
 

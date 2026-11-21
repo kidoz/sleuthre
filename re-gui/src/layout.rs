@@ -784,6 +784,7 @@ impl SleuthreApp {
                     self.open_binary(ctx);
                 }
             }
+            CommandAction::OpenRawImage => self.open_raw_image(),
             CommandAction::SaveProject => self.save_project(),
             CommandAction::Search => {
                 self.search_active = true;
@@ -810,6 +811,7 @@ impl SleuthreApp {
         }
         for (label, action, requires_project) in [
             ("Open Binary", CommandAction::OpenBinary, false),
+            ("Open Raw Image", CommandAction::OpenRawImage, false),
             ("Save Project", CommandAction::SaveProject, true),
             ("Search", CommandAction::Search, false),
             ("Re-Analyze", CommandAction::Reanalyze, true),
@@ -879,6 +881,9 @@ impl SleuthreApp {
             ui.menu_button("File", |ui| {
                 if ui.button("Open Binary...").clicked() && !self.is_loading() {
                     self.open_binary(ui.ctx());
+                    ui.close();
+                }
+                if self.raw_image_button(ui) {
                     ui.close();
                 }
                 if ui
