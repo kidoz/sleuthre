@@ -261,10 +261,15 @@ mod tests {
     }
 
     #[test]
-    fn open_raw_image_shows_both_regions_and_exports_cli_json() {
+    fn raw_project_reopens_with_both_regions_and_the_original_cli_report() {
         let mut app = SleuthreApp::default();
         let ctx = egui::Context::default();
-        app.raw_dialog = Some(fixture_dialog());
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("sample.raw");
+        let mut dialog = fixture_dialog();
+        std::fs::copy(&dialog.path, &source).unwrap();
+        dialog.path = source.clone();
+        app.raw_dialog = Some(dialog);
         let mut draw = |events| {
             let input = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -304,7 +309,22 @@ mod tests {
         wait_for_load(&mut app);
         assert!(app.raw_dialog.is_none(), "{}", app.output);
         assert_eq!(app.current_address, 0x8001);
+        let export = dir.path().join("report.json");
+        save_report(app.triage.as_ref().unwrap(), ReportFormat::Json, &export).unwrap();
+        let before = std::fs::read(&export).unwrap();
+        assert_eq!(
+            before,
+            include_bytes!("../../../re-core/tests/fixtures/two-regions.json")
+        );
 
+        let saved = dir.path().join("project.slre");
+        app.remember_view_address();
+        app.project.as_mut().unwrap().save_new(&saved).unwrap();
+        drop(app);
+        std::fs::remove_file(source).unwrap();
+        let mut app = SleuthreApp::default();
+        app.load_project_from_path(&saved);
+        assert_eq!(app.current_address, 0x8001, "{}", app.output);
         for (address, displayed) in [
             (0x1001, "ABCD"),
             (0x8001, "EFGH"),
@@ -325,13 +345,8 @@ mod tests {
         assert_eq!(memory.get_data(0x8001, 1), Some(&b"F"[..]));
         assert_eq!(memory.get_data(0x1004, 1), None);
 
-        let dir = tempfile::tempdir().unwrap();
-        let export = dir.path().join("report.json");
         save_report(app.triage.as_ref().unwrap(), ReportFormat::Json, &export).unwrap();
-        assert_eq!(
-            std::fs::read(export).unwrap(),
-            include_bytes!("../../../re-core/tests/fixtures/two-regions.json")
-        );
+        assert_eq!(std::fs::read(export).unwrap(), before);
     }
 
     #[test]

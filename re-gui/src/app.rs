@@ -98,6 +98,7 @@ pub(crate) struct SleuthreApp {
     pub(crate) new_enum_name: String,
     pub(crate) new_enum_variants: Vec<(String, String)>,
 
+    // Keep the report visible while the analysis worker owns the project.
     pub(crate) triage: Option<std::sync::Arc<TriageReport>>,
     pub(crate) triage_export: Option<std::sync::mpsc::Receiver<std::io::Result<()>>>,
     pub(crate) pending_triage_finding: Option<usize>,
@@ -871,7 +872,7 @@ impl SleuthreApp {
                     self.load_stage = Some(s);
                 }
                 LoadProgress::Done(Ok(result)) => {
-                    let (result, report) = *result;
+                    let (mut result, report) = *result;
                     // Create a fresh Disassembler on the main thread
                     // (Capstone is !Send so it cannot come from the worker)
                     self.disasm = result.project.disassembler().ok();
@@ -890,8 +891,8 @@ impl SleuthreApp {
                     );
                     self.output.push_str(&result.summary);
                     self.output.push('\n');
+                    result.project.triage_report = Some(std::sync::Arc::new(report));
                     self.set_project(result.project);
-                    self.triage = Some(std::sync::Arc::new(report));
                     self.plugin_findings = result.findings;
                     // Compute entropy map
                     if let Some(ref project) = self.project {
@@ -1090,23 +1091,27 @@ impl SleuthreApp {
             .add_filter("Sleuthre Project", &["slre"])
             .pick_file()
         {
-            match Project::load(&path) {
-                Ok(project) => {
-                    self.add_toast(
-                        ToastKind::Success,
-                        format!("Project loaded from '{}'", path.display()),
-                    );
-                    self.output
-                        .push_str(&format!("Project loaded from '{}'.\n", path.display()));
-                    self.disasm = project.disassembler().ok();
-                    self.approval_queue_open = !project.pending_actions.is_empty();
-                    self.current_address = project_start_address(&project).unwrap_or_default();
-                    self.set_project(project);
-                }
-                Err(e) => {
-                    self.add_toast(ToastKind::Error, format!("Load error: {}", e));
-                    self.output.push_str(&format!("Load error: {}\n", e));
-                }
+            self.load_project_from_path(&path);
+        }
+    }
+
+    pub(crate) fn load_project_from_path(&mut self, path: &std::path::Path) {
+        match Project::load(path) {
+            Ok(project) => {
+                self.add_toast(
+                    ToastKind::Success,
+                    format!("Project loaded from '{}'", path.display()),
+                );
+                self.output
+                    .push_str(&format!("Project loaded from '{}'.\n", path.display()));
+                self.disasm = project.disassembler().ok();
+                self.approval_queue_open = !project.pending_actions.is_empty();
+                self.current_address = project_start_address(&project).unwrap_or_default();
+                self.set_project(project);
+            }
+            Err(e) => {
+                self.add_toast(ToastKind::Error, format!("Load error: {}", e));
+                self.output.push_str(&format!("Load error: {}\n", e));
             }
         }
     }
@@ -1115,9 +1120,9 @@ impl SleuthreApp {
         if project.memory_map.contains_address(self.current_address) {
             project.navigate_to(self.current_address);
         }
+        self.triage.clone_from(&project.triage_report);
         self.project = Some(project);
         self.raw_dialog = None;
-        self.triage = None;
         self.pending_triage_finding = None;
         self.hex_selected_addr = None;
         self.plugin_findings.clear();

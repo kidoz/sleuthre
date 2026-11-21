@@ -197,9 +197,14 @@ mod tests {
         let mut app = SleuthreApp::default();
         app.load_receiver = Some(rx);
         app.poll_load();
-        app.focus_or_open_tab(Tab::Triage);
 
         let dir = tempfile::tempdir().unwrap();
+        let saved = dir.path().join("fixture.slre");
+        app.project.as_mut().unwrap().save_new(&saved).unwrap();
+        drop(app);
+        let mut app = SleuthreApp::default();
+        app.load_project_from_path(&saved);
+        app.focus_or_open_tab(Tab::Triage);
         let output = dir.path().join("report");
         for (format, expected) in [
             (ReportFormat::Json, fixture.with_extension("json")),
